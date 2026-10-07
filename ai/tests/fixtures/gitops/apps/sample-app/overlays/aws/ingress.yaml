@@ -1,0 +1,25 @@
+# EKS(oneaction)에서 AWS Load Balancer Controller가 이 Ingress를 보고 인터넷용 ALB를 자동으로 만든다.
+# 서브넷은 Public 서브넷의 kubernetes.io/role/elb 태그로 자동 선택된다 (Terraform network 스택).
+# 도메인·인증서가 준비되기 전까지는 HTTP(80)로만 접속한다.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sample-app
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/tags: Project=oneaction,Owner=seongjin.lee,Env=dev
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sample-app
+                port:
+                  number: 80

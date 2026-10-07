@@ -16,6 +16,6 @@ Review API (FastAPI) ─▶ Kafka review.requested ─▶ LangGraph 워커
 
 | 경로 | 내용 |
 |---|---|
-| `ai/` | AI 판단 쪽 — 명세 모델, 규칙 목록, 샘플, 평가셋 |
+| `ai/` | AI 판단 쪽 — 명세 모델, 규칙, 판단 노드, overlay 렌더러, 근거 문서, 평가셋. 연결 안내는 [ai/docs/review-ai.md](ai/docs/review-ai.md) |
 
 파이프라인 쪽 디렉터리는 구조가 정해지면 추가한다.

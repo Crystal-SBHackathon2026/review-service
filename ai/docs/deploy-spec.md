@@ -96,7 +96,7 @@ evidence 에도 값을 남기지 않는다. `source: generated` 는 배포 시 �
 3. **Finding.category 에 `runtime` 추가.** readiness·아키텍처는 Rollout 자동 중단과 직결돼 빼기 어렵다.
 4. **decide_verdict 보완.** low finding 은 `forbidden` 이어도 사람 조건에서 빼야 한다.
    안 그러면 HTTP 전용인 지금의 sample-app(NET-001)이 매번 needs_human 이 된다.
-5. **명세 → kustomize overlay 변환은 누가 하나.** 지금 gitops 는 overlay 를 손으로 쓴다. 검토 서비스의 patch 는 명세를 고치는데, 그게 overlay 에 반영돼야 한다.
+5. ~~**명세 → kustomize overlay 변환은 누가 하나.**~~ → 검토 서비스 코드(`review_ai/overlay`)가 만든다. 지금 sample-app overlay 3개를 그대로 재현한다 — [review-ai.md](review-ai.md#overlay-렌더러-결정-7-검토-서비스-코드가-만든다)
 6. **능력표 실측.** EKS 노드 아키텍처, GKE·Cloud SQL 유무, busan-local 노드 아키텍처.
 7. **`source: generated` 시크릿은 누가 만드나.**
 

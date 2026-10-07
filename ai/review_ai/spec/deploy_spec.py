@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from datetime import datetime
 from pathlib import Path
@@ -90,7 +91,7 @@ class Runtime(_Frozen):
 
     @model_validator(mode="after")
     def _env_names(self) -> Runtime:
-        bad = [k for k in self.env if not re.match(ENV_NAME, k)]
+        bad = [k for k in self.env if not re.fullmatch(ENV_NAME, k)]
         if bad:
             raise ValueError(f"runtime.env 이름은 대문자 환경변수 형식이어야 한다: {bad}")
         return self
@@ -138,6 +139,15 @@ class Ingress(_Frozen):
     tls: bool = False
     host: str | None = None
     allowed_cidrs: tuple[str, ...] = Field(default=(), description="비우면 별도 제한 없음")
+
+    @model_validator(mode="after")
+    def _cidrs(self) -> Ingress:
+        for cidr in self.allowed_cidrs:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"network.ingress.allowed_cidrs 항목이 CIDR 이 아니다: {cidr!r}") from exc
+        return self
 
 
 class Network(_Frozen):

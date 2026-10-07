@@ -1,0 +1,104 @@
+"""deploy_spec → gitops kustomize overlay 렌더러 (결정 #7: 검토 서비스 코드가 overlay 를 만든다).
+
+- 입력은 deploy_spec 하나, 출력은 apps/<app>/overlays/<env>/ 아래 파일 내용 (dict). 디스크에 쓰지 않는다.
+  gitops 레포에 커밋하는 일은 파이프라인 커밋 단계가 한다.
+- 전제: apps/<app>/base 에 Rollout·Service(이름 = metadata.name)가 있다 — 지금 sample-app base 구조.
+- overlay 로 표현할 수 없는 것(DB·버킷 프로비저닝, Secret 값 생성)은 warnings 로 돌려준다. 조용히 빼지 않는다.
+"""
+
+from __future__ import annotations
+
+import difflib
+from dataclasses import dataclass
+from typing import Any
+
+from review_ai.catalog import load_targets
+from review_ai.overlay.ingress import render_ingress
+from review_ai.overlay.workload import pvc, rollout_ops, secret_name, service_ops
+from review_ai.overlay.yaml_io import dump, dump_with_header
+from review_ai.secrets_pattern import MASK
+from review_ai.spec.deploy_spec import AppSpec
+
+HEADER = (
+    "생성 파일 — review-service overlay 렌더러가 deploy_spec 에서 만든다.\n"
+    "손으로 고치지 말고 앱 레포의 deploy.yaml 을 고친다."
+)
+
+
+@dataclass(frozen=True)
+class RenderedOverlay:
+    directory: str
+    files: dict[str, str]  # 파일 이름 → 내용
+    warnings: tuple[str, ...]
+
+
+def _images(spec: AppSpec) -> list[dict[str, str]]:
+    image: dict[str, str] = {"name": spec.image.repository}
+    if spec.image.tag:
+        image["newTag"] = spec.image.tag
+    if spec.image.digest:
+        image["digest"] = spec.image.digest
+    return [image]
+
+
+def _warnings(spec: AppSpec) -> list[str]:
+    out = []
+    if spec.secrets:
+        names = ", ".join(s.name for s in spec.secrets)
+        out.append(f"Secret {secret_name(spec)} 에 키 [{names}] 가 미리 있어야 한다 (값 생성·동기화 주체는 결정 #8)")
+    if spec.database.engine != "none" and spec.database.placement != "volume":
+        out.append(f"database ({spec.database.placement} {spec.database.engine}) 는 overlay 로 만들지 않는다 — 인프라 프로비저닝 필요")
+    if spec.storage.buckets:
+        out.append("storage.buckets 는 overlay 로 만들지 않는다 — Terraform 등 인프라 쪽에서 반영 필요")
+    if not spec.image.digest:
+        out.append("image.digest 가 없어 태그로만 고정된다 — 같은 태그 재푸시 시 다른 이미지가 배포된다")
+    return out
+
+
+def render_overlay(spec: AppSpec, *, apps_root: str = "apps") -> RenderedOverlay:
+    """spec 은 앱 레포에서 spec_ref 로 읽은 원본이어야 한다. Kafka 메시지의 가린 사본으로 렌더링하면 거절한다."""
+    if MASK in spec.model_dump_json():
+        raise ValueError("가린 명세(***MASKED***)로는 overlay 를 만들지 않는다 — spec_ref 로 원본을 읽어야 한다")
+    caps = load_targets()[spec.target.env]
+    name = spec.metadata.name
+    files: dict[str, str] = {}
+    warnings = _warnings(spec)
+    resources = ["../../base"]
+    if spec.network.ingress is not None:
+        ingress, ingress_warnings = render_ingress(spec, caps)
+        files["ingress.yaml"] = dump_with_header(ingress, HEADER)
+        warnings.extend(ingress_warnings)
+        resources.append("ingress.yaml")
+    for v in spec.storage.volumes:
+        if v.persistent:
+            filename = f"pvc-{v.name}.yaml"
+            files[filename] = dump_with_header(pvc(spec, v.name), HEADER)
+            resources.append(filename)
+    kustomization: dict[str, Any] = {
+        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+        "kind": "Kustomization",
+        "namespace": spec.target.namespace or name,
+        "resources": resources,
+        "images": _images(spec),
+        "patches": [
+            {"target": {"kind": "Rollout", "name": name}, "patch": dump(rollout_ops(spec)).rstrip("\n")},
+            {"target": {"kind": "Service", "name": name}, "patch": dump(service_ops(spec)).rstrip("\n")},
+        ],
+    }
+    files["kustomization.yaml"] = dump_with_header(kustomization, HEADER)
+    directory = f"{apps_root}/{name}/overlays/{spec.target.env}"
+    return RenderedOverlay(directory=directory, files=dict(sorted(files.items())), warnings=tuple(warnings))
+
+
+def overlay_diff(before: AppSpec, after: AppSpec) -> list[dict[str, str]]:
+    """패치 전후 overlay 의 파일별 unified diff. Patch.files 에 들어간다."""
+    old, new = render_overlay(before), render_overlay(after)
+    diffs = []
+    for filename in sorted(set(old.files) | set(new.files)):
+        a, b = old.files.get(filename, ""), new.files.get(filename, "")
+        if a == b:
+            continue
+        path = f"{new.directory}/{filename}"
+        text = "".join(difflib.unified_diff(a.splitlines(True), b.splitlines(True), f"a/{path}", f"b/{path}"))
+        diffs.append({"path": path, "diff": text})
+    return diffs

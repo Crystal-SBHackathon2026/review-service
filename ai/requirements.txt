@@ -1,2 +1,9 @@
 pydantic>=2.7,<3
 pyyaml>=6
+langgraph>=1.2,<2
+anthropic>=1.11
+qdrant-client>=1.19,<2
+fastembed>=0.8           # 로컬 다국어 임베딩 (첫 실행 시 모델 내려받음)
+pytest>=9
+pytest-asyncio>=1
+pytest-cov>=7
