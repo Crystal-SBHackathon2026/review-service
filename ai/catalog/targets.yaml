@@ -1,6 +1,7 @@
 # 대상 환경 능력표 초안 — DB-002·SEC-002·STO-001·RUN-004 가 읽는다.
 # verified: false 는 아직 실측 전(EKS·GKE 가 Terraform 에 없음). 팀이 클러스터를 만들면 값을 확인해 true 로 바꾼다.
 # database: placement → engine → 지원 메이저 버전. 버전 목록이 []면 버전 무관.
+# ingress: overlay 렌더러(review_ai/overlay)가 쓰는 Ingress 클래스와 환경 고정 annotation.
 
 targets:
   aws:
@@ -13,6 +14,10 @@ targets:
       external: {postgres: [], mysql: []}
     volume_access_modes: [ReadWriteOnce]           # EBS. EFS 를 붙이면 ReadWriteMany
     secret_sources: [aws-secrets-manager, k8s-secret, generated]
+    ingress:
+      class: alb                   # AWS Load Balancer Controller
+      annotations:                 # gitops overlays/aws/ingress.yaml 과 같은 값
+        alb.ingress.kubernetes.io/tags: Project=oneaction,Owner=seongjin.lee,Env=dev
 
   gcp:
     verified: false
@@ -24,6 +29,9 @@ targets:
       external: {postgres: [], mysql: []}
     volume_access_modes: [ReadWriteOnce]           # PD. Filestore 를 붙이면 ReadWriteMany
     secret_sources: [gcp-secret-manager, k8s-secret, generated]
+    ingress:
+      class: gce                   # 내부 전용이면 gce-internal
+      annotations: {}
 
   local:
     verified: false
@@ -34,3 +42,6 @@ targets:
       external: {postgres: [], mysql: []}
     volume_access_modes: [ReadWriteOnce]           # k3s local-path
     secret_sources: [k8s-secret, generated]
+    ingress:
+      class: traefik               # k3s 기본
+      annotations: {}

@@ -1,0 +1,25 @@
+from __future__ import annotations
+
+from review_ai.secrets_pattern import MASK, looks_secret
+from review_ai.static_check.context import CheckContext, Hit
+
+DB_ENGINES_WITH_CREDENTIALS = frozenset({"postgres", "mysql"})
+
+
+def plaintext_secret(ctx: CheckContext) -> list[Hit]:
+    """SEC-001 — runtime.env 에 비밀로 보이는 평문. evidence 에는 이름만 남긴다."""
+    return [
+        Hit(f"/runtime/env/{name}", f"runtime.env.{name}={MASK}")
+        for name, value in sorted(ctx.spec.runtime.env.items())
+        if looks_secret(name, value)
+    ]
+
+
+def missing_db_secret(ctx: CheckContext) -> list[Hit]:
+    """SEC-005 — postgres·mysql 인데 접속 정보 시크릿이 없다."""
+    db = ctx.spec.database
+    if db.engine not in DB_ENGINES_WITH_CREDENTIALS:
+        return []
+    if any(s.name == db.env_var for s in ctx.spec.secrets):
+        return []
+    return [Hit("/secrets", f"secrets 에 {db.env_var} 없음")]

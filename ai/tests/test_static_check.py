@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+import pytest
+
+from review_ai.spec.deploy_spec import DeploySpec
+from review_ai.static_check import make_static_check, run_static_check
+from tests.conftest import load_cases, load_sample_dict
+
+
+def rule_ids(spec: dict[str, Any]) -> list[str]:
+    return sorted(f["rule_id"] for f in run_static_check(DeploySpec.model_validate(spec)))
+
+
+def findings_of(spec: dict[str, Any], rule_id: str) -> list[dict[str, Any]]:
+    return [f for f in run_static_check(DeploySpec.model_validate(spec)) if f["rule_id"] == rule_id]
+
+
+# ── 정답지: cases.yaml ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("case", load_cases(), ids=lambda c: c["file"])
+def test_sample_findings_match_cases(case: dict[str, Any]) -> None:
+    assert rule_ids(load_sample_dict(case["file"])) == sorted(case["findings"])
+
+
+@pytest.mark.parametrize(
+    "case", [c for c in load_cases() if "evidence_must_not_contain" in c], ids=lambda c: c["file"]
+)
+def test_evidence_never_contains_secret_values(case: dict[str, Any]) -> None:
+    spec = DeploySpec.model_validate(load_sample_dict(case["file"]))
+    blob = repr(run_static_check(spec))
+    for secret in case["evidence_must_not_contain"]:
+        assert secret not in blob
+
+
+def test_findings_are_deterministic_and_sorted() -> None:
+    spec = DeploySpec.model_validate(load_sample_dict("10-human-mixed-aws.yaml"))
+    first, second = run_static_check(spec), run_static_check(spec)
+    assert first == second
+    assert [f["rule_id"] for f in first] == sorted(f["rule_id"] for f in first)
+
+
+def test_finding_id_is_stable_per_rule_and_location() -> None:
+    spec = load_sample_dict("03-fix-sqlite-replicas-gcp.yaml")
+    a = findings_of(spec, "DB-003")[0]
+    spec["metadata"]["commit"] = "aaaaaaa"
+    b = findings_of(spec, "DB-003")[0]
+    assert a["finding_id"] == b["finding_id"]
+    assert a["finding_id"].startswith("DB-003:")
+
+
+def test_severity_and_category_come_from_catalog(sample_app: dict[str, Any]) -> None:
+    f = findings_of(sample_app, "NET-001")[0]
+    assert (f["severity"], f["category"], f["autofix"], f["irreversible"]) == ("low", "network", "forbidden", False)
+
+
+# ── database ─────────────────────────────────────────────────────
+
+
+def _with_baseline(spec: dict[str, Any], prev_db: dict[str, Any], has_data: bool | None) -> dict[str, Any]:
+    prev = copy.deepcopy(spec)
+    prev["database"] = prev_db
+    facts = {} if has_data is None else {"database_has_data": has_data}
+    return {**spec, "baseline": {"spec_ref": "prev", "spec": prev, "facts": facts}}
+
+
+PG = {"engine": "postgres", "version": "16", "placement": "managed"}
+MYSQL = {"engine": "mysql", "version": "8.0", "placement": "managed"}
+DB_SECRET = [{"name": "DATABASE_URL", "source": "aws-secrets-manager", "key": "app/db"}]
+
+
+@pytest.mark.parametrize(
+    ("has_data", "expected"),
+    [(True, ["DB-001"]), (None, ["DB-001"]), (False, [])],
+    ids=["data", "unknown-means-data", "no-data"],
+)
+def test_db001_engine_change_depends_on_data(sample_app: dict[str, Any], has_data: bool | None, expected: list[str]) -> None:
+    spec = {**sample_app, "database": MYSQL, "secrets": DB_SECRET}
+    spec = _with_baseline(spec, PG, has_data)
+    assert [r for r in rule_ids(spec) if r.startswith("DB")] == expected
+
+
+def test_db001_is_irreversible_and_forbidden(sample_app: dict[str, Any]) -> None:
+    spec = _with_baseline({**sample_app, "database": MYSQL, "secrets": DB_SECRET}, PG, True)
+    f = findings_of(spec, "DB-001")[0]
+    assert (f["autofix"], f["irreversible"], f["location"]["spec_path"]) == ("forbidden", True, "/database/engine")
+    assert f["evidence"] == "postgres → mysql"
+
+
+def test_db001_ignores_first_database(sample_app: dict[str, Any]) -> None:
+    spec = _with_baseline({**sample_app, "database": PG, "secrets": DB_SECRET}, {"engine": "none"}, True)
+    assert "DB-001" not in rule_ids(spec)
+
+
+@pytest.mark.parametrize(
+    ("db", "env", "hit"),
+    [
+        ({"engine": "mysql", "placement": "in-cluster"}, "local", True),
+        ({"engine": "postgres", "placement": "in-cluster", "version": "16"}, "local", False),
+        ({"engine": "postgres", "placement": "managed"}, "local", True),
+        ({"engine": "postgres", "placement": "managed", "version": "9"}, "aws", True),
+        ({"engine": "mysql", "placement": "managed", "version": "8.0"}, "aws", False),
+        ({"engine": "sqlite", "placement": "managed"}, "aws", True),
+    ],
+)
+def test_db002_target_capabilities(sample_app: dict[str, Any], db: dict[str, Any], env: str, hit: bool) -> None:
+    spec = {**sample_app, "database": db, "secrets": DB_SECRET, "target": {"env": env, "region": "r"}}
+    assert ("DB-002" in rule_ids(spec)) is hit
+
+
+def test_db002_autofix_allowed_without_data_forbidden_with_data(sample_app: dict[str, Any]) -> None:
+    db = {"engine": "mysql", "placement": "in-cluster"}
+    spec = {**sample_app, "database": db, "secrets": DB_SECRET, "target": {"env": "local", "region": "r"}}
+    assert findings_of(spec, "DB-002")[0]["autofix"] == "allowed"
+    with_data = _with_baseline(spec, db, True)
+    assert findings_of(with_data, "DB-002")[0]["autofix"] == "forbidden"
+
+
+def test_db003_sqlite_single_replica_is_fine() -> None:
+    spec = load_sample_dict("03-fix-sqlite-replicas-gcp.yaml")
+    spec["runtime"]["replicas"] = 1
+    assert rule_ids(spec) == []
+
+
+@pytest.mark.parametrize(
+    "volumes",
+    [[], [{"name": "data", "mount_path": "/data", "size": "1Gi", "persistent": False}]],
+    ids=["missing", "ephemeral"],
+)
+def test_db005_sqlite_needs_persistent_volume(volumes: list[dict[str, Any]]) -> None:
+    spec = load_sample_dict("02-pass-local-sqlite.yaml")
+    spec["storage"] = {"volumes": volumes}
+    assert "DB-005" in rule_ids(spec)
+
+
+# ── secret ───────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "hit"),
+    [
+        ("DB_PASSWORD", "x", True),
+        ("STRIPE_API_KEY", "x", True),
+        ("CLIENT_SECRET", "x", True),
+        ("REDIS_URL", "redis://user:pa55@redis:6379", True),
+        ("REDIS_URL", "redis://redis:6379", False),
+        ("LOG_LEVEL", "info", False),
+    ],
+)
+def test_sec001_plaintext_secret(sample_app: dict[str, Any], name: str, value: str, hit: bool) -> None:
+    sample_app["runtime"]["env"][name] = value
+    found = findings_of(sample_app, "SEC-001")
+    assert bool(found) is hit
+    if hit:
+        assert value not in found[0]["evidence"]
+        assert found[0]["location"]["spec_path"] == f"/runtime/env/{name}"
+
+
+def test_sec005_db_without_connection_secret(sample_app: dict[str, Any]) -> None:
+    spec = {**sample_app, "database": PG}
+    assert "SEC-005" in rule_ids(spec)
+    assert "SEC-005" not in rule_ids({**spec, "secrets": DB_SECRET})
+
+
+# ── network · storage · runtime ─────────────────────────────────
+
+
+def test_net001_only_for_public_without_tls(sample_app: dict[str, Any]) -> None:
+    assert "NET-001" in rule_ids(sample_app)
+    sample_app["network"]["ingress"] = {"public": True, "tls": True, "host": "a.example.com"}
+    assert "NET-001" not in rule_ids(sample_app)
+    sample_app["network"]["ingress"] = {"public": False}
+    assert "NET-001" not in rule_ids(sample_app)
+
+
+def test_sto003_skipped_on_local(sample_app: dict[str, Any]) -> None:
+    sample_app["storage"] = {"buckets": [{"name": "uploads", "public": True}]}
+    assert "STO-003" in rule_ids(sample_app)
+    sample_app["target"] = {"env": "local", "region": "busan-local"}
+    assert "STO-003" not in rule_ids(sample_app)
+
+
+@pytest.mark.parametrize(("prev", "cur", "hit"), [("10Gi", "5Gi", True), ("1Gi", "1024Mi", False), ("1Gi", "2Gi", False)])
+def test_sto005_volume_shrink(sample_app: dict[str, Any], prev: str, cur: str, hit: bool) -> None:
+    vol = {"name": "uploads", "mount_path": "/u", "persistent": True}
+    spec = {**sample_app, "storage": {"volumes": [{**vol, "size": cur}]}}
+    prev_spec = {**sample_app, "storage": {"volumes": [{**vol, "size": prev}]}}
+    spec["baseline"] = {"spec_ref": "prev", "spec": prev_spec}
+    assert ("STO-005" in rule_ids(spec)) is hit
+
+
+def test_run001_missing_readiness(sample_app: dict[str, Any]) -> None:
+    sample_app["runtime"]["health"] = {"liveness": "/healthz"}
+    f = findings_of(sample_app, "RUN-001")[0]
+    assert (f["severity"], f["autofix"]) == ("medium", "forbidden")
+
+
+def test_run004_multi_arch_image_is_fine(sample_app: dict[str, Any]) -> None:
+    sample_app["image"]["platforms"] = ["arm64", "amd64"]
+    assert "RUN-004" not in rule_ids(sample_app)
+
+
+# ── 노드 ─────────────────────────────────────────────────────────
+
+
+async def test_node_returns_only_findings() -> None:
+    node = make_static_check()
+    out = await node({"deploy_spec": load_sample_dict("07-fix-public-bucket.yaml"), "target_env": "aws"})
+    assert list(out) == ["findings"]
+    assert [f["rule_id"] for f in out["findings"]] == ["STO-003"]

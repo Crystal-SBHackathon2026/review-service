@@ -23,13 +23,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from review_ai.spec.deploy_spec import DeploySpec, load_spec  # noqa: E402
+from review_ai.state import REASON_CODES  # noqa: E402
+
+REASONS = set(REASON_CODES)
 
 PREFIX = {"database": "DB", "secret": "SEC", "network": "NET", "storage": "STO", "runtime": "RUN"}
 VERDICTS = {"pass", "fix", "needs_human"}
-REASONS = {
-    "CITATION_INVALID", "LOW_SCORE", "AUTOFIX_FORBIDDEN", "PATCH_OUT_OF_SCOPE",
-    "IRREVERSIBLE", "LLM_UNAVAILABLE", "LOOP_EXHAUSTED",
-}
 
 
 def check_rules() -> set[str]:
