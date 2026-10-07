@@ -1,0 +1,17 @@
+# 자동 수정 가능한 것(STO-003)과 불가능한 것(RUN-001)이 섞임.
+# 기대: [RUN-001, STO-003] → needs_human, 사유 AUTOFIX_FORBIDDEN (하나라도 사람 조건이면 fix 로 가지 않는다)
+api_version: crystal.review/v1alpha1
+kind: DeploySpec
+metadata: {name: sample-app, repository: Crystal-SBHackathon2026/sample-app, commit: c7e5d10}
+target: {env: aws, region: ap-northeast-2, namespace: sample-app}
+image: {repository: ghcr.io/crystal-sbhackathon2026/sample-app, tag: c7e5d10, digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, platforms: [amd64]}
+runtime:
+  port: 8080
+  replicas: 2
+  health: {liveness: /healthz}
+  resources: {cpu_request: 50m, memory_request: 64Mi, cpu_limit: 250m, memory_limit: 128Mi}
+network:
+  ingress: {public: true, tls: true, host: app.example.com}
+storage:
+  buckets:
+    - {name: sample-app-uploads, public: true, versioning: true, encryption: true}

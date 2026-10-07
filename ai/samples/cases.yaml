@@ -1,0 +1,51 @@
+# 샘플별 기대 결과 — static_check·decide_verdict 테스트와 평가셋의 정답.
+# findings: 1회차 static_check 가 내야 할 rule_id (순서 무관, 정확히 이 집합)
+# verdict / reasons: 1회차 decide_verdict 결과
+# after_patch: fix 인 경우 패치 적용 후 재검사 기대값
+# llm_called: false 면 judge 가 LLM 을 호출하면 안 된다 (finding 0 → 바로 pass)
+cases:
+  - file: 01-pass-sample-app-aws.yaml
+    findings: [NET-001]
+    verdict: pass
+    reasons: []
+  - file: 02-pass-local-sqlite.yaml
+    findings: []
+    verdict: pass
+    reasons: []
+    llm_called: false
+  - file: 03-fix-sqlite-replicas-gcp.yaml
+    findings: [DB-003]
+    verdict: fix
+    reasons: []
+    after_patch: {findings: [], verdict: pass}
+  - file: 04-human-engine-change-with-data.yaml
+    findings: [DB-001]
+    verdict: needs_human
+    reasons: [IRREVERSIBLE]
+  - file: 05-fix-engine-unsupported-local.yaml
+    findings: [DB-002]
+    verdict: fix
+    reasons: []
+    after_patch: {findings: [], verdict: pass}
+  - file: 06-human-plaintext-secret.yaml
+    findings: [SEC-001]
+    verdict: needs_human
+    reasons: [AUTOFIX_FORBIDDEN]
+    evidence_must_not_contain: [sample-not-a-real-token-0000]
+  - file: 07-fix-public-bucket.yaml
+    findings: [STO-003]
+    verdict: fix
+    reasons: []
+    after_patch: {findings: [], verdict: pass}
+  - file: 08-human-volume-shrink-local.yaml
+    findings: [STO-005]
+    verdict: needs_human
+    reasons: [IRREVERSIBLE]
+  - file: 09-human-arch-mismatch-aws.yaml
+    findings: [RUN-004]
+    verdict: needs_human
+    reasons: [AUTOFIX_FORBIDDEN]
+  - file: 10-human-mixed-aws.yaml
+    findings: [RUN-001, STO-003]
+    verdict: needs_human
+    reasons: [AUTOFIX_FORBIDDEN]

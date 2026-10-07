@@ -1,0 +1,778 @@
+{
+  "$defs": {
+    "AppSpec": {
+      "additionalProperties": false,
+      "description": "사용자가 선언하는 부분.",
+      "properties": {
+        "api_version": {
+          "const": "crystal.review/v1alpha1",
+          "title": "Api Version",
+          "type": "string"
+        },
+        "kind": {
+          "const": "DeploySpec",
+          "title": "Kind",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "target": {
+          "$ref": "#/$defs/Target"
+        },
+        "image": {
+          "$ref": "#/$defs/Image"
+        },
+        "runtime": {
+          "$ref": "#/$defs/Runtime"
+        },
+        "requirements": {
+          "$ref": "#/$defs/Requirements",
+          "default": {
+            "persistence": false
+          }
+        },
+        "database": {
+          "$ref": "#/$defs/Database",
+          "default": {
+            "engine": "none",
+            "version": null,
+            "placement": null,
+            "engine_policy": "preserve",
+            "volume": null,
+            "env_var": "DATABASE_URL",
+            "backup_retention_days": 1,
+            "publicly_accessible": false
+          }
+        },
+        "secrets": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SecretRef"
+          },
+          "title": "Secrets",
+          "type": "array"
+        },
+        "network": {
+          "$ref": "#/$defs/Network",
+          "default": {
+            "ingress": null
+          }
+        },
+        "storage": {
+          "$ref": "#/$defs/Storage",
+          "default": {
+            "volumes": [],
+            "buckets": []
+          }
+        }
+      },
+      "required": [
+        "api_version",
+        "kind",
+        "metadata",
+        "target",
+        "image",
+        "runtime"
+      ],
+      "title": "AppSpec",
+      "type": "object"
+    },
+    "Baseline": {
+      "additionalProperties": false,
+      "properties": {
+        "spec_ref": {
+          "description": "업무 DB 의 마지막 승인 배포 ID 또는 커밋",
+          "minLength": 1,
+          "title": "Spec Ref",
+          "type": "string"
+        },
+        "spec": {
+          "$ref": "#/$defs/AppSpec"
+        },
+        "facts": {
+          "$ref": "#/$defs/BaselineFacts",
+          "default": {
+            "database_has_data": null,
+            "observed_at": null
+          }
+        }
+      },
+      "required": [
+        "spec_ref",
+        "spec"
+      ],
+      "title": "Baseline",
+      "type": "object"
+    },
+    "BaselineFacts": {
+      "additionalProperties": false,
+      "description": "파이프라인이 관측한 사실. 모르면 None — 규칙은 None 을 '데이터 있음'으로 취급한다.",
+      "properties": {
+        "database_has_data": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Database Has Data"
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Observed At"
+        }
+      },
+      "title": "BaselineFacts",
+      "type": "object"
+    },
+    "Bucket": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 63,
+          "minLength": 3,
+          "title": "Name",
+          "type": "string"
+        },
+        "public": {
+          "default": false,
+          "title": "Public",
+          "type": "boolean"
+        },
+        "versioning": {
+          "default": true,
+          "title": "Versioning",
+          "type": "boolean"
+        },
+        "encryption": {
+          "default": true,
+          "title": "Encryption",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "Bucket",
+      "type": "object"
+    },
+    "Database": {
+      "additionalProperties": false,
+      "properties": {
+        "engine": {
+          "default": "none",
+          "enum": [
+            "none",
+            "postgres",
+            "mysql",
+            "sqlite"
+          ],
+          "title": "Engine",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "메이저 버전 (예: '16', '8.0')",
+          "title": "Version"
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "enum": [
+                "managed",
+                "in-cluster",
+                "volume",
+                "external"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Placement"
+        },
+        "engine_policy": {
+          "default": "preserve",
+          "description": "자동 수정이 엔진을 바꿔도 되는가 (데이터 없을 때만 적용)",
+          "enum": [
+            "preserve",
+            "allow_convert"
+          ],
+          "title": "Engine Policy",
+          "type": "string"
+        },
+        "volume": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "sqlite 일 때 storage.volumes[].name",
+          "title": "Volume"
+        },
+        "env_var": {
+          "default": "DATABASE_URL",
+          "pattern": "^[A-Z_][A-Z0-9_]*$",
+          "title": "Env Var",
+          "type": "string"
+        },
+        "backup_retention_days": {
+          "default": 1,
+          "maximum": 35,
+          "minimum": 0,
+          "title": "Backup Retention Days",
+          "type": "integer"
+        },
+        "publicly_accessible": {
+          "default": false,
+          "title": "Publicly Accessible",
+          "type": "boolean"
+        }
+      },
+      "title": "Database",
+      "type": "object"
+    },
+    "Health": {
+      "additionalProperties": false,
+      "properties": {
+        "readiness": {
+          "anyOf": [
+            {
+              "pattern": "^/[A-Za-z0-9._~/-]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Readiness"
+        },
+        "liveness": {
+          "anyOf": [
+            {
+              "pattern": "^/[A-Za-z0-9._~/-]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Liveness"
+        }
+      },
+      "title": "Health",
+      "type": "object"
+    },
+    "Image": {
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "minLength": 1,
+          "title": "Repository",
+          "type": "string"
+        },
+        "tag": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tag"
+        },
+        "digest": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Digest"
+        },
+        "platforms": {
+          "items": {
+            "enum": [
+              "amd64",
+              "arm64"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Platforms",
+          "type": "array"
+        }
+      },
+      "required": [
+        "repository",
+        "platforms"
+      ],
+      "title": "Image",
+      "type": "object"
+    },
+    "Ingress": {
+      "additionalProperties": false,
+      "properties": {
+        "public": {
+          "title": "Public",
+          "type": "boolean"
+        },
+        "tls": {
+          "default": false,
+          "title": "Tls",
+          "type": "boolean"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host"
+        },
+        "allowed_cidrs": {
+          "default": [],
+          "description": "비우면 별도 제한 없음",
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Cidrs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "public"
+      ],
+      "title": "Ingress",
+      "type": "object"
+    },
+    "Metadata": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[a-z]([-a-z0-9]{0,38}[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        },
+        "repository": {
+          "description": "owner/repo",
+          "pattern": "^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$",
+          "title": "Repository",
+          "type": "string"
+        },
+        "commit": {
+          "pattern": "^[0-9a-f]{7,40}$",
+          "title": "Commit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "repository",
+        "commit"
+      ],
+      "title": "Metadata",
+      "type": "object"
+    },
+    "Network": {
+      "additionalProperties": false,
+      "properties": {
+        "ingress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ingress"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "None 이면 클러스터 밖으로 노출하지 않음"
+        }
+      },
+      "title": "Network",
+      "type": "object"
+    },
+    "Requirements": {
+      "additionalProperties": false,
+      "properties": {
+        "persistence": {
+          "default": false,
+          "description": "재배포 뒤에도 데이터가 남아야 하는가",
+          "title": "Persistence",
+          "type": "boolean"
+        }
+      },
+      "title": "Requirements",
+      "type": "object"
+    },
+    "Resources": {
+      "additionalProperties": false,
+      "properties": {
+        "cpu_request": {
+          "default": "50m",
+          "pattern": "^(\\d+m|\\d+(\\.\\d+)?)$",
+          "title": "Cpu Request",
+          "type": "string"
+        },
+        "memory_request": {
+          "default": "64Mi",
+          "pattern": "^\\d+(Mi|Gi|Ti)$",
+          "title": "Memory Request",
+          "type": "string"
+        },
+        "cpu_limit": {
+          "anyOf": [
+            {
+              "pattern": "^(\\d+m|\\d+(\\.\\d+)?)$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cpu Limit"
+        },
+        "memory_limit": {
+          "anyOf": [
+            {
+              "pattern": "^\\d+(Mi|Gi|Ti)$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory Limit"
+        }
+      },
+      "title": "Resources",
+      "type": "object"
+    },
+    "Runtime": {
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        },
+        "replicas": {
+          "default": 1,
+          "maximum": 10,
+          "minimum": 1,
+          "title": "Replicas",
+          "type": "integer"
+        },
+        "health": {
+          "$ref": "#/$defs/Health",
+          "default": {
+            "readiness": null,
+            "liveness": null
+          }
+        },
+        "resources": {
+          "$ref": "#/$defs/Resources",
+          "default": {
+            "cpu_request": "50m",
+            "memory_request": "64Mi",
+            "cpu_limit": null,
+            "memory_limit": null
+          }
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "평문 값만. 비밀은 secrets 로",
+          "title": "Env",
+          "type": "object"
+        },
+        "termination_grace_seconds": {
+          "default": 30,
+          "maximum": 600,
+          "minimum": 0,
+          "title": "Termination Grace Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "port"
+      ],
+      "title": "Runtime",
+      "type": "object"
+    },
+    "SecretRef": {
+      "additionalProperties": false,
+      "description": "비밀 값 자체는 명세에 넣지 않는다. 어디서 읽을지만 적는다.",
+      "properties": {
+        "name": {
+          "pattern": "^[A-Z_][A-Z0-9_]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "aws-secrets-manager",
+            "gcp-secret-manager",
+            "k8s-secret",
+            "generated"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "source 안의 이름. generated 면 생략",
+          "title": "Key"
+        }
+      },
+      "required": [
+        "name",
+        "source"
+      ],
+      "title": "SecretRef",
+      "type": "object"
+    },
+    "Storage": {
+      "additionalProperties": false,
+      "properties": {
+        "volumes": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Volume"
+          },
+          "title": "Volumes",
+          "type": "array"
+        },
+        "buckets": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Bucket"
+          },
+          "title": "Buckets",
+          "type": "array"
+        }
+      },
+      "title": "Storage",
+      "type": "object"
+    },
+    "Target": {
+      "additionalProperties": false,
+      "properties": {
+        "env": {
+          "enum": [
+            "aws",
+            "gcp",
+            "local"
+          ],
+          "title": "Env",
+          "type": "string"
+        },
+        "region": {
+          "minLength": 1,
+          "title": "Region",
+          "type": "string"
+        },
+        "namespace": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z]([-a-z0-9]{0,38}[a-z0-9])?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "생략하면 metadata.name",
+          "title": "Namespace"
+        }
+      },
+      "required": [
+        "env",
+        "region"
+      ],
+      "title": "Target",
+      "type": "object"
+    },
+    "Volume": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[a-z]([-a-z0-9]{0,38}[a-z0-9])?$",
+          "title": "Name",
+          "type": "string"
+        },
+        "mount_path": {
+          "pattern": "^/[A-Za-z0-9._/-]+$",
+          "title": "Mount Path",
+          "type": "string"
+        },
+        "size": {
+          "pattern": "^\\d+(Mi|Gi|Ti)$",
+          "title": "Size",
+          "type": "string"
+        },
+        "persistent": {
+          "default": true,
+          "title": "Persistent",
+          "type": "boolean"
+        },
+        "access_mode": {
+          "default": "ReadWriteOnce",
+          "enum": [
+            "ReadWriteOnce",
+            "ReadWriteMany"
+          ],
+          "title": "Access Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "mount_path",
+        "size"
+      ],
+      "title": "Volume",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "State.deploy_spec 에 들어가는 전체. baseline 은 파이프라인이 채운다.",
+  "properties": {
+    "api_version": {
+      "const": "crystal.review/v1alpha1",
+      "title": "Api Version",
+      "type": "string"
+    },
+    "kind": {
+      "const": "DeploySpec",
+      "title": "Kind",
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/Metadata"
+    },
+    "target": {
+      "$ref": "#/$defs/Target"
+    },
+    "image": {
+      "$ref": "#/$defs/Image"
+    },
+    "runtime": {
+      "$ref": "#/$defs/Runtime"
+    },
+    "requirements": {
+      "$ref": "#/$defs/Requirements",
+      "default": {
+        "persistence": false
+      }
+    },
+    "database": {
+      "$ref": "#/$defs/Database",
+      "default": {
+        "engine": "none",
+        "version": null,
+        "placement": null,
+        "engine_policy": "preserve",
+        "volume": null,
+        "env_var": "DATABASE_URL",
+        "backup_retention_days": 1,
+        "publicly_accessible": false
+      }
+    },
+    "secrets": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SecretRef"
+      },
+      "title": "Secrets",
+      "type": "array"
+    },
+    "network": {
+      "$ref": "#/$defs/Network",
+      "default": {
+        "ingress": null
+      }
+    },
+    "storage": {
+      "$ref": "#/$defs/Storage",
+      "default": {
+        "volumes": [],
+        "buckets": []
+      }
+    },
+    "baseline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Baseline"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "api_version",
+    "kind",
+    "metadata",
+    "target",
+    "image",
+    "runtime"
+  ],
+  "title": "DeploySpec",
+  "type": "object"
+}

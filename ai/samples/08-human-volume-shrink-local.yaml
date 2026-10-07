@@ -1,0 +1,38 @@
+# 업로드 볼륨을 10Gi → 5Gi 로 줄이려는 요청.
+# 기대: STO-005(high, irreversible) → needs_human, 사유 IRREVERSIBLE
+api_version: crystal.review/v1alpha1
+kind: DeploySpec
+metadata: {name: gallery, repository: Crystal-SBHackathon2026/sample-gallery, commit: e02b9a4}
+target: {env: local, region: busan-local}
+image: {repository: ghcr.io/crystal-sbhackathon2026/sample-gallery, tag: e02b9a4, digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, platforms: [amd64, arm64]}
+runtime:
+  port: 8080
+  replicas: 1
+  health: {readiness: /readyz, liveness: /livez}
+  resources: {cpu_request: 50m, memory_request: 64Mi, cpu_limit: 250m, memory_limit: 256Mi}
+requirements: {persistence: true}
+storage:
+  volumes:
+    - {name: uploads, mount_path: /var/uploads, size: 5Gi, persistent: true}
+network:
+  ingress: {public: false, allowed_cidrs: [192.168.0.0/16]}
+baseline:
+  spec_ref: review-2026-10-05-0003
+  facts: {observed_at: "2026-10-07T09:00:00+09:00"}
+  spec:
+    api_version: crystal.review/v1alpha1
+    kind: DeploySpec
+    metadata: {name: gallery, repository: Crystal-SBHackathon2026/sample-gallery, commit: 77aa310}
+    target: {env: local, region: busan-local}
+    image: {repository: ghcr.io/crystal-sbhackathon2026/sample-gallery, tag: 77aa310, digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, platforms: [amd64, arm64]}
+    runtime:
+      port: 8080
+      replicas: 1
+      health: {readiness: /readyz, liveness: /livez}
+      resources: {cpu_request: 50m, memory_request: 64Mi, cpu_limit: 250m, memory_limit: 256Mi}
+    requirements: {persistence: true}
+    storage:
+      volumes:
+        - {name: uploads, mount_path: /var/uploads, size: 10Gi, persistent: true}
+    network:
+      ingress: {public: false, allowed_cidrs: [192.168.0.0/16]}
