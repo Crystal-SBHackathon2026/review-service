@@ -1,0 +1,36 @@
+# 대상 환경 능력표 초안 — DB-002·SEC-002·STO-001·RUN-004 가 읽는다.
+# verified: false 는 아직 실측 전(EKS·GKE 가 Terraform 에 없음). 팀이 클러스터를 만들면 값을 확인해 true 로 바꾼다.
+# database: placement → engine → 지원 메이저 버전. 버전 목록이 []면 버전 무관.
+
+targets:
+  aws:
+    verified: false
+    arch: [amd64]                  # EKS 노드 인스턴스 타입 미정 — Graviton 이면 arm64
+    database:
+      managed: {postgres: ["16"], mysql: ["8.0"]}   # RDS. 업무 DB 는 postgres 16.15
+      in-cluster: {postgres: ["16"]}
+      volume: {sqlite: []}
+      external: {postgres: [], mysql: []}
+    volume_access_modes: [ReadWriteOnce]           # EBS. EFS 를 붙이면 ReadWriteMany
+    secret_sources: [aws-secrets-manager, k8s-secret, generated]
+
+  gcp:
+    verified: false
+    arch: [amd64]
+    database:
+      managed: {postgres: ["16"], mysql: ["8.0"]}   # Cloud SQL — Terraform 미작성
+      in-cluster: {postgres: ["16"]}
+      volume: {sqlite: []}
+      external: {postgres: [], mysql: []}
+    volume_access_modes: [ReadWriteOnce]           # PD. Filestore 를 붙이면 ReadWriteMany
+    secret_sources: [gcp-secret-manager, k8s-secret, generated]
+
+  local:
+    verified: false
+    arch: [amd64]                  # busan-local 노드 아키텍처 확인 필요
+    database:
+      in-cluster: {postgres: ["16"]}
+      volume: {sqlite: []}
+      external: {postgres: [], mysql: []}
+    volume_access_modes: [ReadWriteOnce]           # k3s local-path
+    secret_sources: [k8s-secret, generated]

@@ -1,0 +1,14 @@
+# Apple Silicon 에서 단일 플랫폼으로 빌드한 이미지(arm64 만)를 amd64 노드에 배포.
+# 기대: RUN-004(high, forbidden) → needs_human, 사유 AUTOFIX_FORBIDDEN
+api_version: crystal.review/v1alpha1
+kind: DeploySpec
+metadata: {name: sample-app, repository: Crystal-SBHackathon2026/sample-app, commit: c7e5d10}
+target: {env: aws, region: ap-northeast-2, namespace: sample-app}
+image: {repository: ghcr.io/crystal-sbhackathon2026/sample-app, tag: c7e5d10, digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, platforms: [arm64]}
+runtime:
+  port: 8080
+  replicas: 2
+  health: {readiness: /healthz, liveness: /healthz}
+  resources: {cpu_request: 50m, memory_request: 64Mi, cpu_limit: 250m, memory_limit: 128Mi}
+network:
+  ingress: {public: true, tls: true, host: app.example.com}

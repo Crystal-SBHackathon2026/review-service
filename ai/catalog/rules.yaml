@@ -1,0 +1,281 @@
+# 정적 검사 규칙 목록 초안 — deploy_spec 기준.
+# ID 형식: <카테고리 접두>-<3자리>. 규칙 문서(S3 rules/), static_check, 평가셋이 모두 이 ID 로 연결된다.
+#
+# autofix
+#   allowed       설정만 바꿔 고칠 수 있다 — patch 후보
+#   forbidden     사람이 정해야 한다 (값 등록, 앱 코드 수정, 되돌릴 수 없는 변경)
+#   when_no_data  baseline 이 없거나 database_has_data == false 일 때만 allowed, 아니면 forbidden
+# irreversible: true 면 사유 코드 IRREVERSIBLE (AUTOFIX_FORBIDDEN 대신)
+# priority: P0 = 데모·평가셋에 필요 (먼저 구현), P1 = 시간 되면
+#
+# Finding.autofix 는 규칙이 인스턴스마다 계산한다 (when_no_data → allowed/forbidden 중 하나로 확정).
+
+rules:
+  # ── database ────────────────────────────────────────────────
+  - id: DB-001
+    category: database
+    severity: high
+    autofix: forbidden
+    irreversible: true
+    priority: P0
+    providers: [any]
+    title: 데이터가 있는 DB 의 엔진 변경
+    check: baseline.database.engine 이 none 이 아니고 지금 engine 과 다르며 database_has_data 가 false 가 아니다
+    fix: 이전 엔진을 유지하거나, 사람이 덤프·변환·복원 계획을 승인한다
+
+  - id: DB-002
+    category: database
+    severity: high
+    autofix: when_no_data
+    priority: P0
+    providers: [any]
+    title: 대상 환경이 지원하지 않는 엔진·배치·버전
+    check: (placement, engine, 메이저 버전) 이 catalog/targets.yaml 의 대상 환경 능력에 없다
+    fix: 같은 환경이 지원하는 조합으로 바꾼다. 엔진이 바뀌면 engine_policy 와 무관하게 데이터 없을 때만 자동
+
+  - id: DB-003
+    category: database
+    severity: high
+    autofix: allowed
+    priority: P0
+    providers: [any]
+    title: SQLite 를 여러 replica 가 공유
+    check: engine == sqlite 이고 runtime.replicas > 1
+    fix: replicas 를 1 로. engine_policy == allow_convert 이고 데이터가 없으면 postgres 전환안도 가능
+
+  - id: DB-004
+    category: database
+    severity: high
+    autofix: forbidden
+    priority: P1
+    providers: [any]
+    title: 영속성이 필요한데 저장소가 없다
+    check: requirements.persistence 이고 engine == none 이며 persistent 볼륨도 없다
+    fix: 앱이 쓸 DB 나 볼륨을 사람이 정한다 (앱 코드와 맞물림)
+
+  - id: DB-005
+    category: database
+    severity: high
+    autofix: allowed
+    priority: P0
+    providers: [any]
+    title: SQLite 파일이 영속 볼륨 밖에 있다
+    check: engine == sqlite 이고 requirements.persistence 인데 database.volume 이 없거나 그 볼륨이 persistent 가 아니다
+    fix: persistent 볼륨을 추가·지정하고 placement 를 volume 으로
+
+  - id: DB-006
+    category: database
+    severity: high
+    autofix: allowed
+    priority: P1
+    providers: [aws, gcp]
+    title: 관리형 DB 가 인터넷에 열려 있다
+    check: placement == managed 이고 publicly_accessible
+    fix: publicly_accessible 를 false 로
+
+  - id: DB-007
+    category: database
+    severity: medium
+    autofix: allowed
+    priority: P1
+    providers: [aws, gcp]
+    title: 관리형 DB 자동 백업 꺼짐
+    check: placement == managed 이고 backup_retention_days == 0
+    fix: backup_retention_days 를 1 이상으로 (Terraform 기본값 1)
+
+  - id: DB-008
+    category: database
+    severity: high
+    autofix: forbidden
+    irreversible: true
+    priority: P1
+    providers: [any]
+    title: DB 메이저 버전 다운그레이드
+    check: baseline 과 엔진이 같고 메이저 버전이 더 낮다
+    fix: 이전 버전 유지. 다운그레이드는 덤프·복원으로만 가능
+
+  # ── secret ──────────────────────────────────────────────────
+  - id: SEC-001
+    category: secret
+    severity: high
+    autofix: forbidden
+    priority: P0
+    providers: [any]
+    title: 비밀 값이 runtime.env 에 평문으로 있다
+    check: env 이름이 PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|CREDENTIAL 을 포함하거나 값이 scheme://user:pass@ 형태
+    fix: 값을 비밀 저장소에 등록하고 secrets 로 옮긴 뒤, 이미 노출된 값은 교체한다. evidence 에 값을 남기지 않는다
+
+  - id: SEC-002
+    category: secret
+    severity: high
+    autofix: forbidden
+    priority: P1
+    providers: [any]
+    title: 대상 환경에 없는 비밀 저장소를 참조
+    check: secrets[].source 가 대상 환경의 secret_sources 에 없다
+    fix: 대상 환경의 저장소에 값을 등록하고 source·key 를 바꾼다
+
+  - id: SEC-003
+    category: secret
+    severity: medium
+    autofix: allowed
+    priority: P1
+    providers: [any]
+    title: 시크릿 이름 중복
+    check: secrets[].name 이 겹친다
+    fix: 중복 항목 제거
+
+  - id: SEC-004
+    category: secret
+    severity: medium
+    autofix: allowed
+    priority: P1
+    providers: [any]
+    title: 같은 이름이 env 와 secrets 에 둘 다 있다
+    check: runtime.env 키와 secrets[].name 이 겹친다
+    fix: runtime.env 쪽 항목 제거
+
+  - id: SEC-005
+    category: secret
+    severity: high
+    autofix: forbidden
+    priority: P0
+    providers: [any]
+    title: DB 접속 정보 시크릿이 없다
+    check: engine 이 postgres 나 mysql 인데 database.env_var 이름의 secrets 항목이 없다
+    fix: 접속 정보를 비밀 저장소에 등록하거나 source generated 로 선언한다
+
+  # ── network ─────────────────────────────────────────────────
+  - id: NET-001
+    category: network
+    severity: low
+    autofix: forbidden
+    priority: P0
+    providers: [any]
+    title: 공개 진입점에 TLS 가 없다
+    check: network.ingress.public 이고 tls 가 false
+    fix: 도메인·인증서 준비 후 tls 를 켠다 (현재 aws overlay 는 HTTP 80 만 — 경고로만 둔다)
+
+  - id: NET-002
+    category: network
+    severity: high
+    autofix: allowed
+    priority: P1
+    providers: [any]
+    title: 내부 전용인데 전체 대역에 열려 있다
+    check: network.ingress.public 이 false 인데 allowed_cidrs 에 0.0.0.0/0 또는 ::/0
+    fix: 전체 대역 항목 제거
+
+  # ── storage ─────────────────────────────────────────────────
+  - id: STO-001
+    category: storage
+    severity: high
+    autofix: forbidden
+    priority: P1
+    providers: [any]
+    title: 대상 환경이 지원하지 않는 볼륨 접근 모드
+    check: volumes[].access_mode 가 대상 환경의 volume_access_modes 에 없다
+    fix: ReadWriteOnce + replicas 1 로 바꿀지, 공유 스토리지를 붙일지 사람이 정한다
+
+  - id: STO-002
+    category: storage
+    severity: high
+    autofix: allowed
+    priority: P1
+    providers: [any]
+    title: ReadWriteOnce 볼륨을 여러 replica 가 쓴다
+    check: DB 용이 아닌 persistent RWO 볼륨이 있고 runtime.replicas > 1 (DB 볼륨은 DB-003 이 맡는다)
+    fix: replicas 를 1 로
+
+  - id: STO-003
+    category: storage
+    severity: high
+    autofix: allowed
+    priority: P0
+    providers: [aws, gcp]
+    title: 버킷이 공개돼 있다
+    check: storage.buckets[].public
+    fix: public 을 false 로. 공개 배포가 필요하면 CDN·서명 URL 을 사람이 정한다
+
+  - id: STO-004
+    category: storage
+    severity: medium
+    autofix: allowed
+    priority: P1
+    providers: [aws, gcp]
+    title: 버킷 암호화 꺼짐
+    check: storage.buckets[].encryption 이 false
+    fix: encryption 을 true 로
+
+  - id: STO-005
+    category: storage
+    severity: high
+    autofix: forbidden
+    irreversible: true
+    priority: P0
+    providers: [any]
+    title: 볼륨 크기 축소
+    check: baseline 에 같은 이름의 persistent 볼륨이 있고 지금 size 가 더 작다
+    fix: 이전 크기 유지. PVC 는 줄일 수 없고 새로 만들면 데이터가 사라진다
+
+  - id: STO-006
+    category: storage
+    severity: high
+    autofix: forbidden
+    irreversible: true
+    priority: P1
+    providers: [any]
+    title: 기존 persistent 볼륨 제거
+    check: baseline 의 persistent 볼륨이 지금 명세에 없다
+    fix: 볼륨을 되살리거나, 사람이 데이터 폐기를 승인한다
+
+  # ── runtime (카테고리 추가 제안 — State 의 Finding.category Literal 에 'runtime' 필요) ──
+  - id: RUN-001
+    category: runtime
+    severity: medium
+    autofix: forbidden
+    priority: P0
+    providers: [any]
+    title: readiness 경로가 없다
+    check: runtime.health.readiness 가 없다
+    fix: 앱에 준비 확인 경로를 만든다 — Rollout progressDeadlineAbort 가 이걸로 실패를 판정한다
+
+  - id: RUN-002
+    category: runtime
+    severity: low
+    autofix: forbidden
+    priority: P1
+    providers: [any]
+    title: liveness 경로가 없다
+    check: runtime.health.liveness 가 없다
+    fix: 외부 의존성 없이 프로세스 생존만 보는 경로를 만든다
+
+  - id: RUN-003
+    category: runtime
+    severity: low
+    autofix: allowed
+    priority: P1
+    providers: [any]
+    title: 이미지가 digest 로 고정되지 않았다
+    check: image.digest 가 없다
+    fix: CI 가 기록한 digest 로 고정 (같은 태그 재푸시 시 다른 이미지가 배포된다)
+
+  - id: RUN-004
+    category: runtime
+    severity: high
+    autofix: forbidden
+    priority: P0
+    providers: [any]
+    title: 이미지 아키텍처가 대상 노드와 맞지 않다
+    check: image.platforms 와 대상 환경 arch 의 교집합이 비어 있다
+    fix: 대상 아키텍처를 포함해 다시 빌드한다 (buildx 멀티 플랫폼)
+
+  - id: RUN-005
+    category: runtime
+    severity: low
+    autofix: allowed
+    priority: P1
+    providers: [any]
+    title: 리소스 상한이 없다
+    check: runtime.resources 의 cpu_limit 또는 memory_limit 이 없다
+    fix: base rollout.yaml 과 같은 값(250m / 128Mi)으로 채운다

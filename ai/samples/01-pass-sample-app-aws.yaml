@@ -1,0 +1,19 @@
+# 팀 sample-app 을 지금 gitops aws overlay 그대로 옮긴 명세.
+# 기대: NET-001(low, TLS 없음) 하나 → 경고만 있으므로 pass
+api_version: crystal.review/v1alpha1
+kind: DeploySpec
+metadata: {name: sample-app, repository: Crystal-SBHackathon2026/sample-app, commit: b084c24}
+target: {env: aws, region: ap-northeast-2, namespace: sample-app}
+image:
+  repository: ghcr.io/crystal-sbhackathon2026/sample-app
+  tag: b084c24
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef   # 샘플 값
+  platforms: [amd64]
+runtime:
+  port: 8080
+  replicas: 2
+  health: {readiness: /healthz, liveness: /healthz}
+  resources: {cpu_request: 50m, memory_request: 64Mi, cpu_limit: 250m, memory_limit: 128Mi}
+  env: {DEPLOY_ENV: aws, DEPLOY_REGION: ap-northeast-2}
+network:
+  ingress: {public: true, tls: false}

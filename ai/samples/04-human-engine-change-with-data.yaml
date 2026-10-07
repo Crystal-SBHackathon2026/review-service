@@ -1,0 +1,38 @@
+# 운영 중인 postgres 16(데이터 있음)을 mysql 8.0 으로 바꾸려는 요청. baseline 은 파이프라인이 채운 것을 흉내.
+# 기대: DB-001(high, irreversible) → needs_human, 사유 IRREVERSIBLE
+api_version: crystal.review/v1alpha1
+kind: DeploySpec
+metadata: {name: orders, repository: Crystal-SBHackathon2026/sample-orders, commit: 9d41a07}
+target: {env: aws, region: ap-northeast-2}
+image: {repository: ghcr.io/crystal-sbhackathon2026/sample-orders, tag: 9d41a07, digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, platforms: [amd64]}
+runtime:
+  port: 8080
+  replicas: 2
+  health: {readiness: /readyz, liveness: /livez}
+  resources: {cpu_request: 100m, memory_request: 128Mi, cpu_limit: 500m, memory_limit: 256Mi}
+requirements: {persistence: true}
+database: {engine: mysql, version: "8.0", placement: managed}
+secrets:
+  - {name: DATABASE_URL, source: aws-secrets-manager, key: orders/database-url}
+network:
+  ingress: {public: true, tls: true, host: orders.example.com}
+baseline:
+  spec_ref: review-2026-10-06-0007
+  facts: {database_has_data: true, observed_at: "2026-10-07T09:00:00+09:00"}
+  spec:
+    api_version: crystal.review/v1alpha1
+    kind: DeploySpec
+    metadata: {name: orders, repository: Crystal-SBHackathon2026/sample-orders, commit: 51c0b3e}
+    target: {env: aws, region: ap-northeast-2}
+    image: {repository: ghcr.io/crystal-sbhackathon2026/sample-orders, tag: 51c0b3e, digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, platforms: [amd64]}
+    runtime:
+      port: 8080
+      replicas: 2
+      health: {readiness: /readyz, liveness: /livez}
+      resources: {cpu_request: 100m, memory_request: 128Mi, cpu_limit: 500m, memory_limit: 256Mi}
+    requirements: {persistence: true}
+    database: {engine: postgres, version: "16", placement: managed}
+    secrets:
+      - {name: DATABASE_URL, source: aws-secrets-manager, key: orders/database-url}
+    network:
+      ingress: {public: true, tls: true, host: orders.example.com}

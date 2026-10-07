@@ -1,0 +1,23 @@
+# SQLite 인데 replicas 2. 첫 배포(데이터 없음), engine_policy allow_convert.
+# 기대: DB-003(high, allowed) → fix. 패치 후 재검사 finding 0 → pass
+api_version: crystal.review/v1alpha1
+kind: DeploySpec
+metadata: {name: todo, repository: Crystal-SBHackathon2026/sample-todo, commit: 3f9c2e1}
+target: {env: gcp, region: asia-northeast1}
+image:
+  repository: ghcr.io/crystal-sbhackathon2026/sample-todo
+  tag: 3f9c2e1
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  platforms: [amd64, arm64]
+runtime:
+  port: 3000
+  replicas: 2
+  health: {readiness: /readyz, liveness: /livez}
+  resources: {cpu_request: 50m, memory_request: 64Mi, cpu_limit: 250m, memory_limit: 256Mi}
+requirements: {persistence: true}
+database: {engine: sqlite, placement: volume, volume: data, env_var: DATABASE_PATH, engine_policy: allow_convert}
+storage:
+  volumes:
+    - {name: data, mount_path: /data, size: 1Gi, persistent: true, access_mode: ReadWriteOnce}
+network:
+  ingress: {public: true, tls: true, host: todo.example.com}

@@ -1,0 +1,23 @@
+# SQLite 단일 replica + 영속 볼륨, 로컬 k3s. 정상 반례(오탐 확인용).
+# 기대: finding 0 → 검색·LLM 없이 pass
+api_version: crystal.review/v1alpha1
+kind: DeploySpec
+metadata: {name: todo, repository: Crystal-SBHackathon2026/sample-todo, commit: 3f9c2e1}
+target: {env: local, region: busan-local}
+image:
+  repository: ghcr.io/crystal-sbhackathon2026/sample-todo
+  tag: 3f9c2e1
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  platforms: [amd64, arm64]
+runtime:
+  port: 3000
+  replicas: 1
+  health: {readiness: /readyz, liveness: /livez}
+  resources: {cpu_request: 50m, memory_request: 64Mi, cpu_limit: 250m, memory_limit: 256Mi}
+requirements: {persistence: true}
+database: {engine: sqlite, placement: volume, volume: data, env_var: DATABASE_PATH}
+storage:
+  volumes:
+    - {name: data, mount_path: /data, size: 1Gi, persistent: true, access_mode: ReadWriteOnce}
+network:
+  ingress: {public: false, allowed_cidrs: [192.168.0.0/16]}
