@@ -1,0 +1,1 @@
+gitops@4b89369 의 apps/ 사본 — overlay 렌더러가 팀 overlay 를 그대로 재현하는지 비교하는 기준

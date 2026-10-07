@@ -1,0 +1,51 @@
+# Argo Rollouts: 새 버전이 progressDeadlineSeconds 안에 헬스체크(readiness)를 통과하지 못하면
+# 배포를 자동 중단(abort)하고 기존(stable) 버전을 계속 서비스한다.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: sample-app
+  labels:
+    app: sample-app
+spec:
+  replicas: 2
+  progressDeadlineSeconds: 60
+  progressDeadlineAbort: true
+  strategy:
+    canary:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+    spec:
+      containers:
+        - name: sample-app
+          image: ghcr.io/crystal-sbhackathon2026/sample-app
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DEPLOY_ENV
+              value: base
+            - name: DEPLOY_REGION
+              value: unknown
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
