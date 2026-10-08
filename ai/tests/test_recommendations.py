@@ -97,6 +97,13 @@ async def test_no_recommendation_and_no_values_is_plain_approval() -> None:
     assert route_start({**state, "human_decision": human}) == "static_check"
 
 
+async def test_same_path_with_and_without_value_is_rejected() -> None:
+    state = await pause("04-human-engine-change-with-data.yaml")
+    ops = [{"op": "replace", "path": "/database/version", "value": "15"}, {"op": "replace", "path": "/database/version"}]
+    with pytest.raises(PatchError, match="함께"):
+        resolve_human_decision(state, {"decision": "approved", "approver": "tester", "edited_ops": ops})
+
+
 async def test_unanswered_path_without_recommendation_is_rejected() -> None:
     state = await pause("10-human-mixed-aws.yaml")
     with pytest.raises(PatchError, match="권장값이 없다"):

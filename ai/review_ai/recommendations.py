@@ -118,6 +118,9 @@ def resolve_human_decision(state: dict[str, Any], human: dict[str, Any]) -> dict
             unanswered.append(path)
         else:
             supplied.append(copy.deepcopy(op))
+    both = sorted(set(unanswered) & {op["path"] for op in supplied})
+    if both:
+        raise PatchError(f"같은 경로를 값 있음·값 없음으로 함께 보냈다: {', '.join(both)}")
     recommendations = (state.get("decision") or {}).get("recommendations") or []
     defaults = [copy.deepcopy(op) for rec in recommendations for op in rec["ops"]]
     if not human.get("use_recommendations", True):
