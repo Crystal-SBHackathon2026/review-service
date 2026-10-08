@@ -1,0 +1,48 @@
+# ai/ 판단 모듈 검사 — 테스트·샘플/스키마 정합성·평가셋(가짜 LLM, API 키 없음).
+# 외부 호출 없음: Claude 는 가짜 LLM, Qdrant 는 메모리 모드, kubectl kustomize 는 러너에 기본 설치돼 있다.
+name: ai-ci
+
+on:
+  pull_request:
+    paths: ["ai/**", ".github/workflows/ai-ci.yml"]
+  push:
+    branches: [main]
+    paths: ["ai/**", ".github/workflows/ai-ci.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ai
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: ai/pyproject.toml
+
+      - name: 의존성 설치
+        run: pip install -e ".[dev]"
+
+      - name: 테스트 (커버리지 90% 미만이면 실패)
+        run: pytest -q --cov=review_ai --cov-report=term --cov-fail-under=90
+
+      - name: 샘플·규칙 목록·기대 결과 정합성, JSON Schema 가 커밋된 것과 같은지
+        run: |
+          python scripts/validate_samples.py
+          git diff --exit-code -- schema/deploy_spec.schema.json \
+            || { echo "::error::DeploySpec 을 바꿨으면 validate_samples.py 로 schema/deploy_spec.schema.json 을 다시 만들어 커밋하세요"; exit 1; }
+
+      - name: 평가셋 (가짜 LLM — 코드 게이트가 틀린 출력을 잡는지)
+        run: python scripts/run_eval.py
