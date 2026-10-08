@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 STATUS_CONTEXT = "review-service/intake"
 STALE_AFTER = timedelta(minutes=2)
 SWEEP_EVERY_SECONDS = 60.0
+READ_CONCURRENCY = 8  # 레포 분석 파일 읽기 — GitHub 은 동시 요청이 많으면 secondary rate limit 을 건다
 
 
 class IntakeGitHub(Protocol):
@@ -138,7 +139,13 @@ async def _context(deps: ApiDeps, github: IntakeGitHub, repository: str, head_sh
     base = GenerationContext(repository=repository, target=Target(env=env, region=region))
     tree = await github.list_files(repository, head_sha)
     paths = files_to_read(tree)
-    texts = await asyncio.gather(*(github.get_file(repository, p, head_sha) for p in paths))
+    limit = asyncio.Semaphore(READ_CONCURRENCY)
+
+    async def read(path: str) -> str:
+        async with limit:
+            return await github.get_file(repository, path, head_sha)
+
+    texts = await asyncio.gather(*map(read, paths))
     analysis = analyze_repository(base, tree, dict(zip(paths, texts, strict=True)))
     return analysis.context, None, analysis.findings
 

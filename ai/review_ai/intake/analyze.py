@@ -2,7 +2,8 @@
 
 입력은 PR head 의 파일 경로 목록과 읽은 파일 원문이다 (Review API 가 GitHub 에서 읽어 넘긴다). 네트워크 없음.
 채운 값마다 근거(파일·이유)를 남기고, 하나라도 애매하면 그 항목은 비워 둔다 → prepare_spec 이 확인 항목으로 남겨
-커밋하지 않는다. '없다'는 결론(DB 없음·시크릿 없음·저장소 없음)은 의존성 파일과 소스를 다 읽었을 때만 낸다.
+커밋하지 않는다. '없다'는 결론(DB 없음·시크릿 없음·저장소 없음)은 의존성 파일과 소스를 다 읽었을 때만 낸다 —
+분석하지 않는 언어(Java·Ruby·셸 …)나 하위 디렉터리·다른 형식의 의존성 파일이 있으면 내지 않는다.
 
 | 항목 | 근거 |
 |---|---|
@@ -30,10 +31,17 @@ from review_ai.spec.deploy_spec import Database, Health, Image, Requirements, Ru
 
 MANIFESTS = ("package.json", "requirements.txt", "pyproject.toml", "go.mod")
 SOURCE_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".ts", ".mts", ".py", ".go"})
-SKIP_DIRS = frozenset({"node_modules", "vendor", "dist", "build", "test", "tests", "__tests__", "spec", "docs",
+SKIP_DIRS = frozenset({"node_modules", "vendor", "dist", "build", "public", "static", "assets",
+                       "test", "tests", "__tests__", "spec", "docs",
                        "examples", "scripts", ".github", "migrations"})
 TEST_NAME = re.compile(r"(\.(test|spec)\.[cm]?[jt]s|_test\.go|^test_.*\.py|_test\.py)$")
 MAX_SOURCE_FILES = 40
+# 이 파일이 있으면 소스·의존성을 다 읽었다고 할 수 없다 — '없음' 결론을 내지 않는다
+UNSCANNED_SUFFIXES = frozenset({".java", ".kt", ".kts", ".scala", ".groovy", ".rb", ".php", ".rs", ".cs", ".fs",
+                                ".ex", ".exs", ".erl", ".clj", ".swift", ".dart", ".c", ".cc", ".cpp", ".lua", ".pl",
+                                ".sh", ".csproj"})
+OTHER_MANIFESTS = frozenset({"Pipfile", "setup.py", "setup.cfg", "Gemfile", "pom.xml", "build.gradle",
+                             "build.gradle.kts", "Cargo.toml", "composer.json", "mix.exs", "deno.json"})
 
 # 생태계:이름 → 엔진. go 는 모듈 경로 접두로 맞춘다 (pgx/v5 등).
 DRIVERS: dict[str, str] = {
@@ -55,6 +63,13 @@ STATEFUL = frozenset({
     "py:sqlalchemy", "py:django", "py:peewee", "py:tortoise-orm", "py:sqlmodel", "py:pymongo", "py:motor",
     "py:redis",
     "go:gorm.io/gorm", "go:github.com/jmoiron/sqlx", "go:go.mongodb.org/mongo-driver", "go:github.com/redis/go-redis",
+})
+# 환경변수를 이름 패턴 없이 읽는 설정 라이브러리 — 필요한 시크릿을 소스에서 알 수 없다
+ENV_LIBS = frozenset({
+    "npm:convict", "npm:config", "npm:nconf", "npm:env-var", "npm:@nestjs/config",
+    "py:python-decouple", "py:environs", "py:django-environ", "py:pydantic-settings", "py:dynaconf",
+    "go:github.com/kelseyhightower/envconfig", "go:github.com/caarlos0/env", "go:github.com/spf13/viper",
+    "go:github.com/knadh/koanf",
 })
 STORAGE_DEPS = frozenset({
     "npm:multer", "npm:formidable", "npm:busboy", "npm:aws-sdk", "npm:@aws-sdk/client-s3",
@@ -79,12 +94,13 @@ DYNAMIC_ENV = re.compile(
     r"|BaseSettings")
 FILE_WRITES = re.compile(
     r"\b(?:writeFile(?:Sync)?|appendFile(?:Sync)?|createWriteStream|mkdirSync)\(|\bfs\.(?:mkdir|rename|copyFile)\("
-    r"|\bopen\([^)\n]*,\s*['\"][wax]|\.write_(?:text|bytes)\(|\bshutil\.(?:copy\w*|move)\("
+    r"|\bopen\([^)\n]*,\s*['\"][wax]|\bmode\s*=\s*['\"][wax]|\.open\(\s*['\"][wax]|\.write_(?:text|bytes)\(|\bshutil\.(?:copy\w*|move)\("
     r"|\bos\.(?:Create|WriteFile|OpenFile|Mkdir|MkdirAll)\(|\bioutil\.WriteFile\(")
 SQLITE_STDLIB = re.compile(r"['\"]node:sqlite['\"]|^\s*(?:import|from)\s+sqlite3\b", re.MULTILINE)
 GO_SQL = re.compile(r"\"database/sql\"")
 LOCAL_URL = re.compile(r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::(\d+))?(/[A-Za-z0-9._~/-]*)?")
-GHCR = re.compile(r"ghcr\.io/[^\s\"'\]]+")
+GHCR = re.compile(r"ghcr\.io/[^\s\"'\],]+")
+IMAGE_PATH = re.compile(r"ghcr\.io(?:/[a-z0-9._-]+){2,}")
 PLATFORM_LINE = re.compile(r"(?:platforms?:|--platform[= ])([^\n]+)")
 LINUX_ARCH = re.compile(r"linux/(amd64|arm64)")
 RUNS_ON = re.compile(r"runs-on:\s*([^\n]+)")
@@ -139,9 +155,21 @@ def _is_workflow(path: str) -> bool:
 def _source_files(tree: Iterable[str]) -> list[str]:
     def wanted(path: str) -> bool:
         p = PurePosixPath(path)
-        return (p.suffix in SOURCE_SUFFIXES and not p.name.endswith(".d.ts") and not TEST_NAME.search(p.name)
+        return (p.suffix in SOURCE_SUFFIXES and not p.name.endswith((".d.ts", ".min.js"))
+                and not TEST_NAME.search(p.name)
                 and not SKIP_DIRS.intersection(p.parts[:-1]))
     return sorted(p for p in tree if wanted(p))
+
+
+def _unscanned(tree: Iterable[str]) -> list[str]:
+    """분석하지 않는 언어의 소스, 하위 디렉터리·다른 형식의 의존성 파일."""
+    def gap(path: str) -> bool:
+        p = PurePosixPath(path)
+        if SKIP_DIRS.intersection(p.parts[:-1]):
+            return False
+        return (p.name in OTHER_MANIFESTS or p.suffix in UNSCANNED_SUFFIXES
+                or (p.name in MANIFESTS and len(p.parts) > 1))
+    return sorted(p for p in tree if gap(p))
 
 
 def files_to_read(tree: Iterable[str]) -> tuple[str, ...]:
@@ -258,7 +286,7 @@ def _image(repository: str, workflows: Mapping[str, str]) -> Decision:
     joined = "\n".join(texts)
     candidates = {re.split(r"[:@]", m.group(0), maxsplit=1)[0].lower().rstrip("/")
                   for m in GHCR.finditer(joined)}
-    usable = sorted(c for c in candidates if not re.search(r"[${}]", c) and c.count("/") >= 2)
+    usable = sorted(c for c in candidates if IMAGE_PATH.fullmatch(c))
     source = ", ".join(sorted(workflows))
     if len(usable) != 1 or len(usable) != len(candidates):
         found = ", ".join(sorted(candidates)) or "없음"
@@ -291,7 +319,7 @@ def _runtime(docker: _Docker | None) -> Decision:
             Finding(path, "Dockerfile", f"EXPOSE {port}, HEALTHCHECK {probe}", True))
 
 
-def _database(deps: _Deps, sources: Mapping[str, str], complete: bool) -> Decision:
+def _database(deps: _Deps, sources: Mapping[str, str], gap: str | None) -> Decision:
     path = "/database"
     if not deps.manifests:
         return None, Finding(path, "-", "의존성 파일(package.json·requirements.txt·pyproject.toml·go.mod)이 없다", False)
@@ -304,30 +332,34 @@ def _database(deps: _Deps, sources: Mapping[str, str], complete: bool) -> Decisi
         engines = sorted({_engine(d) for d in drivers})
         return None, Finding(path, source, f"{_bare(drivers)} → {'/'.join(engines)} 사용. 배치·버전은 레포로 정할 수 없다",
                              False)
-    if not complete:
-        return None, Finding(path, source, "소스를 다 읽지 못해 내장 sqlite 사용 여부를 확인하지 못했다", False)
+    if gap:
+        return None, Finding(path, source, f"{gap} — DB 사용 여부를 확인하지 못했다", False)
     if hits := [p for p, text in sources.items() if SQLITE_STDLIB.search(text) or GO_SQL.search(text)]:
         return None, Finding(path, ", ".join(hits), "표준 라이브러리 DB(sqlite·database/sql)를 쓴다", False)
     return Database(), Finding(path, source, "DB 드라이버·ORM 의존성이 없다", True)
 
 
-def _storage(docker: _Docker | None, deps: _Deps, sources: Mapping[str, str], complete: bool) -> Decision:
+def _storage(docker: _Docker | None, deps: _Deps, sources: Mapping[str, str], gap: str | None) -> Decision:
     path = "/storage"
     if docker is not None and docker.volumes:
         return None, Finding(path, "Dockerfile", f"VOLUME {' '.join(docker.volumes)} — 크기·보존을 정할 수 없다", False)
     if found := _matches(deps.names, STORAGE_DEPS):
         return None, Finding(path, ", ".join(deps.manifests), f"업로드·오브젝트 스토리지 의존성 {_bare(found)}", False)
-    if not complete or not deps.manifests:
-        return None, Finding(path, "-", "소스·의존성을 다 읽지 못해 파일 저장 여부를 확인하지 못했다", False)
+    if gap or not deps.manifests:
+        why = gap or "의존성 파일이 없다"
+        return None, Finding(path, "-", f"{why} — 파일 저장 여부를 확인하지 못했다", False)
     if writers := [p for p, text in sources.items() if FILE_WRITES.search(text)]:
         return None, Finding(path, ", ".join(writers), "파일을 쓰는 코드가 있다 — 볼륨 필요 여부를 정할 수 없다", False)
     return Storage(), Finding(path, f"소스 {len(sources)}개", "VOLUME·파일 쓰기·스토리지 의존성이 없다", True)
 
 
-def _secrets(docker: _Docker | None, sources: Mapping[str, str], complete: bool) -> Decision:
+def _secrets(docker: _Docker | None, deps: _Deps, sources: Mapping[str, str], gap: str | None) -> Decision:
     path = "/secrets"
-    if not complete:
-        return None, Finding(path, "-", f"소스를 다 읽지 못했다(최대 {MAX_SOURCE_FILES}개) — 환경변수를 확인하지 못했다", False)
+    if gap:
+        return None, Finding(path, "-", f"{gap} — 환경변수를 확인하지 못했다", False)
+    if libs := _matches(deps.names, ENV_LIBS):
+        return None, Finding(path, ", ".join(deps.manifests),
+                             f"설정 라이브러리 {_bare(libs)} 가 환경변수를 읽는다 — 필요한 시크릿을 알 수 없다", False)
     if dynamic := [p for p, text in sources.items() if DYNAMIC_ENV.search(text)]:
         return None, Finding(path, ", ".join(dynamic), "환경변수를 이름 없이 읽는다 — 필요한 시크릿을 알 수 없다", False)
     names = {m.group(1) for text in sources.values() for pattern in ENV_READS for m in pattern.finditer(text)}
@@ -351,21 +383,31 @@ def _bare(names: Sequence[str]) -> str:
     return ", ".join(n.split(":", 1)[1] for n in names)
 
 
+def _gap(tree: Sequence[str], expected: Sequence[str], sources: Mapping[str, str]) -> str | None:
+    """'없음' 결론을 막는 이유 — 다 읽었으면 None."""
+    if unscanned := _unscanned(tree):
+        more = f" 외 {len(unscanned) - 3}개" if len(unscanned) > 3 else ""
+        return f"분석하지 않는 파일이 있다({', '.join(unscanned[:3])}{more})"
+    if len(sources) < len(expected):
+        return f"소스가 {len(expected)}개라 다 읽지 못했다(최대 {MAX_SOURCE_FILES}개)"
+    return None
+
+
 def analyze_repository(base: GenerationContext, tree: Iterable[str], files: Mapping[str, str]) -> RepoAnalysis:
     """tree 는 PR head 의 전체 파일 경로, files 는 files_to_read(tree) 중 읽은 것. base 의 레포·대상은 그대로 쓴다."""
     tree = list(tree)
     expected = _source_files(tree)
     sources = {p: files[p] for p in expected if p in files}
-    complete = len(sources) == len(expected)
+    gap = _gap(tree, expected, sources)
     docker = _dockerfile(files["Dockerfile"]) if "Dockerfile" in files else None
     deps = _dependencies(files)
     workflows = {p: text for p, text in files.items() if _is_workflow(p)}
 
     image, f_image = _image(base.repository, workflows)
     runtime, f_runtime = _runtime(docker)
-    database, f_database = _database(deps, sources, complete)
-    storage, f_storage = _storage(docker, deps, sources, complete)
-    secrets, f_secrets = _secrets(docker, sources, complete)
+    database, f_database = _database(deps, sources, gap)
+    storage, f_storage = _storage(docker, deps, sources, gap)
+    secrets, f_secrets = _secrets(docker, deps, sources, gap)
     requirements, f_requirements = _requirements(database, storage)
     values = {"image": image, "runtime": runtime, "database": database, "storage": storage, "secrets": secrets,
               "requirements": requirements}

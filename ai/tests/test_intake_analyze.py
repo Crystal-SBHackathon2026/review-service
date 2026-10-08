@@ -146,6 +146,7 @@ def test_image_from_templated_repository_and_declared_platforms() -> None:
     ("env:\n  IMAGE: docker.io/me/app\n", "(없음)"),
     ("tags: ghcr.io/a/x\n---\ntags: ghcr.io/a/y\n", "ghcr.io/a/x, ghcr.io/a/y"),
     ("tags: ghcr.io/${{ env.OWNER }}/app\n", "${{"),
+    ("tags: ghcr.io/a/x,ghcr.io/a/x-dev\n", "ghcr.io/a/x, ghcr.io/a/x-dev"),
     ("tags: ghcr.io/a/x\njobs:\n  b:\n    runs-on: ubuntu-24.04-arm\n", "빌드 플랫폼"),
 ])
 def test_image_left_unverified(workflow: str | None, why: str) -> None:
@@ -204,6 +205,31 @@ def test_too_many_sources_keeps_absence_claims_unverified() -> None:
     assert analysis.context.runtime is not None and analysis.context.image is not None
 
 
+@pytest.mark.parametrize(("extra", "why"), [
+    ({"src/main/java/App.java": 'String pw = System.getenv("DB_PASSWORD");'}, "src/main/java/App.java"),
+    ({"docker-entrypoint.sh": "exec node src/server.js\n"}, "docker-entrypoint.sh"),
+    ({"server/package.json": json.dumps({"dependencies": {"pg": "8"}})}, "server/package.json"),
+    ({"Pipfile": "[packages]\npsycopg2 = '*'\n"}, "Pipfile"),
+])
+def test_unscanned_languages_or_manifests_block_absence_claims(extra: dict[str, str], why: str) -> None:
+    """루트 package.json 만 보고 Java·Pipfile 백엔드에 'DB·시크릿 없음'을 커밋하면 안 된다."""
+    analysis = analyze(sample_files(**extra))
+
+    assert set(analysis.unresolved) == {"/database", "/storage", "/secrets", "/requirements"}
+    assert why in analysis.unresolved["/secrets"].reason
+
+
+def test_unscanned_list_is_shortened() -> None:
+    extra = {f"lib/m{i}.rb": "" for i in range(5)}
+    assert "외 2개" in analyze(sample_files(**extra)).unresolved["/database"].reason
+
+
+def test_frontend_bundles_are_not_scanned() -> None:
+    analysis = analyze(sample_files(**{"public/vendor.js": "x(process.env)", "src/lib.min.js": "x(process.env)"}))
+
+    assert analysis.unresolved == {}
+
+
 # --- secrets --------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize(("code", "why"), [
@@ -219,6 +245,17 @@ def test_secret_env_reads_stay_unverified(code: str, why: str) -> None:
     analysis = analyze(sample_files(**{"src/config.js": code}))
 
     assert analysis.context.secrets is None and why in analysis.unresolved["/secrets"].reason
+
+
+@pytest.mark.parametrize(("manifest", "text", "lib"), [
+    ("requirements.txt", "flask\npython-decouple==3.8\n", "python-decouple"),
+    ("package.json", json.dumps({"dependencies": {"express": "4", "convict": "6"}}), "convict"),
+    ("go.mod", "module x\nrequire github.com/kelseyhightower/envconfig v1.4.0\n", "envconfig"),
+])
+def test_config_libraries_hide_env_names(manifest: str, text: str, lib: str) -> None:
+    analysis = analyze(sample_files(**{"package.json": None, manifest: text}))
+
+    assert analysis.context.secrets is None and lib in analysis.unresolved["/secrets"].reason
 
 
 def test_secret_name_in_dockerfile_env_counts() -> None:
@@ -242,6 +279,8 @@ def test_named_env_reads_with_get_are_not_dynamic() -> None:
     ({"package.json": json.dumps({"dependencies": {"multer": "1"}})}, "multer"),
     ({"src/save.js": "fs.writeFileSync('/tmp/x', data);\n"}, "파일을 쓰는 코드"),
     ({"app/save.py": "with open(path, 'wb') as f:\n    f.write(b)\n"}, "파일을 쓰는 코드"),
+    ({"app/save.py": "f = open(path, mode='a')\n"}, "파일을 쓰는 코드"),
+    ({"app/save.py": "with Path(p).open('w') as f:\n    pass\n"}, "파일을 쓰는 코드"),
     ({"main.go": "f, _ := os.Create(name)\n"}, "파일을 쓰는 코드"),
 ])
 def test_storage_signals_stay_unverified(change: dict[str, str], why: str) -> None:
