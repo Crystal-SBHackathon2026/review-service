@@ -12,7 +12,9 @@ from pathlib import Path
 
 import yaml
 
-KNOWLEDGE_DIR = Path(__file__).resolve().parents[2] / "knowledge"
+from review_ai.resources import data_dir
+
+KNOWLEDGE_DIR = data_dir("knowledge")
 FRONT_MATTER = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 
 

@@ -1,0 +1,37 @@
+# 워커·Review API 가 review_ai 를 import 하도록 설치한다.
+#   pip install -e ./ai            # 개발 (소스의 catalog/·knowledge/ 를 그대로 읽는다)
+#   pip install "./ai[qdrant]"     # 이미지 빌드 (catalog/·knowledge/ 를 패키지 안에 복사한다)
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "review-ai"
+version = "0.1.0"
+description = "AI 리뷰 서비스 판단 노드 — static_check · 근거 검색 · judge · overlay 렌더러"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.7,<3",
+    "pyyaml>=6",
+    "langgraph>=1.2,<2",
+    "anthropic>=1.11",
+]
+
+[project.optional-dependencies]
+qdrant = [
+    "qdrant-client>=1.19,<2",
+    "fastembed>=0.8",  # 로컬 다국어 임베딩 (첫 실행 시 모델 내려받음)
+]
+dev = [
+    "review-ai[qdrant]",
+    "pytest>=9",
+    "pytest-asyncio>=1",
+    "pytest-cov>=7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["review_ai"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"catalog" = "review_ai/_data/catalog"
+"knowledge" = "review_ai/_data/knowledge"
