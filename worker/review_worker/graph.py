@@ -43,6 +43,7 @@ from review_ai.judge.node import judge_unavailable, make_judge
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.patching import apply_ops
+from review_ai.recommendations import resolve_human_decision
 from review_ai.retrieval import Retriever, make_retrieve_evidence
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.state import DeployResult, ReviewState
@@ -194,8 +195,16 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         if decision["decision"] == "rejected":
             await repo.update_review(rid, status="rejected", human_decision=decision)
             return Command(goto=END, update={"human_decision": decision, "status": "rejected"})
+        try:
+            decision = resolve_human_decision(state, decision)
+        except ValueError as exc:
+            await repo.update_review(rid, error=f"사람 응답 적용 실패: {exc}"[:2000])
+            return Command(goto="await_human", update={"human_decision": None})
         await repo.update_review(rid, human_decision=decision, error=None)
-        goto = "apply_human_edits" if decision["edited_ops"] else "await_ci"
+        if decision["edited_ops"]:
+            goto = "apply_human_edits"
+        else:
+            goto = "commit_fix" if applied_ops(state) else "await_ci"
         return Command(goto=goto, update={"human_decision": decision})
 
     async def apply_human_edits(state: dict[str, Any]) -> Command:
@@ -307,7 +316,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     graph.add_node("record_result", record_result)
     graph.add_node("apply_patch", apply_patch)
     graph.add_node("await_human", await_human)
-    graph.add_node("wait_human", wait_human, destinations=("apply_human_edits", "await_ci", END))
+    graph.add_node("wait_human", wait_human, destinations=("apply_human_edits", "await_human", "await_ci", "commit_fix", END))
     graph.add_node("apply_human_edits", apply_human_edits, destinations=("static_check", "await_human"))
     graph.add_node("commit_fix", commit_fix, destinations=(END,))
     graph.add_node("await_ci", await_ci)

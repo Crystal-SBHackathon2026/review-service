@@ -212,6 +212,91 @@ async def test_decision_edited_ops_checked_against_paused_spec(env: Env, ops: li
 
 # --- POST /webhooks/github -------------------------------------------------------------------------
 
+
+async def _paused_with_recommendations(env: Env, name: str = "04-human-engine-change-with-data.yaml") -> str:
+    from review_ai.graph import initial_state, run_graph
+    from review_ai.judge.fake_llm import FAKES
+    from review_ai.retrieval.file_retriever import FileRetriever
+
+    spec = yaml.safe_load(sample_text(name))
+    paused = await run_graph(initial_state(spec, review_id="paused"), llm=FAKES["oracle"](), retriever=FileRetriever())
+    env.put_spec(sample_text(name))
+    rid = env.request_review().json()["review_id"]
+    await env.set_status(rid, status="needs_human", decision=paused["decision"],
+                         final_spec={k: v for k, v in paused["deploy_spec"].items() if k != "baseline"})
+    return rid
+
+
+async def test_approval_without_values_uses_server_recommendations(env: Env) -> None:
+    rid = await _paused_with_recommendations(env)
+    displayed = env.client.get(f"/reviews/{rid}").json()
+    assert displayed["decision"]["recommendations"][0]["source"] == "baseline"
+    response = env.client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "tester"})
+    assert response.status_code == 202
+    msg = parse_review_resumed(env.publisher.sent[-1][2])
+    assert msg.human_decision.use_recommendations and not msg.human_decision.edited_ops
+
+
+@pytest.mark.parametrize("op", [
+    {"op": "replace", "path": "/database/version"},
+    {"op": "replace", "path": "/database/version", "value": ""},
+])
+async def test_partial_answer_keeps_unanswered_value_through_message(env: Env, op: dict) -> None:
+    rid = await _paused_with_recommendations(env)
+    response = env.client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "tester",
+                              "edited_ops": [{"op": "replace", "path": "/database/engine", "value": "postgres"}, op]})
+    assert response.status_code == 202
+    msg = parse_review_resumed(env.publisher.sent[-1][2])
+    assert msg.human_decision.as_state()["edited_ops"][1] == op
+
+
+async def test_explicit_null_is_distinct_from_omitted_value(env: Env) -> None:
+    rid = await _paused_with_recommendations(env)
+    response = env.client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "tester",
+                              "edited_ops": [{"op": "replace", "path": "/database/version", "value": None}]})
+    assert response.status_code == 202
+    msg = parse_review_resumed(env.publisher.sent[-1][2])
+    assert msg.human_decision.as_state()["edited_ops"] == [{"op": "replace", "path": "/database/version", "value": None}]
+
+
+async def test_unanswered_unknown_value_does_not_publish(env: Env) -> None:
+    rid = await _paused_with_recommendations(env, "10-human-mixed-aws.yaml")
+    before = len(env.publisher.sent)
+    response = env.client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "tester",
+                              "edited_ops": [{"op": "add", "path": "/runtime/health/readiness"}]})
+    assert response.status_code == 422
+    assert len(env.publisher.sent) == before
+
+
+@pytest.mark.parametrize("path", ["/storage/volumes/0/size/typo", "/storage/volumes/2/size"])
+async def test_unanswered_invalid_path_does_not_publish(env: Env, path: str) -> None:
+    rid = await _paused_with_recommendations(env, "08-human-volume-shrink-local.yaml")
+    before = len(env.publisher.sent)
+    response = env.client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "tester",
+                              "edited_ops": [{"op": "replace", "path": path}]})
+    assert response.status_code == 422
+    assert len(env.publisher.sent) == before
+    assert env.repo.reviews[rid]["status"] == "needs_human"
+
+
+async def test_client_cannot_supply_server_default_audit(env: Env) -> None:
+    rid = await _paused_with_recommendations(env)
+    before = len(env.publisher.sent)
+    response = env.client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "tester",
+                              "defaulted_ops": []})
+    assert response.status_code == 422
+    assert len(env.publisher.sent) == before
+
+
+async def test_unknown_recommendation_needs_input_or_explicit_opt_out(env: Env) -> None:
+    rid = await _paused_with_recommendations(env, "06-human-plaintext-secret.yaml")
+    before = len(env.publisher.sent)
+    body = {"decision": "approved", "approver": "tester"}
+    assert env.client.post(f"/reviews/{rid}/decision", json=body).status_code == 422
+    assert len(env.publisher.sent) == before
+    assert env.client.post(f"/reviews/{rid}/decision", json={**body, "use_recommendations": False}).status_code == 202
+
+
 def check_suite(conclusion: str = "success", slug: str = "github-actions", action: str = "completed") -> dict:
     return {"action": action, "check_suite": {"head_sha": HEAD, "conclusion": conclusion, "app": {"slug": slug}}}
 

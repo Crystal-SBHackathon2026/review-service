@@ -59,15 +59,15 @@ async def test_human_round_keeps_why_ai_stopped_and_who_approved() -> None:
     assert snap["human"] == {"decision": "approved", "approver": "hyeyeon"}
 
 
-async def test_leftover_after_human_edit_goes_back_to_human_not_autofix() -> None:
+async def test_unanswered_field_uses_recommendation_with_human_edit() -> None:
     paused = await _review("10-human-mixed-aws.yaml")  # RUN-001(사람) + STO-003(자동 수정 가능)
 
     final = await _resume(paused, _approved(ADD_READINESS))  # 사람은 RUN-001 만 고쳤다
 
-    assert final["status"] == "needs_human"
-    assert final["decision"]["reasons"] == ["LOOP_EXHAUSTED"]
-    assert [f["rule_id"] for f in final["findings"]] == ["STO-003"]
-    assert final["applied_ops"] == [ADD_READINESS]  # AI 패치는 적용되지 않았다
+    assert final["status"] == "pass"
+    assert not final["findings"]
+    assert final["applied_ops"] == [{"op": "replace", "path": "/storage/buckets/0/public", "value": False}, ADD_READINESS]
+    assert final["rounds"][0]["defaulted_ops"] == final["applied_ops"][:1]
     assert final["patch"] is None
 
 
@@ -81,7 +81,7 @@ async def test_human_resume_keeps_earlier_ai_rounds_in_order() -> None:
 
     final = await _resume(paused, _approved(ADD_READINESS))
 
-    assert [op["path"] for op in final["applied_ops"]] == ["/runtime/replicas", "/runtime/health/readiness"]
+    assert [op["path"] for op in final["applied_ops"]] == ["/runtime/replicas", "/storage/buckets/0/public", "/runtime/health/readiness"]
     assert [r["round"] for r in final["rounds"]] == [0, 1]
 
 

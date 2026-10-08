@@ -19,6 +19,7 @@ from review_ai.judge.llm import LlmClient, LlmRefused, LlmUnavailable
 from review_ai.judge.prompt import PROMPT_VERSION, build_request
 from review_ai.judge.schema import LlmItem, LlmReview
 from review_ai.judge.validate import validate_output
+from review_ai.recommendations import build_recommendations
 from review_ai.state import Finding
 from review_ai.verdict import Validation, decide_verdict
 
@@ -38,6 +39,8 @@ def _result(state: dict[str, Any], review: LlmReview | None, validation: Validat
     decision = decide_verdict(state.get("findings") or [], state.get("retrieved_docs") or [], review, validation,
                               rounds=state.get("rounds") or [], llm_meta=meta, autofix_allowed=autofix_allowed(state))
     verdict = decision["verdict"]
+    trusted_patch = patch if validation.get("schema_ok") and validation.get("citations_ok") else None
+    decision["recommendations"] = build_recommendations(state["deploy_spec"], state.get("findings") or [], trusted_patch)
     return {"decision": decision, "patch": patch if verdict == "fix" else None, "status": verdict}
 
 

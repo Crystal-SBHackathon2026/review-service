@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from review_ai.graph import check_edited_ops
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
+from review_ai.recommendations import resolve_human_decision
 from review_ai.spec.deploy_spec import REPOSITORY, DeploySpec
 from review_api.argocd import ArgoCdEvent
 from review_common.github import GitHubError, SpecNotFound
@@ -152,12 +153,14 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             raise HTTPException(404, "검토가 없다")
         if row["status"] != "needs_human":
             raise HTTPException(409, f"needs_human 상태에서만 결정할 수 있다 (지금 {row['status']})")
-        if body.decision == "approved" and body.edited_ops:
+        if body.decision == "approved" and (body.edited_ops or body.use_recommendations):
             # edited_ops 는 멈춘 State 의 deploy_spec 기준 — 워커가 멈출 때 final_spec 에 남긴 것과 같다
             if row["final_spec"] is None:
                 raise HTTPException(409, "검토 중인 명세가 아직 기록되지 않았다")
             try:
-                check_edited_ops(row["final_spec"], [op.as_op() for op in body.edited_ops])
+                resolved = resolve_human_decision({"deploy_spec": row["final_spec"], "decision": row.get("decision")},
+                                                 body.as_state())
+                check_edited_ops(row["final_spec"], resolved["edited_ops"])
             except ValueError as exc:
                 raise HTTPException(422, {"message": "edited_ops 를 적용할 수 없다", "errors": str(exc)}) from exc
         msg = HumanDecisionResumed(review_id=review_id, human_decision=body, resumed_at=datetime.now(UTC))

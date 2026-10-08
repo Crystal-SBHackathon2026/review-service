@@ -125,10 +125,11 @@ class Harness:
         await self.resume({"review_id": review_id, "kind": "ci_completed",
                            "ci": {"head_sha": head_sha, "conclusion": conclusion}})
 
-    async def human(self, review_id: str, decision: str, edited_ops: list[dict[str, Any]] | None = None) -> None:
+    async def human(self, review_id: str, decision: str, edited_ops: list[dict[str, Any]] | None = None,
+                    *, use_recommendations: bool = True) -> None:
         await self.resume({"review_id": review_id, "kind": "human_decision",
                            "human_decision": {"decision": decision, "approver": "hyeyeon",
-                                              "edited_ops": edited_ops or []}})
+                                              "edited_ops": edited_ops or [], "use_recommendations": use_recommendations}})
 
     def row(self, review_id: str = "rv_20261008_test") -> dict[str, Any]:
         return self.repo.reviews[review_id]

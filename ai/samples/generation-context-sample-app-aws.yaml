@@ -1,0 +1,16 @@
+# 파이프라인이 이미 알고 있는 sample-app 설정을 전달하는 예시. deploy.yaml 자체가 아니다.
+# 이 파일은 검증된 stateless sample-app 예시이며 임의 앱의 요구사항으로 재사용하지 않는다.
+repository: Crystal-SBHackathon2026/sample-app
+target: {env: aws, region: ap-northeast-2, namespace: sample-app}
+image:
+  repository: ghcr.io/crystal-sbhackathon2026/sample-app
+  platforms: [amd64]
+runtime:
+  port: 8080
+  health: {readiness: /healthz, liveness: /healthz}
+  env: {DEPLOY_ENV: aws, DEPLOY_REGION: ap-northeast-2}
+requirements: {persistence: false}
+database: {engine: none}
+secrets: []
+storage: {}
+# 내부 접근 후보가 기본값이다. 앱을 외부에 공개할 때 파이프라인이 확인한 network 를 전달한다.
