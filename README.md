@@ -54,6 +54,14 @@ docker compose --profile app up -d --build
 | `ARGOCD_WEBHOOK_TOKEN` | API | 있으면 `/webhooks/argocd` 가 `Authorization: Bearer <토큰>` 을 확인한다 |
 | `ANTHROPIC_API_KEY` `REVIEW_LLM_MODEL` | 워커 | judge LLM. 키가 없으면 판단이 필요한 검토는 `LLM_UNAVAILABLE` 로 사람에게 간다 |
 
+## 검토가 시작되는 곳
+
+- **GitHub 조직 웹훅** → `POST /webhooks/github` (이벤트: `pull_request`, `check_suite`)
+  - `pull_request` `opened`·`synchronize`·`reopened`, base 가 기본 브랜치인 PR 만 → head SHA 의 `deploy.yaml` 검토
+  - `deploy.yaml` 이 없으면 `{"skipped": "no deploy.yaml"}`, 같은 레포·head SHA 검토가 있으면 `{"skipped": "already reviewed"}`
+  - 새 검토를 만들면 그 PR 의 끝나지 않은 검토(`received`·`reviewing`·`needs_human`·`waiting_ci`)는 `superseded`
+- `POST /reviews` — 직접 요청 (PR 번호를 모르므로 superseded 대상이 아니다)
+
 ## 상태 흐름 (`reviews.status`)
 
 ```

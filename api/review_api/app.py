@@ -4,7 +4,8 @@
     GET  /reviews/{review_id}           상태·verdict·사유·rounds·deploy_result
     GET  /verify?sha=<PR head SHA>      그 SHA 의 검토가 통과했는지 (CI 용)
     POST /reviews/{review_id}/decision  needs_human 검토에 사람 결정 → review.resumed(human_decision)
-    POST /webhooks/github               check_suite completed → review.resumed(ci_completed)
+    POST /webhooks/github               pull_request opened·synchronize·reopened → 검토 시작
+                                        check_suite completed → review.resumed(ci_completed)
     POST /webhooks/argocd               배포 Healthy·Degraded 기록, Healthy 면 baselines 갱신
     GET  /healthz
 """
@@ -93,37 +94,10 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
 
     @app.post("/reviews", status_code=202)
     async def create_review(body: ReviewIn, request: Request) -> dict[str, str]:
-        deps_ = d(request)
-        ref = body.spec_ref
         try:
-            raw = await deps_.specs.get_file(ref.repository, ref.path, ref.commit)
+            review_id = await start_review(d(request), body.spec_ref.model_dump(), body.requested_by)
         except SpecNotFound as exc:
             raise HTTPException(404, str(exc)) from exc
-        except GitHubError as exc:
-            raise HTTPException(502, str(exc)) from exc
-        try:
-            loaded = yaml.safe_load(raw)
-        except yaml.YAMLError as exc:
-            raise HTTPException(422, {"message": f"{ref.path} YAML 파싱 실패", "errors": str(exc)}) from exc
-        try:
-            DeploySpec.model_validate(loaded)
-        except ValidationError as exc:
-            raise HTTPException(422, {"message": "deploy_spec 형식 오류", "errors": _errors(exc)}) from exc
-
-        review_id = new_review_id()
-        spec_ref = ref.model_dump()
-        message = build_review_requested(loaded, review_id=review_id,
-                                         spec_ref=spec_ref, requested_by=body.requested_by,
-                                         requested_at=datetime.now(UTC))
-        await deps_.repo.insert_review(review_id=review_id, app=message.app, target_env=message.target_env,
-                                       repo_id=message.repo_id, spec_ref=spec_ref, pr_head_sha=ref.commit,
-                                       requested_by=body.requested_by)
-        try:
-            await deps_.publisher.send(REQUESTED_TOPIC, message.repo_id, message.model_dump_json().encode())
-        except Exception as exc:
-            log.exception("review %s: review.requested 발행 실패", review_id)
-            await deps_.repo.update_review(review_id, status="failed", error=f"publish: {exc}"[:2000])
-            raise HTTPException(503, "검토 요청을 큐에 넣지 못했다") from exc
         return {"review_id": review_id}
 
     @app.get("/reviews/{review_id}")
@@ -177,9 +151,11 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         expected = "sha256=" + hmac.new(deps_.github_webhook_secret.encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, x_hub_signature_256):
             raise HTTPException(401, "서명이 맞지 않다")
+        payload = json.loads(body)
+        if x_github_event == "pull_request":
+            return await on_pull_request(deps_, payload)
         if x_github_event != "check_suite":
             return {"ignored": f"event {x_github_event}"}
-        payload = json.loads(body)
         if payload.get("action") != "completed":
             return {"ignored": f"action {payload.get('action')}"}
         suite = payload.get("check_suite") or {}
@@ -218,6 +194,72 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         return {"ignored": "이미지 태그와 맞는 병합 SHA 가 없다"}
 
     return app
+
+
+async def start_review(deps: ApiDeps, spec_ref: dict[str, str], requested_by: str, *,
+                       pr_number: int | None = None) -> str:
+    """deploy.yaml 읽기 → 형식 검사(422) → review_id 발급 → DB received → review.requested 발행. review_id 반환.
+
+    파일이 없으면 SpecNotFound 를 그대로 올린다 (POST /reviews 는 404, pull_request 웹훅은 skip).
+    """
+    repository, path, commit = spec_ref["repository"], spec_ref["path"], spec_ref["commit"]
+    try:
+        raw = await deps.specs.get_file(repository, path, commit)
+    except SpecNotFound:
+        raise
+    except GitHubError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    try:
+        loaded = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise HTTPException(422, {"message": f"{path} YAML 파싱 실패", "errors": str(exc)}) from exc
+    try:
+        DeploySpec.model_validate(loaded)
+    except ValidationError as exc:
+        raise HTTPException(422, {"message": "deploy_spec 형식 오류", "errors": _errors(exc)}) from exc
+
+    review_id = new_review_id()
+    message = build_review_requested(loaded, review_id=review_id, spec_ref=spec_ref, requested_by=requested_by,
+                                     requested_at=datetime.now(UTC))
+    await deps.repo.insert_review(review_id=review_id, app=message.app, target_env=message.target_env,
+                                  repo_id=message.repo_id, spec_ref=spec_ref, pr_head_sha=commit,
+                                  requested_by=requested_by, pr_number=pr_number)
+    try:
+        await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.model_dump_json().encode())
+    except Exception as exc:
+        log.exception("review %s: review.requested 발행 실패", review_id)
+        await deps.repo.update_review(review_id, status="failed", error=f"publish: {exc}"[:2000])
+        raise HTTPException(503, "검토 요청을 큐에 넣지 못했다") from exc
+    return review_id
+
+
+PR_ACTIONS = frozenset({"opened", "synchronize", "reopened"})
+
+
+async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, Any]:
+    """기본 브랜치로 가는 PR 이 열리거나 커밋이 올라오면 그 head SHA 의 deploy.yaml 을 검토한다.
+
+    - 같은 레포·같은 head SHA 검토가 이미 있으면 새로 만들지 않는다. 워커 commit_fix 가 PR 브랜치에 커밋하면
+      synchronize 가 다시 오는데, 워커가 브랜치를 옮기기 전에 autofix_commit 검토를 DB 에 넣어 둔다
+    - 새 검토를 만들면 그 PR 의 끝나지 않은 이전 검토는 superseded 로 넘긴다
+    """
+    action = payload.get("action")
+    if action not in PR_ACTIONS:
+        return {"ignored": f"action {action}"}
+    pr, repo = payload["pull_request"], payload["repository"]
+    if pr["base"]["ref"] != repo["default_branch"]:
+        return {"ignored": f"base {pr['base']['ref']}"}
+    repository, head_sha, number = repo["full_name"], pr["head"]["sha"], pr["number"]
+    existing = await deps.repo.find_by_head(repository, head_sha)
+    if existing is not None:
+        return {"skipped": "already reviewed", "review_id": existing["review_id"]}
+    spec_ref = {"repository": repository, "commit": head_sha, "path": "deploy.yaml"}
+    try:
+        review_id = await start_review(deps, spec_ref, payload["sender"]["login"], pr_number=number)
+    except SpecNotFound:
+        return {"skipped": "no deploy.yaml"}
+    superseded = await deps.repo.supersede_open(repository=repository, pr_number=number, superseded_by=review_id)
+    return {"review_id": review_id, "superseded": superseded}
 
 
 @asynccontextmanager

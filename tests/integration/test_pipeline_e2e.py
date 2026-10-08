@@ -104,7 +104,7 @@ def worker_graph(repo: PostgresReviewRepository, github: FakeGitHub, checkpointe
 
 
 async def test_migrate_is_idempotent(conninfo: str) -> None:
-    assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql"]
+    assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql", "0003_pr_number.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -144,6 +144,22 @@ async def test_repository_on_postgres(pool: Any) -> None:
                              pr_head_sha="b" * 40, requested_by="autofix:rv_1")
     await repo.update_review("rv_1", status="superseded", superseded_by="rv_2")
     assert (await repo.get_review("rv_1"))["superseded_by"] == "rv_2"
+    await repo.update_review("rv_1", status="committed", verdict="pass")  # superseded 상태는 덮어쓰지 않는다
+    assert ((await repo.get_review("rv_1"))["status"], (await repo.get_review("rv_1"))["verdict"]) == (
+        "superseded", "pass")
+
+    # pull_request 웹훅: 같은 레포·head 검토 찾기, 같은 PR 의 끝나지 않은 검토 넘기기
+    for rid, sha, pr, status in [("rv_a", "1" * 40, 9, "needs_human"), ("rv_b", "2" * 40, 9, "committed"),
+                                 ("rv_c", "3" * 40, 10, "waiting_ci")]:
+        await repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=REPO,
+                                 spec_ref={**ref, "commit": sha}, pr_head_sha=sha, requested_by="it", pr_number=pr)
+        await repo.update_review(rid, status=status)
+    assert (await repo.find_by_head(REPO, "1" * 40))["review_id"] == "rv_a"
+    assert await repo.find_by_head("other/repo", "1" * 40) is None
+    assert await repo.supersede_open(repository=REPO, pr_number=9, superseded_by="rv_2") == ["rv_a"]
+    assert (await repo.get_review("rv_a"))["superseded_by"] == "rv_2"
+    assert (await repo.get_review("rv_b"))["status"] == "committed"
+    assert (await repo.get_review("rv_c"))["status"] == "waiting_ci"
 
 
 async def test_checkpoint_survives_worker_restart(pool: Any) -> None:

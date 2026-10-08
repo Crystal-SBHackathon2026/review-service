@@ -245,7 +245,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
                                          requested_at=datetime.now(UTC), autofix_commit=True)
         await repo.insert_review(review_id=new_rid, app=message.app, target_env=message.target_env,
                                  repo_id=message.repo_id, spec_ref=new_ref, pr_head_sha=new_sha,
-                                 requested_by=message.requested_by)
+                                 requested_by=message.requested_by, pr_number=pull["number"])
         try:
             await github.update_branch(repository, pull["head"]["ref"], new_sha)
         except GitHubError as exc:  # 그사이 사람이 푸시했다 — 이 수정은 버린다
