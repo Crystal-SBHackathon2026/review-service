@@ -12,11 +12,12 @@ low finding 은 사람 확인 조건에서 뺀다 (결정 #6). 안 빼면 HTTP �
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import copy
+from collections.abc import Mapping, Sequence
 from typing import Any, TypedDict
 
 from review_ai.judge.schema import LlmReview
-from review_ai.state import REASON_CODES, Decision, Doc, Finding
+from review_ai.state import REASON_CODES, Decision, Doc, Finding, PatchOp
 
 MAX_PATCH_ROUNDS = 2
 LOW_SCORE_THRESHOLD = 0.5  # dense cosine 기준. ruleId 정확 매칭에는 쓰지 않는다
@@ -119,3 +120,16 @@ def round_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         "reasons": list(decision["reasons"]),
         "patch": state.get("patch"),
     }
+
+
+def applied_ops(state: Mapping[str, Any]) -> list[PatchOp]:
+    """원본 deploy_spec 에 적용할 수정 지시서 — 회차별 패치를 순서대로 이어 붙인다. 커밋 단계가 이걸 쓴다.
+
+    apply_patch 는 patch 를 rounds 로 옮기고 비우므로, fix 루프를 돈 최종 State 는 verdict=pass·patch=None 이고
+    실제 ops 는 rounds[*].patch.ops 에만 있다. 마지막 judge 가 fix 로 끝났으면(아직 적용 전) 현재 patch.ops 를 덧붙인다.
+    입력 State 는 바꾸지 않는다 (ops 는 복사본).
+    """
+    patches = [r.get("patch") for r in state.get("rounds") or []]
+    if (state.get("decision") or {}).get("verdict") == "fix":
+        patches.append(state.get("patch"))
+    return [copy.deepcopy(op) for patch in patches if patch for op in patch["ops"]]
