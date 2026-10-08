@@ -120,6 +120,16 @@ def test_buckets_and_allowed_cidrs_are_reported_not_dropped() -> None:
     assert "INGRESS_CIDRS_NOT_ENFORCED" in codes(local)
 
 
+def test_unenforced_ingress_cidrs_block_commit() -> None:
+    """막으라고 한 대역을 강제하지 못하면 공개로 열린다 — fail-closed (aws 는 ALB 가 강제하므로 경고 없음)."""
+    local = render_overlay(spec_of("05-fix-engine-unsupported-local.yaml"))
+    assert "INGRESS_CIDRS_NOT_ENFORCED" in {w.code for w in local.blocking}
+    raw = load_sample_dict("05-fix-engine-unsupported-local.yaml")
+    raw["target"] = {**raw["target"], "env": "aws"}
+    aws = render_overlay(DeploySpec.model_validate(raw))
+    assert "INGRESS_CIDRS_NOT_ENFORCED" not in codes(aws)
+
+
 def test_sample_app_has_no_blocking_warning() -> None:
     """데모 경로: 태그·digest 없이 쓴 sample-app 은 경고 없이 커밋할 수 있다 (이미지는 CI 몫)."""
     raw = load_sample_dict("01-pass-sample-app-aws.yaml")
