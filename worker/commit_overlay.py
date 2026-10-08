@@ -39,8 +39,16 @@ class GitClient(Protocol):
     ) -> str:
         """gitops 레포의 directory 아래를 files 로 맞추고 커밋한다. 커밋 SHA 를 돌려준다.
 
-        directory 안에 있지만 files 에 없는 파일은 지운다. overlay 는 생성물이라
-        남은 파일이 있으면 kustomize 가 없는 리소스를 참조할 수 있다.
+        구현체가 지켜야 할 것 두 가지.
+
+        1. directory 안에 있지만 files 에 없는 파일은 지운다. overlay 는 생성물이라
+           명세에서 볼륨이 빠졌는데 예전 pvc-*.yaml 이 남으면 kustomize 가 없는
+           리소스를 참조한다.
+        2. push 가 충돌하면 rebase 해서 다시 시도한다. gitops 에 커밋하는 곳이
+           셋이다 — sample-app CI(이미지 태그), review-service CI(이미지 태그),
+           그리고 이 노드. 같은 시점에 겹칠 수 있다.
+
+        네트워크 오류는 TransientError 로 올린다. 재시도해도 안 되는 충돌도 마찬가지다.
         """
         ...
 
