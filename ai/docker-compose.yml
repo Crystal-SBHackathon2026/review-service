@@ -1,0 +1,13 @@
+# 로컬 개발용 Qdrant. 클라이언트(qdrant-client 1.19)와 같은 마이너 버전으로 고정한다.
+#   docker compose up -d qdrant
+#   .venv/bin/python scripts/index_knowledge.py --qdrant-url http://localhost:6333
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+volumes:
+  qdrant-data:
