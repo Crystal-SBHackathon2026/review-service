@@ -12,8 +12,18 @@ from review_ai.errors import TransientError
 from review_ai.judge.prompt import JudgeRequest
 from review_ai.judge.schema import LlmReview
 
-DEFAULT_MODEL = os.environ.get("REVIEW_LLM_MODEL", "claude-opus-5-5")
+DEFAULT_MODEL = os.environ.get("REVIEW_LLM_MODEL", "claude-sonnet-5-5")
 MAX_TOKENS = 8000
+
+
+BILLING_ERROR_MARKER = "credit balance"
+
+
+def _is_billing_error(exc: Any) -> bool:
+    body = getattr(exc, "body", None)
+    error = body.get("error") if isinstance(body, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    return isinstance(message, str) and BILLING_ERROR_MARKER in message.lower()
 
 
 class LlmUnavailable(RuntimeError):
@@ -65,6 +75,10 @@ class ClaudeLLM:
             )
         except (a.AuthenticationError, a.PermissionDeniedError) as exc:
             raise LlmUnavailable(str(exc)) from exc
+        except a.BadRequestError as exc:
+            if _is_billing_error(exc):  # 잔액 부족은 요청 버그가 아니라 계정 상태 — AI 분석 불가로 내린다
+                raise LlmUnavailable("Claude API 크레딧 잔액 부족") from exc
+            raise
         except (a.APITimeoutError, a.APIConnectionError, a.RateLimitError, a.InternalServerError) as exc:
             raise TransientError(f"Claude API 일시 오류: {type(exc).__name__}") from exc
         except a.APIStatusError as exc:

@@ -79,9 +79,20 @@ S3 `review-docs` 버킷과 같은 구조다: `rules/{any,aws,gcp,local}/<ruleId>
 - 임베딩은 로컬 `paraphrase-multilingual-MiniLM-L12-v2`(fastembed, 키 없음). 실측해 보니 무관한 사례가 0.34~0.43 으로 나와 판정은 ruleId 매칭에 기대고 의미 검색은 보조로만 쓴다.
 
 ```bash
-docker run -d -p 6333:6333 qdrant/qdrant
+docker compose up -d qdrant                                            # qdrant v1.19.1 (클라이언트와 같은 마이너)
 .venv/bin/python scripts/index_knowledge.py --qdrant-url http://localhost:6333
 ```
+
+다시 돌려도 같은 청크는 같은 point ID 라 중복되지 않는다(2026-10-08 실측: 103청크, 두 번 돌려도 103).
+
+문서 원본은 이 레포의 `knowledge/` 이고, S3 버킷은 그 사본이다. 문서를 고친 뒤:
+
+```bash
+scripts/sync_knowledge_s3.sh oneaction-review-docs-<계정ID>            # dry-run
+scripts/sync_knowledge_s3.sh oneaction-review-docs-<계정ID> --apply    # 업로드 (*.md 만, 지운 문서는 버킷에서도 지움)
+```
+
+워커 쪽에서 버킷을 받아 색인할 때는 `aws s3 sync s3://<버킷>/ <dir>` 뒤 `index_knowledge.py --knowledge-dir <dir>`.
 
 ## 평가셋 (eval/cases.yaml)
 

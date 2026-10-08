@@ -45,7 +45,7 @@ async def make_retriever(kind: str, url: str | None):
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--llm", choices=["fake", "claude"], default="fake")
-    parser.add_argument("--model", default=None, help="claude 모델 ID (기본 REVIEW_LLM_MODEL 또는 claude-opus-5-5)")
+    parser.add_argument("--model", default=None, help="claude 모델 ID (기본 REVIEW_LLM_MODEL 또는 claude-sonnet-5-5)")
     parser.add_argument("--repeat", type=int, default=1, help="reviewer 케이스 반복 횟수")
     parser.add_argument("--retriever", choices=["file", "qdrant"], default="file")
     parser.add_argument("--qdrant-url", default=None)

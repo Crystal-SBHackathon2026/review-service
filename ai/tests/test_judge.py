@@ -203,9 +203,15 @@ async def test_cached_llm_calls_once_per_input() -> None:
 # ── Claude 클라이언트 (네트워크 없이) ───────────────────────────
 
 
-def _status_error(cls: type, status: int) -> Exception:
+def _status_error(cls: type, status: int, message: str | None = None) -> Exception:
     response = httpx.Response(status, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
-    return cls("x", response=response, body=None)
+    body = {"type": "error", "error": {"type": "invalid_request_error", "message": message}} if message else None
+    return cls("x", response=response, body=body)
+
+
+# 2026-10-08 실측: 잔액 부족은 401 이 아니라 400 invalid_request_error 로 온다
+CREDIT_TOO_LOW = ("Your credit balance is too low to access the Anthropic API. "
+                  "Please go to Plans & Billing to upgrade or purchase credits.")
 
 
 class _FakeMessages:
@@ -245,9 +251,11 @@ async def test_claude_sends_structured_output_and_cached_system() -> None:
         (_status_error(anthropic.InternalServerError, 500), TransientError),
         (_status_error(anthropic.APIStatusError, 529), TransientError),
         (_status_error(anthropic.AuthenticationError, 401), LlmUnavailable),
+        (_status_error(anthropic.BadRequestError, 400, CREDIT_TOO_LOW), LlmUnavailable),
         (_status_error(anthropic.BadRequestError, 400), anthropic.BadRequestError),
+        (_status_error(anthropic.BadRequestError, 400, "max_tokens: field required"), anthropic.BadRequestError),
     ],
-    ids=["429", "500", "529", "401", "400-is-bug"],
+    ids=["429", "500", "529", "401", "400-credit-too-low", "400-is-bug", "400-request-bug"],
 )
 async def test_claude_error_mapping(error: Exception, expected: type) -> None:
     state = await prepared("07-fix-public-bucket.yaml")
