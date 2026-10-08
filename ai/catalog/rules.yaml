@@ -171,7 +171,7 @@ rules:
     category: storage
     severity: high
     autofix: forbidden
-    priority: P1
+    priority: P0
     providers: [any]
     title: 대상 환경이 지원하지 않는 볼륨 접근 모드
     check: volumes[].access_mode 가 대상 환경의 volume_access_modes 에 없다

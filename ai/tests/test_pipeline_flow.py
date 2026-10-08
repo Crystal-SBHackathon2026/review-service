@@ -23,6 +23,10 @@ from tests.conftest import SAMPLES, load_sample_dict
 
 SPEC_REF = {"repository": "github.com/crystal/sample-app", "commit": "abc123", "path": "deploy.yaml"}
 SAMPLE_NAMES = sorted(p.name for p in SAMPLES.glob("[0-9]*.yaml"))
+BLOCKED_AFTER_PASS = {
+    "05-fix-engine-unsupported-local.yaml": {"DB_PROVISIONING_REQUIRED"},
+    "07-fix-public-bucket.yaml": {"BUCKET_PROVISIONING_REQUIRED"},
+}
 
 
 def _expected(name: str) -> tuple[str, bool]:
@@ -55,7 +59,10 @@ async def test_sample_flows_through_pipeline(name: str) -> None:
     app_spec = {k: v for k, v in original.items() if k != "baseline"}
     fixed = apply_ops(app_spec, final["applied_ops"])
     assert not [f for f in run_static_check(DeploySpec.model_validate(fixed)) if f["severity"] != "low"]
-    assert render_overlay(DeploySpec.model_validate(fixed)).files
+    rendered = render_overlay(DeploySpec.model_validate(fixed))
+    assert rendered.files
+    # 검토를 통과해도 overlay 로 못 만드는 것(DB·버킷)은 커밋 단계가 blocked 로 멈춘다
+    assert {w.code for w in rendered.blocking} == BLOCKED_AFTER_PASS.get(name, set())
 
 
 async def test_fixed_spec_is_lost_if_commit_stage_reads_patch() -> None:

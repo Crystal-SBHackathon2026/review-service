@@ -16,7 +16,7 @@ from review_ai.judge.prompt import JudgeRequest
 from review_ai.state import Finding
 
 FAKE_MODEL = "fake-oracle"
-FIX_KIND = {"SEC-001": "env", "RUN-001": "code", "RUN-004": "code", "DB-001": "none", "STO-005": "none"}
+FIX_KIND = {"SEC-001": "env", "RUN-001": "code", "RUN-004": "code", "DB-001": "none", "STO-005": "none", "STO-001": "none"}
 
 
 def _op(op: str, path: str, value: Any = None) -> dict[str, Any]:

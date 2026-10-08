@@ -31,7 +31,8 @@ pip install "./ai[qdrant]"        # 이미지 빌드 — catalog/·knowledge/ �
 | 워커 그래프 | `judge.node.make_judge(llm)` | `CachedLLM(ClaudeLLM())` 권장. `llm=None` 이면 LLM_UNAVAILABLE |
 | 워커 재시도 실패 시 | `judge.node.judge_unavailable(state, error=...)` | RetryPolicy 소진 뒤 이 결과로 State 를 채우고 계속. 원인은 `decision.llm.error` |
 | apply_patch | `verdict.round_snapshot(state)` · `patching.apply_ops(spec, patch["ops"])` | 참고 구현: `graph.apply_patch` |
-| 커밋 단계 | `verdict.applied_ops(final)` · `patching.apply_ops(원본, ops)` · `overlay.render_overlay(spec)` → `files`·`warnings` | **spec_ref 로 앱 레포에서 읽은 원본**에 `applied_ops(final)` 를 적용해 렌더링한다. ⚠️ `patch["ops"]` 가 아니다 — apply_patch 가 patch 를 rounds 로 옮기고 비우므로 고쳐서 통과한 최종 State 는 `patch=None` 이고, ops 는 `rounds[*].patch.ops` 에 회차 순서대로 있다. `applied_ops == []` 면 수정 없이 통과(원본 그대로). Kafka 사본은 가려져 있어 렌더러가 거절한다. 회차별 diff 는 `rounds[i].patch.files` 에 있다 |
+| 커밋 단계 | `verdict.applied_ops(final)` · `patching.apply_ops(원본, ops)` · `overlay.render_overlay(spec)` → `files`·`warnings`·`blocking` | **spec_ref 로 앱 레포에서 읽은 원본**에 `applied_ops(final)` 를 적용해 렌더링한다. ⚠️ `patch["ops"]` 가 아니다 — apply_patch 가 patch 를 rounds 로 옮기고 비우므로 고쳐서 통과한 최종 State 는 `patch=None` 이고, ops 는 `rounds[*].patch.ops` 에 회차 순서대로 있다. `applied_ops == []` 면 수정 없이 통과(원본 그대로). Kafka 사본은 가려져 있어 렌더러가 거절한다. 회차별 diff 는 `rounds[i].patch.files` 에 있다. `rendered.blocking` 이 비어 있지 않으면 커밋하지 말고 `blocked` 로 돌려준다 |
+| 커밋 노드 (`commit_overlay`, 배포 담당) | `state.DeployResult` → State 의 `deploy_result` | `{status: committed \| blocked, commit_sha, reason}`. verdict 가 pass 일 때만 쓴다. `status`(verdict 값)와 섞지 않는다. push 실패처럼 재시도할 오류는 `errors.TransientError`, DB·버킷이 없어 멈추는 건 `blocked` 로 정상 반환 |
 | 결과 저장 (업무 DB·결과 화면) | 최종 State 의 `status`·`decision`·`findings`·`rounds` | 고쳐서 통과하면 최종 `findings`·`decision.items`·`retrieved_docs` 는 재검사 결과라 비어 있다. **무엇을 왜 고쳤는지는 `rounds[i]`** 에 있다 — `{round, finding_ids, findings, verdict, reasons, items(why·cited_rule_ids), doc_ids, patch(ops·files)}` |
 | 단독 실행·평가 | `graph.run_graph(initial_state(spec, review_id=), llm=, retriever=)` | 최종 State 에 `status`·`applied_ops`·`patched`(고친 적 있음) 를 더해 돌려준다. 고쳐서 통과 = `status == "pass" and patched`. `scripts/run_eval.py` 가 이걸 쓴다 |
 
@@ -78,15 +79,27 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
 - 지금 gitops 의 sample-app aws·gcp·local overlay 를 `kubectl kustomize` 결과 기준으로 그대로 재현한다(테스트). 차이는 의도한 두 가지 — 이미지 digest 고정, `terminationGracePeriodSeconds` 명시.
 - 시크릿은 `secretKeyRef`(`<앱>-secrets`)로만 렌더링한다. 값은 넣지 않는다.
 - overlay 로 못 만드는 것(관리형 DB, 버킷, Secret 값 생성, 로컬·GCP 의 allowed_cidrs)은 `warnings` 로 돌려준다.
+- 경고는 `RenderWarning`(str)이고 `code`·`blocking` 이 있다 (`overlay/warnings.py`). 커밋 단계는 문장을 파싱하지 말고 `rendered.blocking` 만 본다.
+
+  | code | blocking | 뜻 |
+  |---|---|---|
+  | `DB_PROVISIONING_REQUIRED` | ✅ | managed·in-cluster·external DB — overlay 로 안 만든다 |
+  | `BUCKET_PROVISIONING_REQUIRED` | ✅ | 버킷은 인프라 쪽에서 만든다 |
+  | `VOLUME_UNSUPPORTED` | ✅ | 대상 환경에 그 접근 모드의 스토리지가 없다 (지금 aws 는 볼륨 불가, STO-001) |
+  | `TLS_HOST_MISSING` | ✅ | TLS 를 요구했는데 host 가 없어 인증서를 못 붙인다 |
+  | `SECRET_KEYS_REQUIRED` | — | `<앱>-secrets` 에 키가 미리 있어야 한다. 없으면 Rollout 이 멈추고 자동 롤백 |
+  | `TLS_SECRET_REQUIRED` | — | `<앱>-tls` 인증서 Secret 이 미리 있어야 한다 |
+  | `INGRESS_CIDRS_NOT_ENFORCED` | — | local·gcp 에서 allowed_cidrs 를 강제하지 못한다 (중단으로 올릴지 배포 담당과 정할 것) |
+  | `IMAGE_DIGEST_MISSING` | — | 태그로만 고정된다 |
 
 ```bash
-.venv/bin/python scripts/render_overlay.py samples/01-pass-sample-app-aws.yaml
+.venv/bin/python scripts/render_overlay.py samples/01-pass-sample-app-aws.yaml   # blocking 경고가 있으면 종료 코드 3
 ```
 
 ## 근거 문서 (knowledge/)
 
 S3 `review-docs` 버킷과 같은 구조다: `rules/{any,aws,gcp,local}/<ruleId>.md`, `incidents/K-*.md`(oneaction 리허설 카드 13장), `guides/*.md`.
-문서의 `## ` 섹션 하나가 청크다. P0 규칙 11개 전부 문서가 있고, 환경별 청크 수는 테스트로 30개 이상을 유지한다.
+문서의 `## ` 섹션 하나가 청크다. P0 규칙 12개(구현한 규칙 전부) 문서가 있고, 환경별 청크 수는 테스트로 30개 이상을 유지한다.
 
 - 규칙 문서는 ruleId 정확 매칭(점수 1.0)으로 찾고, 사례·가이드는 의미 검색(dense cosine, 0.5 미만 버림)으로 보탠다.
 - 임베딩은 로컬 `paraphrase-multilingual-MiniLM-L12-v2`(fastembed, 키 없음). 실측해 보니 무관한 사례가 0.34~0.43 으로 나와 판정은 ruleId 매칭에 기대고 의미 검색은 보조로만 쓴다.
