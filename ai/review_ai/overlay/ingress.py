@@ -11,6 +11,13 @@ from review_ai.spec.deploy_spec import AppSpec, Ingress
 
 SERVICE_PORT = 80
 
+# allowed_cidrs 를 못 막는 이유. local 은 Traefik ipAllowList 를 붙여도 소용없다 — k3d 에서 Traefik 이 보는
+# 클라이언트 IP 가 SNAT 된 10.42.0.0 이라 대역을 넣으면 전부 403, 10.42 를 넣으면 전부 허용 (10/08 k3d 실측)
+_CIDR_GAP = {
+    "local": "k3d 에서는 Traefik 이 클라이언트 IP 를 SNAT 된 10.42.0.0 으로 봐서 ipAllowList 가 전부 막거나 전부 연다",
+    "gcp": "Cloud Armor 보안 정책(BackendConfig)이 필요하다",
+}
+
 
 def _aws_annotations(spec: AppSpec, ingress: Ingress) -> dict[str, str]:
     listen: list[dict[str, int]] = [{"HTTP": 80}] + ([{"HTTPS": 443}] if ingress.tls else [])
@@ -44,7 +51,7 @@ def render_ingress(spec: AppSpec, caps: TargetCaps) -> tuple[dict[str, Any], lis
     if ingress.allowed_cidrs and caps.env != "aws":
         warnings.append(RenderWarning(
             "INGRESS_CIDRS_NOT_ENFORCED",
-            f"{caps.env}: network.ingress.allowed_cidrs 는 overlay 로 강제하지 못한다 (Traefik middleware·Cloud Armor 필요)",
+            f"{caps.env}: network.ingress.allowed_cidrs 는 overlay 로 강제하지 못한다 — {_CIDR_GAP[caps.env]}",
         ))
     rule: dict[str, Any] = {"http": {"paths": [{
         "path": "/", "pathType": "Prefix",

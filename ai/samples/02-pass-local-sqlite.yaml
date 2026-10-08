@@ -1,5 +1,6 @@
-# SQLite 단일 replica + 영속 볼륨, 로컬 k3s. 정상 반례(오탐 확인용).
-# 기대: finding 0 → 검색·LLM 없이 pass
+# SQLite 단일 replica + 영속 볼륨, 로컬 k3s. 정상 반례(오탐 확인용)이자 로컬 데모 명세.
+# 기대: finding 0 → 검색·LLM 없이 pass, overlay 중단 경고 없음
+# allowed_cidrs 는 넣지 않는다 — local 은 강제하지 못해 INGRESS_CIDRS_NOT_ENFORCED 로 커밋이 멈춘다 (05 가 그 예)
 api_version: crystal.review/v1alpha1
 kind: DeploySpec
 metadata: {name: todo, repository: Crystal-SBHackathon2026/sample-todo, commit: 3f9c2e1}
@@ -20,4 +21,4 @@ storage:
   volumes:
     - {name: data, mount_path: /data, size: 1Gi, persistent: true, access_mode: ReadWriteOnce}
 network:
-  ingress: {public: false, allowed_cidrs: [192.168.0.0/16]}
+  ingress: {public: false}

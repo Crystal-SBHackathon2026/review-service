@@ -130,6 +130,14 @@ def test_unenforced_ingress_cidrs_block_commit() -> None:
     assert "INGRESS_CIDRS_NOT_ENFORCED" not in codes(aws)
 
 
+def test_local_demo_spec_has_no_blocking_warning() -> None:
+    """로컬 데모 명세(02)는 allowed_cidrs 없이 커밋할 수 있다 — 대역을 넣으면 local 은 멈춘다 (05)."""
+    rendered = render_overlay(spec_of("02-pass-local-sqlite.yaml"))
+    assert rendered.blocking == ()
+    assert "SNAT" in next(w for w in render_overlay(spec_of("05-fix-engine-unsupported-local.yaml")).warnings
+                          if w.code == "INGRESS_CIDRS_NOT_ENFORCED")
+
+
 def test_sample_app_has_no_blocking_warning() -> None:
     """데모 경로: 태그·digest 없이 쓴 sample-app 은 경고 없이 커밋할 수 있다 (이미지는 CI 몫)."""
     raw = load_sample_dict("01-pass-sample-app-aws.yaml")

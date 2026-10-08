@@ -1,4 +1,7 @@
-"""judge 노드 — LLM 호출 → 출력 검증 → decide_verdict. decision·patch 두 필드만 쓴다.
+"""judge 노드 — LLM 호출 → 출력 검증 → decide_verdict. decision·patch·status 세 필드만 쓴다.
+
+status 는 decision.verdict 와 같은 값이다. 파이프라인이 make_* 로 그래프를 직접 조립해도 status 가 채워지게 여기서 쓴다.
+봇 커밋 재검토(autofix_commit)·사람 수정 뒤 재검사(human_decision)면 자동 수정을 막는다 → verdict.decide_verdict 참고
 
 - findings 0건: LLM 없이 pass
 - low 경고뿐: LLM 없이 pass (설명은 규칙 문서 제목으로). 매 배포 경고 설명에 비용을 쓰지 않는다
@@ -33,8 +36,13 @@ def _warning_review(findings: list[Finding]) -> LlmReview:
 def _result(state: dict[str, Any], review: LlmReview | None, validation: Validation,
             meta: dict[str, Any] | None, patch: Any = None) -> dict[str, Any]:
     decision = decide_verdict(state.get("findings") or [], state.get("retrieved_docs") or [], review, validation,
-                              rounds=state.get("rounds") or [], llm_meta=meta)
-    return {"decision": decision, "patch": patch if decision["verdict"] == "fix" else None}
+                              rounds=state.get("rounds") or [], llm_meta=meta, autofix_allowed=autofix_allowed(state))
+    verdict = decision["verdict"]
+    return {"decision": decision, "patch": patch if verdict == "fix" else None, "status": verdict}
+
+
+def autofix_allowed(state: dict[str, Any]) -> bool:
+    return not state.get("autofix_commit") and not state.get("human_decision")
 
 
 def judge_unavailable(state: dict[str, Any], error: str = "llm_not_configured") -> dict[str, Any]:

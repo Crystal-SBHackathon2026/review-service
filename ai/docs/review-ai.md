@@ -4,8 +4,9 @@
 파이프라인 담당은 아래 **연결 지점**만 보면 된다. 판단 노드는 Kafka·Qdrant·API 키 없이도 단독으로 돌고 테스트된다.
 
 ```
-static_check → retrieve_evidence → judge ─┬─ pass / needs_human → 끝
-     ▲                                     └─ fix → apply_patch ─┘ (최대 2회)
+START ─┬────────────────────▶ static_check → retrieve_evidence → judge ─┬─ pass / needs_human → 끝
+       └─ apply_human_edits ─▶ ▲                                       └─ fix → apply_patch ─┘ (최대 2회)
+          (승인 + edited_ops)
 ```
 
 ## 설치
@@ -24,18 +25,18 @@ pip install "./ai[qdrant]"        # 이미지 빌드 — catalog/·knowledge/ �
 
 | 쓰는 곳 | 가져다 쓸 것 | 비고 |
 |---|---|---|
-| Review API | `messages.build_review_requested(spec, review_id=, spec_ref=, requested_by=, requested_at=)` | baseline 을 떼고 `mask_spec()` 한 뒤 `spec_sha256` 계산. `ReviewRequested` 모델이 평문 비밀·baseline·해시 불일치를 거절한다 |
+| Review API | `messages.build_review_requested(spec, review_id=, spec_ref=, requested_by=, requested_at=, autofix_commit=False)` | baseline 을 떼고 `mask_spec()` 한 뒤 `spec_sha256` 계산. `ReviewRequested` 모델이 평문 비밀·baseline·해시 불일치를 거절한다. **검토할 커밋이 워커가 `applied_ops` 를 커밋한 것(봇 커밋)이면 `autofix_commit=True`** — 워커는 `initial_state(..., autofix_commit=message.autofix_commit)` 로 넘긴다 |
 | Review API | `spec.deploy_spec.DeploySpec` / `schema/deploy_spec.schema.json` | 형식 오류 → 422 |
 | 워커 그래프 | `static_check.make_static_check()` | `findings` 만 반환 |
 | 워커 그래프 | `retrieval.make_retrieve_evidence(retriever)` | `FileRetriever()`(벡터 DB 없음) 또는 `QdrantRetriever(client, FastEmbedder())` |
-| 워커 그래프 | `judge.node.make_judge(llm)` | `CachedLLM(ClaudeLLM())` 권장. `llm=None` 이면 LLM_UNAVAILABLE |
+| 워커 그래프 | `judge.node.make_judge(llm)` | `CachedLLM(ClaudeLLM())` 권장. `llm=None` 이면 LLM_UNAVAILABLE. `decision`·`patch`·**`status`(= verdict)** 를 쓴다 — 그래프를 직접 조립해도 status 가 채워진다. `autofix_commit` 이거나 `human_decision` 이 있으면 fix 대신 needs_human(LOOP_EXHAUSTED) |
 | 워커 재시도 실패 시 | `judge.node.judge_unavailable(state, error=...)` | RetryPolicy 소진 뒤 이 결과로 State 를 채우고 계속. 원인은 `decision.llm.error` |
 | apply_patch | `verdict.round_snapshot(state)` · `patching.apply_ops(spec, patch["ops"])` | 참고 구현: `graph.apply_patch` |
 | 커밋 단계 | `verdict.applied_ops(final)` · `patching.apply_ops(원본, ops)` · `overlay.render_overlay(spec)` → `files`·`warnings`·`blocking` | **spec_ref 로 앱 레포에서 읽은 원본**에 `applied_ops(final)` 를 적용해 렌더링한다. ⚠️ `patch["ops"]` 가 아니다 — apply_patch 가 patch 를 rounds 로 옮기고 비우므로 고쳐서 통과한 최종 State 는 `patch=None` 이고, ops 는 `rounds[*].patch.ops` 에 회차 순서대로 있다. `applied_ops == []` 면 수정 없이 통과(원본 그대로). Kafka 사본은 가려져 있어 렌더러가 거절한다. 회차별 diff 는 `rounds[i].patch.files` 에 있다. `rendered.blocking` 이 비어 있지 않으면 커밋하지 말고 `blocked` 로 돌려준다 |
 | 커밋 노드 (`commit_overlay`, 배포 담당) | `state.DeployResult` → State 의 `deploy_result` | `{status: committed \| blocked, commit_sha, reason}`. verdict 가 pass 일 때만 쓴다. `status`(verdict 값)와 섞지 않는다. push 실패처럼 재시도할 오류는 `errors.TransientError`, DB·버킷이 없어 멈추는 건 `blocked` 로 정상 반환 |
-| 사람 확인 재개 (승인 API·워커) | `state.HumanDecision` → State 의 `human_decision`, `status` 에 `rejected` | `{decision: approved \| rejected, approver, edited_ops}`. 승인 + `edited_ops` 없음 → `commit_overlay`, 승인 + 있음 → `static_check` 부터 재검사, 거절 → `status=rejected` 로 종료 |
-| 결과 저장 (업무 DB·결과 화면) | 최종 State 의 `status`·`decision`·`findings`·`rounds` | 고쳐서 통과하면 최종 `findings`·`decision.items`·`retrieved_docs` 는 재검사 결과라 비어 있다. **무엇을 왜 고쳤는지는 `rounds[i]`** 에 있다 — `{round, finding_ids, findings, verdict, reasons, items(why·cited_rule_ids), doc_ids, patch(ops·files)}` |
-| 단독 실행·평가 | `graph.run_graph(initial_state(spec, review_id=), llm=, retriever=)` | 최종 State 에 `status`·`applied_ops`·`patched`(고친 적 있음) 를 더해 돌려준다. 고쳐서 통과 = `status == "pass" and patched`. `scripts/run_eval.py` 가 이걸 쓴다 |
+| 사람 확인 재개 (승인 API·워커) | `state.HumanDecision` → State 의 `human_decision`, `status` 에 `rejected` · `graph.apply_human_edits` · `graph.check_edited_ops(spec, ops)` | `{decision: approved \| rejected, approver, edited_ops}`. 승인 + `edited_ops` 없음 → `commit_overlay`, 승인 + 있음 → **`apply_human_edits` 노드 → `static_check`** 부터 재검사, 거절 → `status=rejected` 로 종료. `edited_ops` 는 원본이 아니라 **멈춘 State 의 `deploy_spec`(AI 가 고친 회차 반영) 기준**이다. `apply_human_edits` 가 needs_human 회차와 사람 ops 를 `rounds` 에 남기므로 커밋 노드는 그대로 `applied_ops(state)` 를 쓰면 사람 수정까지 들어간다. 사람이 고친 뒤 남은 문제는 AI 가 다시 고치지 않고 needs_human(LOOP_EXHAUSTED). 승인 API 는 재개 전에 `check_edited_ops` 로 검사해 422 를 돌려주면 워커가 재개 중에 실패하지 않는다 |
+| 결과 저장 (업무 DB·결과 화면) | 최종 State 의 `status`·`decision`·`findings`·`rounds` | `status` 는 `running \| pass \| fix \| needs_human \| rejected`. 고쳐서 통과하면 최종 `findings`·`decision.items`·`retrieved_docs` 는 재검사 결과라 비어 있다. **무엇을 왜 고쳤는지는 `rounds[i]`** 에 있다 — `{round, finding_ids, findings, verdict, reasons, items(why·cited_rule_ids), doc_ids, patch(ops·files)}`. 사람이 고친 회차는 `verdict: needs_human` + `human: {decision, approver}` 가 더 붙는다 |
+| 단독 실행·평가 | `graph.run_graph(initial_state(spec, review_id=), llm=, retriever=)` | 최종 State 에 `applied_ops`·`patched`(고친 적 있음) 를 더해 돌려준다. 멈춘 State 에 `human_decision` 을 넣어 다시 부르면 재개 경로를 탄다. 고쳐서 통과 = `status == "pass" and patched`. `scripts/run_eval.py` 가 이걸 쓴다 |
 
 ## 패치 게이트
 
@@ -49,6 +50,8 @@ LLM 이 낸 패치는 아래를 모두 통과해야 `fix` 가 된다. 하나라�
 6. 적용한 명세를 다시 static_check 하면 대상 finding 이 사라지고 새 finding 이 생기지 않는다
 
 6번 때문에 루프 안 재검사는 대부분 첫 회차에 끝난다. LOOP_EXHAUSTED 는 안전장치로 남아 있다.
+LOOP_EXHAUSTED 는 "AI 가 또 고치려 한다" 는 뜻으로 두 경우에도 쓴다 — 봇 커밋을 다시 검토했는데 fix(`autofix_commit`),
+사람이 고친 명세를 재검사했는데 fix(`human_decision`). 사유 코드를 늘리지 않으려고 같은 코드를 쓴다.
 LLM 의 자유 텍스트(why·extra_opinions)는 비밀처럼 보이는 부분을 가리고, 개수·길이를 제한한다. 명세는 `< > &` 를 이스케이프해 프롬프트 구분 태그를 흉내 내지 못하게 한다.
 
 ## 비밀 판별 기준 (`secrets_pattern.py`)

@@ -5,9 +5,9 @@ from typing import get_args, get_type_hints
 from review_ai.state import HumanDecision, ReviewStatus, Verdict
 
 
-def test_review_status_is_verdict_plus_rejected() -> None:
-    """status 는 verdict 값을 그대로 쓰고, 사람이 거절한 경우만 rejected 가 더해진다."""
-    assert set(get_args(ReviewStatus)) == {*get_args(Verdict), "rejected"}
+def test_review_status_is_verdict_plus_running_and_rejected() -> None:
+    """status 는 verdict 값을 그대로 쓰고, 판정 전 running·사람이 거절한 rejected 만 더해진다."""
+    assert set(get_args(ReviewStatus)) == {"running", *get_args(Verdict), "rejected"}
 
 
 def test_human_decision_fields_match_review_resumed() -> None:
