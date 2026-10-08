@@ -6,7 +6,7 @@ import copy
 
 import pytest
 
-from review_ai.graph import initial_state, run_graph
+from review_ai.graph import initial_state, route_start, run_graph
 from review_ai.judge.fake_llm import FAKES
 from review_ai.patching import PatchError, apply_ops
 from review_ai.recommendations import resolve_human_decision
@@ -85,11 +85,16 @@ async def test_unknown_probe_is_not_invented_and_remaining_problem_stays_human()
     assert not final["deploy_spec"]["runtime"]["health"].get("readiness")
 
 
-async def test_no_known_recommendation_does_not_become_approval() -> None:
+async def test_no_recommendation_and_no_values_is_plain_approval() -> None:
+    """권장값을 못 만드는 사유(평문 비밀 등)에서 값 없는 승인은 기존 계약대로 그대로 승인이다."""
     state = await pause("06-human-plaintext-secret.yaml")
     assert not state["decision"]["recommendations"]
-    with pytest.raises(PatchError, match="입력값이나 권장값"):
-        await resume(state)
+    human = {"decision": "approved", "approver": "tester", "edited_ops": []}
+
+    resolved = resolve_human_decision(state, human)
+
+    assert resolved["edited_ops"] == [] and resolved["defaulted_ops"] == []
+    assert route_start({**state, "human_decision": human}) == "static_check"
 
 
 async def test_unanswered_path_without_recommendation_is_rejected() -> None:

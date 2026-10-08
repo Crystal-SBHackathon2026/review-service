@@ -237,6 +237,17 @@ async def test_approval_without_values_uses_server_recommendations(env: Env) -> 
     assert msg.human_decision.use_recommendations and not msg.human_decision.edited_ops
 
 
+async def test_approval_without_values_and_no_recommendations_is_accepted(env: Env) -> None:
+    """권장값을 못 만드는 사유(평문 비밀)여도 값 없는 승인은 그대로 승인으로 받는다 — 422 로 막지 않는다."""
+    rid = await _paused_with_recommendations(env, "06-human-plaintext-secret.yaml")
+    assert not env.client.get(f"/reviews/{rid}").json()["decision"]["recommendations"]
+
+    response = env.client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "tester"})
+
+    assert response.status_code == 202
+    assert not parse_review_resumed(env.publisher.sent[-1][2]).human_decision.edited_ops
+
+
 @pytest.mark.parametrize("op", [
     {"op": "replace", "path": "/database/version"},
     {"op": "replace", "path": "/database/version", "value": ""},
@@ -288,13 +299,14 @@ async def test_client_cannot_supply_server_default_audit(env: Env) -> None:
     assert len(env.publisher.sent) == before
 
 
-async def test_unknown_recommendation_needs_input_or_explicit_opt_out(env: Env) -> None:
+async def test_unanswered_field_without_recommendation_is_422(env: Env) -> None:
+    """값을 비운 항목에 권장값이 없으면 채울 수 없다 — 422, 재개 메시지도 보내지 않는다."""
     rid = await _paused_with_recommendations(env, "06-human-plaintext-secret.yaml")
     before = len(env.publisher.sent)
-    body = {"decision": "approved", "approver": "tester"}
+    body = {"decision": "approved", "approver": "tester",
+            "edited_ops": [{"op": "add", "path": "/runtime/health/readiness"}]}
     assert env.client.post(f"/reviews/{rid}/decision", json=body).status_code == 422
     assert len(env.publisher.sent) == before
-    assert env.client.post(f"/reviews/{rid}/decision", json={**body, "use_recommendations": False}).status_code == 202
 
 
 def check_suite(conclusion: str = "success", slug: str = "github-actions", action: str = "completed") -> dict:

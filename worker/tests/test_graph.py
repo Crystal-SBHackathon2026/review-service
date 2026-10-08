@@ -314,13 +314,18 @@ async def test_04_partial_answer_survives_kafka_and_defaults_missing_value(harne
     assert harness.row()["human_decision"]["defaulted_ops"] == [{"op": "add", "path": "/database/version", "value": "16"}]
 
 
-async def test_approval_without_known_recommendation_stays_human(harness: Harness) -> None:
+async def test_approval_without_known_recommendation_is_plain_approval(harness: Harness) -> None:
+    """권장값이 없으면 값 없는 승인 = 그대로 승인 (기존 계약). 고친 것이 없으니 커밋 없이 CI 대기."""
     await harness.request(load_sample("06-human-plaintext-secret.yaml"))
+    assert not harness.row()["decision"]["recommendations"]
+
     await harness.human(RID, "approved")
-    assert harness.row()["status"] == "needs_human"
-    assert "권장값" in harness.row()["error"]
-    assert not harness.github.commits and not harness.github.merged
-    assert (await _state(harness))["_next"] == ("wait_human",)
+
+    assert harness.row()["status"] == "waiting_ci"
+    assert harness.row()["error"] is None
+    assert harness.row()["human_decision"]["edited_ops"] == []
+    assert not harness.github.commits
+    assert (await _state(harness))["_next"] == ("wait_ci",)
 
 
 async def test_invalid_edits_go_back_to_human(harness: Harness) -> None:

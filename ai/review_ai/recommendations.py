@@ -104,6 +104,7 @@ def resolve_human_decision(state: dict[str, Any], human: dict[str, Any]) -> dict
 
     전체 응답을 기다리는 타이머는 아니다. approved 응답이 왔을 때만 실행한다.
     use_recommendations=False 는 현재 명세를 그대로 승인하는 명시적 선택이다.
+    입력도 권장값도 없으면 edited_ops=[] — 기존 계약대로 그대로 승인이다(권장값을 못 만드는 사유도 막히지 않게).
     """
     if human["decision"] != "approved":
         return copy.deepcopy(human)
@@ -130,8 +131,6 @@ def resolve_human_decision(state: dict[str, Any], human: dict[str, Any]) -> dict
     # 객체 전체를 명시한 경우도 사용자 선택으로 취급하며, 권장값으로 다시 덮지 않는다.
     defaults = [op for op in defaults if not any(path_under(op["path"], given["path"]) for given in supplied)]
     ops = defaults + supplied
-    if human.get("use_recommendations", True) and not ops:
-        raise PatchError("적용할 입력값이나 권장값이 없다. 값을 입력하거나 기존 명세 그대로 승인을 선택해야 한다")
     for op in ops:
         if parse_pointer(op["path"])[0] == "baseline":
             raise PatchError("baseline은 수정할 수 없다")

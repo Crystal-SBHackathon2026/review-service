@@ -79,7 +79,7 @@ response = result.to_response()
 
 현재 원본 조회 계약을 유지하려면 생성 명세를 앱 레포에 먼저 저장하고, **생성 커밋의 새 SHA**를 `spec_ref.commit`으로 하여 기존 리뷰 요청을 발행한다. 내용이 이미 바뀌었으므로 이전 커밋의 통과 결과는 재사용하지 않는다. 생성은 기존 autofix_commit 교정 루프와 구분한다. 명세 생성 커밋이라는 이유만으로 autofix_commit=True를 쓰지 않는다.
 
-현재 GitHubPort의 `put_file`은 기존 파일의 blob SHA를 요구한다. 파일이 없는 경우는 SHA 없는 생성 쓰기, 빈 파일이면 해당 blob SHA로 갱신하는 분기가 파이프라인에 필요하다. PR head가 바뀌었을 때 충돌 처리·CI 대기·저장·이벤트 발행도 파이프라인 책임이다. 생성 후보가 있는 동안 기존 `/reviews`에 없는 경로의 `spec_ref`만 보내면 계속 404다.
+생성 명세 커밋은 워커 `commit_fix` 와 같은 `GitHubClient.prepare_file_commit`(Git Data API 트리)로 할 수 있다 — 파일이 없어도 blob SHA 없이 새 파일을 만든다. PR head가 바뀌었을 때 충돌 처리·CI 대기·저장·이벤트 발행도 파이프라인 책임이다. 생성 후보가 있는 동안 기존 `/reviews`에 없는 경로의 `spec_ref`만 보내면 계속 404다.
 
 외부 응답의 가린 YAML을 원본에 덮어쓰지 않는다. 같은 프로세스의 저장 단계는 `result.prepared.spec.model_dump(mode="json", exclude_none=True)`를 사용하거나, 기존 원본에 `review.applied_ops`를 적용한다. 평문 비밀이 발견되면 기존 정적 검사가 막으므로 ready_to_commit은 false다. baseline은 앱 파일에 저장하지 않는다.
 

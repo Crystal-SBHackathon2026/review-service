@@ -80,5 +80,5 @@ received → reviewing ─┬─ needs_human ─┬─ (승인) → waiting_ci
   포크 PR 은 커밋할 수 없어 failed. 커밋한 deploy.yaml 은 YAML 을 다시 쓰므로 원래 주석은 사라진다.
 - 그래프 오류·PR head 불일치·병합 실패도 `failed` 이고 원인은 `error` 열에 남는다.
 - 사람 승인 시 입력하지 않은 항목은 `decision.recommendations`의 검증된 권장값을 적용하고 재검사한다.
-  입력한 값이 우선이며, 기존 명세 그대로 승인하려면 `use_recommendations: false`를 명시한다. [응답 기본값 안내](ai/docs/human-recommendations.md).
+  입력한 값이 우선이며, 기존 명세 그대로 승인하려면 `use_recommendations: false`를 명시한다. 권장값이 없으면 값 없는 승인은 그대로 승인이다. [응답 기본값 안내](ai/docs/human-recommendations.md).
 - `commit_overlay`(성진님, `worker/review_worker/commit_overlay.py`)가 원본 명세 + `applied_ops` → overlay 를 gitops main 에 커밋한다. 렌더러 blocking 경고면 커밋하지 않고 `blocked`. gitops ref 충돌은 main 을 다시 읽어 최대 5회.

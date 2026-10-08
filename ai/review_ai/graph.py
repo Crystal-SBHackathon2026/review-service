@@ -5,7 +5,7 @@
               (승인 + edited_ops)
 
 needs_human 뒤 재개는 멈춘 State 에 human_decision 을 넣어 다시 돌린다. 승인 뒤 사용자 입력과 미입력 권장값을 합쳐 재검사한다.
-use_recommendations=False + 수정 없음이면 승인만 처리하고,
+use_recommendations=False 이거나 입력·권장값이 둘 다 없으면 그대로 승인(승인만 처리)이고,
 거절이면 status=rejected — 둘 다 파이프라인 몫이라 여기엔 없다.
 
 노드 모양(async, 바뀐 필드만 반환, 클라이언트는 팩토리로 주입)은 제안서 4절과 같다. 파이프라인 그래프로 바꿀 때
@@ -94,7 +94,10 @@ def check_edited_ops(deploy_spec: dict[str, Any], ops: list[Any]) -> dict[str, A
 
 def route_start(state: dict[str, Any]) -> str:
     human = state.get("human_decision")
-    if human and human["decision"] == "approved" and (human["edited_ops"] or human.get("use_recommendations", True)):
+    if not human or human["decision"] != "approved":
+        return "static_check"
+    has_recommendations = bool((state.get("decision") or {}).get("recommendations"))
+    if human["edited_ops"] or (human.get("use_recommendations", True) and has_recommendations):
         return "apply_human_edits"
     return "static_check"
 
