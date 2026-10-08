@@ -23,8 +23,6 @@ pip install "./ai[qdrant]"        # 이미지 빌드 — catalog/·knowledge/ �
 
 ## 연결 지점
 
-명세 미전달·빈 YAML은 `preparation.prepare_spec` 또는 `preparation.prepare_and_review`로 권장 명세를 생성할 수 있다. 기존 판정 노드 앞에서 쓰는 별도 진입점이며, 저장·커밋은 파이프라인 책임이다. [입력·응답·파이프라인 연결 안내](spec-preparation.md).
-
 | 쓰는 곳 | 가져다 쓸 것 | 비고 |
 |---|---|---|
 | Review API | `messages.build_review_requested(spec, review_id=, spec_ref=, requested_by=, requested_at=, autofix_commit=False)` | baseline 을 떼고 `mask_spec()` 한 뒤 `spec_sha256` 계산. `ReviewRequested` 모델이 평문 비밀·baseline·해시 불일치를 거절한다. **검토할 커밋이 워커가 `applied_ops` 를 커밋한 것(봇 커밋)이면 `autofix_commit=True`** — 워커는 `initial_state(..., autofix_commit=message.autofix_commit)` 로 넘긴다 |
