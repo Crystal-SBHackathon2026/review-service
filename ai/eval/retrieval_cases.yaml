@@ -1,0 +1,65 @@
+# 검색 평가셋 — "질문 → 나와야 할 문서" 짝. 의미 검색(사례·가이드)만 잰다.
+# 규칙 문서는 ruleId 정확 매칭(점수 1.0)으로 찾으므로 여기서 재지 않는다.
+#
+# query    검색어. 실제 워커는 finding 의 "제목 — 근거" 를 쓴다(kind: finding). 나머지는 사람이 증상으로 묻는 말(kind: symptom)
+# env      대상 환경 (provider 필터)
+# expect   상위 3개 청크 중 하나라도 이 문서면 정답 (여러 개면 그중 아무거나). [] 는 "관련 문서 없음" — 임계값을 넘는 결과가 없어야 한다
+# rule     finding 질문의 ruleId. 의미 검색이 놓쳐도 정답 문서가 related_rules 정확 매칭으로 이미 들어가면 '규칙으로 보완'으로 따로 센다
+#
+#   .venv/bin/python scripts/eval_retrieval.py
+cases:
+  # ── 사람이 증상으로 묻는 말 ─────────────────────────────────────────
+  - {id: q01, kind: symptom, env: local, expect: [incidents/K-001-netpol-first-connection-refused.md],
+     query: "DB 는 떠 있는데 새 Pod 가 시작하자마자 ECONNREFUSED 로 죽고 RESTARTS 가 1 씩 남아요"}
+  - {id: q02, kind: symptom, env: aws, expect: [incidents/K-002-tunnel-keepalive-pins-one-pod.md],
+     query: "replicas 2 인데 공개 URL 로 여러 번 요청해도 Pod 하나로만 가서 복제 문제가 안 드러난다"}
+  - {id: q03, kind: symptom, env: gcp, expect: [incidents/K-003-pid1-sigterm-false-persistence.md],
+     query: "rollout restart 후에도 이전 Pod 가 SIGTERM 을 무시하고 30초 동안 살아 있어 보존 검사가 거짓으로 통과한다"}
+  - {id: q04, kind: symptom, env: aws, expect: [incidents/K-004-github-oidc-sub-includes-ids.md],
+     query: "GitHub Actions OIDC 로 AWS 역할을 맡으려는데 Not authorized to perform sts:AssumeRoleWithWebIdentity 가 난다"}
+  - {id: q05, kind: symptom, env: local, expect: [incidents/K-005-quick-tunnel-deleted-after-disconnect.md, incidents/K-008-tunnel-dies-with-parent-process-tree.md],
+     query: "cloudflared 는 살아 있는데 로그에 Tunnel not found 가 반복되고 공개 주소가 DNS 에서 사라졌다"}
+  - {id: q06, kind: symptom, env: gcp, expect: [incidents/K-006-e2-micro-disk-swap-thrash.md],
+     query: "1GB 작은 VM 에서 k3s API 서버가 Handler timeout 을 내고 첫 배포가 시간 초과로 실패한다, 디스크 읽기가 계속 높다"}
+  - {id: q07, kind: symptom, env: gcp, expect: [incidents/K-007-ipv6-only-docker-hub-pull-variance.md],
+     query: "IPv6 전용 VM 에서 이미지 pull 이 2분에서 15분까지 들쭉날쭉해서 롤아웃이 300초를 넘긴다"}
+  - {id: q08, kind: symptom, env: local, expect: [incidents/K-008-tunnel-dies-with-parent-process-tree.md],
+     query: "제어 서비스를 재시작하면 nohup 으로 띄운 터널 프로세스도 같이 죽어서 주소가 바뀐다"}
+  - {id: q09, kind: symptom, env: local, expect: [incidents/K-009-sqlite-file-on-container-tmp.md],
+     query: "재시작하고 나면 가입한 계정으로 로그인이 401 이 된다, SQLite 파일을 /tmp 에 두고 있다"}
+  - {id: q10, kind: symptom, env: aws, expect: [incidents/K-010-localhost-hardcoded-url.md],
+     query: "로그인하면 localhost:3000 으로 리다이렉트돼서 공개 주소 사용자가 자기 PC 로 보내진다"}
+  - {id: q11, kind: symptom, env: aws, expect: [incidents/K-011-session-memorystore-and-literal-secret.md],
+     query: "같은 쿠키로 Pod 마다 읽으면 한쪽만 401 이고 재시작하면 세션이 풀린다, express-session 을 쓴다"}
+  - {id: q12, kind: symptom, env: gcp, expect: [incidents/K-012-no-readiness-path.md, guides/rollout-health-gate.md],
+     query: "깨진 릴리스인데도 롤아웃이 성공으로 끝났다, health 체크 경로를 선언하지 않았다"}
+  - {id: q13, kind: symptom, env: aws, expect: [incidents/K-013-image-arch-pinned-root.md],
+     query: "Mac 에서는 잘 도는데 amd64 노드에서 exec format error 로 CrashLoopBackOff 가 난다"}
+  - {id: q14, kind: symptom, env: aws, expect: [guides/kafka-secret-masking.md],
+     query: "비밀번호가 Kafka 메시지나 로그에 그대로 남지 않게 하려면 어떻게 하나, 이미 새어 나갔으면?"}
+  - {id: q15, kind: symptom, env: gcp, expect: [guides/rollout-health-gate.md],
+     query: "새 버전이 60초 안에 준비되지 않으면 Argo Rollouts 가 배포를 멈추고 stable 버전을 유지하나요"}
+  - {id: q16, kind: symptom, env: local, expect: [guides/sqlite-vs-postgres.md],
+     query: "SQLite 를 계속 써도 되나요 아니면 postgres 로 옮겨야 하나요"}
+
+  # ── 워커가 실제로 만드는 검색어: finding 의 "제목 — 근거" ─────────────
+  - {id: f01, kind: finding, rule: DB-003, env: gcp, expect: [guides/sqlite-vs-postgres.md, incidents/K-009-sqlite-file-on-container-tmp.md],
+     query: "SQLite 를 여러 replica 가 공유 — sqlite + replicas 2"}
+  - {id: f02, kind: finding, rule: DB-005, env: local, expect: [incidents/K-009-sqlite-file-on-container-tmp.md],
+     query: "SQLite 파일이 영속 볼륨 밖에 있다 — database.volume=None (없음)"}
+  - {id: f03, kind: finding, rule: RUN-001, env: aws, expect: [incidents/K-012-no-readiness-path.md, guides/rollout-health-gate.md],
+     query: "readiness 경로가 없다 — readiness 없음"}
+  - {id: f04, kind: finding, rule: SEC-001, env: aws, expect: [guides/kafka-secret-masking.md, incidents/K-011-session-memorystore-and-literal-secret.md],
+     query: "비밀 값이 runtime.env 에 평문으로 있다 — runtime.env.SESSION_SECRET=***MASKED***"}
+  - {id: f05, kind: finding, rule: RUN-004, env: aws, expect: [incidents/K-013-image-arch-pinned-root.md],
+     query: "이미지 아키텍처가 대상 노드와 맞지 않다 — 이미지 ['arm64'] · 노드 ['amd64']"}
+
+  # ── 관련 문서가 없는 질문: 임계값을 넘는 결과가 없어야 한다 ─────────────
+  - {id: n01, kind: negative, env: aws, expect: [],
+     query: "버킷이 공개돼 있다 — bucket sample-app-uploads: public"}
+  - {id: n02, kind: negative, env: gcp, expect: [],
+     query: "볼륨 크기 축소 — uploads: 10Gi → 5Gi"}
+  - {id: n03, kind: negative, env: aws, expect: [],
+     query: "공개 진입점에 TLS 가 없다 — public: true, tls: false"}
+  - {id: n04, kind: negative, env: local, expect: [],
+     query: "프론트엔드 버튼 색을 바꾸고 싶어요"}

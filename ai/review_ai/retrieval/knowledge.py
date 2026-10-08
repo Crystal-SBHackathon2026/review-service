@@ -1,4 +1,4 @@
-"""knowledge/ 아래 마크다운을 청크로 읽는다. S3 review-docs 버킷의 경로 구조(rules/{env}/·incidents/·guides/)와 같다.
+"""knowledge/ 아래 마크다운을 청크로 읽는다. S3 review-docs 버킷의 경로 구조(rules/{env}/·incidents/·guides/·warnings/)와 같다.
 
 청크 = 문서의 '## ' 섹션 하나. 각 청크 앞에 문서 제목을 붙여 단독으로 읽혀도 맥락이 남게 한다.
 """
@@ -21,12 +21,14 @@ FRONT_MATTER = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 @dataclass(frozen=True)
 class Chunk:
     chunk_id: str
-    doc_type: str  # rule · incident · guide
+    doc_type: str  # rule · incident · guide · warning
     provider: str  # aws · gcp · local · any
-    rule_ids: tuple[str, ...]  # rule 문서는 자기 ID 하나, incident·guide 는 related_rules
+    rule_ids: tuple[str, ...]  # rule 문서는 자기 ID 하나, incident·guide 는 related_rules, warning 은 비어 있다
     title: str
     text: str
     source_uri: str
+    # warning 문서만 — 렌더러 경고 code. 규칙이 아니라서 rule_ids 에 넣지 않는다(judge 프롬프트에 섞이지 않게)
+    warning_code: str | None = None
 
 
 def _sections(body: str) -> list[str]:
@@ -49,6 +51,7 @@ def parse_document(text: str, source_uri: str) -> list[Chunk]:
             title=meta["title"],
             text=f"# {meta['title']}\n{section}",
             source_uri=source_uri,
+            warning_code=meta.get("warning_code"),
         )
         for i, section in enumerate(_sections(body))
     ]
