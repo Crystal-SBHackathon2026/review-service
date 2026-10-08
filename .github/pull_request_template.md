@@ -20,7 +20,8 @@
 
 **근거 문서 (`knowledge/`)**
 - [ ] 문서를 고쳤다 → 머지 후 `scripts/sync_knowledge_s3.sh <버킷> --apply` 와 `index_knowledge.py` 재색인
-- [ ] 개수가 맞는다: 로컬 문서 수 = S3 객체 수, 청크 수 = Qdrant points (PR 본문에 숫자 적기)
+- [ ] `scripts/check_knowledge_sync.py --bucket <버킷> --qdrant-url <주소>` 가 `일치` (로컬 = S3 = Qdrant, 내용까지 대조 — PR 본문에 문서·청크 수 적기)
+- [ ] 의미 검색에 영향이 있으면(사례·가이드 추가·임베딩·임계값 변경) `scripts/eval_retrieval.py` 의 hit@3·오탐 수
 
 **비밀**
 - [ ] 로그·리포트·테스트 픽스처에 실제 키·토큰이 없다 (`eval/reports/` 는 커밋하지 않는다)
