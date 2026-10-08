@@ -14,7 +14,7 @@ from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from review_ai.errors import TransientError
-from review_ai.retrieval import MAX_EXACT_PER_RULE, dedupe, to_doc
+from review_ai.retrieval import dedupe, exact_first, to_doc
 from review_ai.retrieval.embedding import Embedder
 from review_ai.retrieval.knowledge import Chunk
 from review_ai.state import Doc, Finding
@@ -95,8 +95,10 @@ class QdrantRetriever:
             models.FieldCondition(key="rule_ids", match=models.MatchValue(value=rule_id)),
             _provider_filter(target_env),
         ])
-        points, _ = await self._client.scroll(COLLECTION, scroll_filter=flt, limit=MAX_EXACT_PER_RULE)
-        return [to_doc(_payload_chunk(p.payload or {}), rule_id=rule_id, score=1.0, match="exact_rule") for p in points]
+        # scroll 은 point ID 순이라 앞에서 자르면 규칙 문서가 빠질 수 있다 — 한 페이지를 다 받아 exact_first 로 고른다
+        points, _ = await self._client.scroll(COLLECTION, scroll_filter=flt, limit=SCROLL_PAGE)
+        chunks = exact_first([_payload_chunk(p.payload or {}) for p in points])
+        return [to_doc(c, rule_id=rule_id, score=1.0, match="exact_rule") for c in chunks]
 
     async def _semantic(self, vector: list[float], target_env: str, *, limit: int = SEMANTIC_LIMIT,
                         min_score: float | None = None) -> list[Doc]:

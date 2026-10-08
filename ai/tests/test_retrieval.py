@@ -9,7 +9,7 @@ from qdrant_client import AsyncQdrantClient
 
 from review_ai.catalog import load_rules
 from review_ai.overlay.warnings import BLOCKING, WarningCode, warning_doc_uri
-from review_ai.retrieval import make_retrieve_evidence
+from review_ai.retrieval import MAX_EXACT_PER_RULE, make_retrieve_evidence, provider_ok
 from review_ai.retrieval.embedding import HashEmbedder
 from review_ai.retrieval.file_retriever import FileRetriever
 from review_ai.retrieval.knowledge import FRONT_MATTER, KNOWLEDGE_DIR, load_chunks, parse_document
@@ -71,6 +71,17 @@ async def test_file_retriever_includes_related_incidents() -> None:
     assert len({d["chunk_id"] for d in docs}) == len(docs)
 
 
+@pytest.mark.parametrize("rule_id", sorted(CHECKS))
+@pytest.mark.parametrize("env", ["aws", "gcp", "local"])
+async def test_rule_document_is_never_cut_by_related_docs(rule_id: str, env: str) -> None:
+    """관련 사례·가이드가 많아도 규칙 문서(정본)의 청크는 전부 근거에 들어간다 — 전엔 DB-003 규칙 문서가 통째로 빠졌다."""
+    rule_chunks = {c.chunk_id for c in load_chunks()
+                   if c.doc_type == "rule" and rule_id in c.rule_ids and provider_ok(c.provider, env)}
+    assert len(rule_chunks) <= MAX_EXACT_PER_RULE
+    docs = await FileRetriever().search([{"rule_id": rule_id}], env)  # type: ignore[list-item]
+    assert rule_chunks <= {d["chunk_id"] for d in docs}
+
+
 async def test_node_skips_search_without_findings() -> None:
     node = make_retrieve_evidence(FileRetriever())
     assert await node({"findings": [], "target_env": "aws"}) == {"retrieved_docs": []}
@@ -84,10 +95,15 @@ async def qdrant() -> QdrantRetriever:
     return QdrantRetriever(client, embedder, min_score=0.0)  # 해시 임베딩은 점수가 낮다
 
 
-async def test_qdrant_exact_matches_file_retriever(qdrant: QdrantRetriever) -> None:
-    findings = findings_for("05-fix-engine-unsupported-local.yaml")
-    exact = {d["chunk_id"] for d in await qdrant.search(findings, "local") if d["match"] == "exact_rule"}
-    expected = {d["chunk_id"] for d in await FileRetriever().search(findings, "local")}
+@pytest.mark.parametrize(
+    ("sample", "env"),
+    [("05-fix-engine-unsupported-local.yaml", "local"), ("03-fix-sqlite-replicas-gcp.yaml", "gcp")],
+)
+async def test_qdrant_exact_matches_file_retriever(qdrant: QdrantRetriever, sample: str, env: str) -> None:
+    """03(DB-003)은 관련 청크가 상한보다 많다 — scroll 순서와 무관하게 같은 청크를 골라야 한다."""
+    findings = findings_for(sample)
+    exact = {d["chunk_id"] for d in await qdrant.search(findings, env) if d["match"] == "exact_rule"}
+    expected = {d["chunk_id"] for d in await FileRetriever().search(findings, env)}
     assert exact == expected
 
 

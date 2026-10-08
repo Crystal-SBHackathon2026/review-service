@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from review_ai.retrieval import MAX_EXACT_PER_RULE, dedupe, provider_ok, to_doc
+from review_ai.retrieval import dedupe, exact_first, provider_ok, to_doc
 from review_ai.retrieval.knowledge import Chunk, load_chunks
 from review_ai.state import Doc, Finding
 
@@ -17,5 +17,5 @@ class FileRetriever:
         docs: list[Doc] = []
         for rule_id in sorted({f["rule_id"] for f in findings}):
             hits = [c for c in self._chunks if rule_id in c.rule_ids and provider_ok(c.provider, target_env)]
-            docs.extend(to_doc(c, rule_id=rule_id, score=1.0, match="exact_rule") for c in hits[:MAX_EXACT_PER_RULE])
+            docs.extend(to_doc(c, rule_id=rule_id, score=1.0, match="exact_rule") for c in exact_first(hits))
         return dedupe(docs)

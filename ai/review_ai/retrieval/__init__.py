@@ -33,6 +33,18 @@ def to_doc(chunk: Chunk, *, rule_id: str | None, score: float, match: str) -> Do
     )
 
 
+def exact_first(chunks: Sequence[Chunk]) -> list[Chunk]:
+    """ruleId 정확 매칭 결과에서 MAX_EXACT_PER_RULE 개를 고른다 — 규칙 문서(정본)를 먼저, 사례·가이드는 그 뒤에.
+
+    경로 순서로 자르면 guides/·incidents/ 가 rules/ 보다 앞서서, 관련 사례가 많은 규칙(DB-003)은 규칙 문서가 통째로 빠졌다.
+    같은 문서 안에서는 섹션 순서(chunk_id 의 #번호)를 지킨다.
+    """
+    def key(c: Chunk) -> tuple[bool, str, int]:
+        return c.doc_type != "rule", c.source_uri, int(c.chunk_id.rsplit("#", 1)[1])
+
+    return sorted(chunks, key=key)[:MAX_EXACT_PER_RULE]
+
+
 def provider_ok(chunk_provider: str, target_env: str) -> bool:
     return chunk_provider in ("any", target_env)
 

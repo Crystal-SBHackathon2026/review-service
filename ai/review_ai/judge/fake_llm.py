@@ -152,6 +152,18 @@ def sqlite_to_postgres(request: JudgeRequest) -> dict[str, Any]:
     return out
 
 
+def patch_deletes_resource(request: JudgeRequest) -> dict[str, Any]:
+    """'고친 척' 환각 — 문제를 고치지 않고 DB·버킷을 지워 finding 을 없앤다. 재검사만으로는 못 잡는다."""
+    out = oracle_review(request)
+    if out["patch"]:
+        rules = {f["rule_id"] for f in request.findings if f["finding_id"] in out["patch"]["target_finding_ids"]}
+        ops = [_op("replace", "/database", {"engine": "none"})] if rules & {"DB-002", "DB-003", "DB-005"} else []
+        if "STO-003" in rules:
+            ops.append(_op("remove", "/storage/buckets/0"))
+        out["patch"]["ops"] = ops or out["patch"]["ops"]
+    return out
+
+
 def not_json(_: JudgeRequest) -> str:
     return "죄송하지만 JSON 으로 답할 수 없습니다."
 
@@ -163,6 +175,7 @@ FAKES: dict[str, Callable[[], Any]] = {
     "patch_creates_finding": lambda: ScriptedLLM(patch_creates_finding, "fake-bad-patch"),
     "patch_out_of_scope": lambda: ScriptedLLM(patch_out_of_scope, "fake-out-of-scope"),
     "sqlite_to_postgres": lambda: ScriptedLLM(sqlite_to_postgres, "fake-sqlite-to-postgres"),
+    "patch_deletes_resource": lambda: ScriptedLLM(patch_deletes_resource, "fake-deletes-resource"),
     "not_json": lambda: ScriptedLLM(not_json, "fake-not-json"),
     "unavailable": UnavailableLLM,
 }
