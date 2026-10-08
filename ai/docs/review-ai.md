@@ -92,7 +92,7 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
   | `TLS_HOST_MISSING` | ✅ | TLS 를 요구했는데 host 가 없어 인증서를 못 붙인다 |
   | `SECRET_KEYS_REQUIRED` | — | `<앱>-secrets` 에 키가 미리 있어야 한다. 없으면 Rollout 이 멈추고 자동 롤백 |
   | `TLS_SECRET_REQUIRED` | — | `<앱>-tls` 인증서 Secret 이 미리 있어야 한다 |
-  | `INGRESS_CIDRS_NOT_ENFORCED` | — | local·gcp 에서 allowed_cidrs 를 강제하지 못한다 (중단으로 올릴지 배포 담당과 정할 것) |
+  | `INGRESS_CIDRS_NOT_ENFORCED` | ✅ | local·gcp 에서 allowed_cidrs 를 강제하지 못해 공개로 열린다 (aws 는 ALB 가 강제 — 경고 없음) |
 
 ```bash
 .venv/bin/python scripts/render_overlay.py samples/01-pass-sample-app-aws.yaml   # blocking 경고가 있으면 종료 코드 3

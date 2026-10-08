@@ -24,9 +24,9 @@ BLOCKING: dict[str, bool] = {
     "DB_PROVISIONING_REQUIRED": True,  # 없는 DB 를 바라보면 앱이 뜨지 않는다
     "BUCKET_PROVISIONING_REQUIRED": True,
     "VOLUME_UNSUPPORTED": True,  # PVC 가 Pending 에 머문다
-    # 명세가 막으라고 한 대역이 강제되지 않는다(local·gcp 만. aws 는 ALB inbound-cidrs 로 강제된다).
-    # 샘플 02(local 비공개 Ingress)처럼 데모 경로에 있어 일단 진행으로 둔다 — 중단으로 올릴지는 배포 담당과 정한다.
-    "INGRESS_CIDRS_NOT_ENFORCED": False,
+    # 명세가 막으라고 한 대역이 강제되지 않아 공개로 열린다(local·gcp 만. aws 는 ALB inbound-cidrs 로 강제된다).
+    # TLS_HOST_MISSING 과 같은 보호 누락이라 fail-closed (D11, 10/08).
+    "INGRESS_CIDRS_NOT_ENFORCED": True,
     "TLS_HOST_MISSING": True,  # TLS 를 요구했는데 인증서를 못 붙여 평문으로 열린다
     "TLS_SECRET_REQUIRED": False,  # 인증서 Secret 이 없으면 Ingress 컨트롤러가 기본 인증서를 쓴다 — 노출은 없음
 }
