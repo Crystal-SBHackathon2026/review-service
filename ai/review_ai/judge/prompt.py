@@ -15,14 +15,17 @@ from typing import Any
 from review_ai.masking import mask_spec
 from review_ai.state import Doc, Finding
 
-PROMPT_VERSION = "judge-v1"
+PROMPT_VERSION = "judge-v2"
 
-# 규칙별로 패치가 건드릴 수 있는 deploy_spec 경로. 여기 없는 규칙은 자동 수정 대상이 아니다
+# 규칙별로 패치가 값을 바꿀 수 있는 deploy_spec 필드. 여기 없는 규칙은 자동 수정 대상이 아니다.
+# op 경로가 아니라 적용 전후 명세에서 실제로 바뀐 말단 필드로 검사한다 — 객체를 통째로 replace 해도 다른 필드가 바뀌면 버린다.
+# '*' 는 리스트 인덱스 하나. 넓은 경로(/database·/storage)를 주면 DB·버킷을 지워서 finding 을 없애는 패치가 통과한다
+_DB_ENGINE = ("/database/engine", "/database/version", "/database/placement")
 RULE_PATCH_PATHS: dict[str, tuple[str, ...]] = {
-    "DB-002": ("/database",),
-    "DB-003": ("/runtime/replicas", "/database"),  # /database 는 allow_convert + 데이터 없음일 때 엔진 전환
-    "DB-005": ("/storage", "/database/volume", "/database/placement"),
-    "STO-003": ("/storage/buckets",),
+    "DB-002": _DB_ENGINE,
+    "DB-003": ("/runtime/replicas", *_DB_ENGINE, "/database/volume"),  # 엔진 필드는 allow_convert + 데이터 없음일 때 전환
+    "DB-005": ("/storage/volumes", "/database/volume", "/database/placement"),
+    "STO-003": ("/storage/buckets/*/public",),
 }
 
 SYSTEM_PROMPT = f"""당신은 Kubernetes 배포 명세(deploy_spec) 검토 보조자다. 정적 검사가 이미 찾은 문제(findings)를 설명하고,
@@ -33,8 +36,11 @@ SYSTEM_PROMPT = f"""당신은 Kubernetes 배포 명세(deploy_spec) 검토 보�
 2. cited_rule_ids 에는 <evidence> 에 있는 rule_id 만 쓴다. 자기 finding 의 rule_id 를 반드시 포함한다. 없는 ID 를 만들지 않는다.
 3. why 는 한국어로, 왜 위험한지와 무엇을 바꿔야 하는지를 근거 문서에 맞춰 3~5문장으로 쓴다.
 4. patch 는 autofix 가 "allowed" 인 finding 만 대상으로 한다. "forbidden" 인 finding 은 patch 대상에 넣지 않는다.
-5. patch ops 는 deploy_spec 기준 JSON Pointer 이고, 대상 finding 의 규칙별로 다음 경로 아래만 바꿀 수 있다:
+5. patch ops 는 deploy_spec 기준 JSON Pointer 이고, 대상 finding 의 규칙별로 다음 필드(와 그 아래)의 값만 바꿀 수 있다
+   ('*' 는 리스트 인덱스). 객체를 통째로 replace 해도 나머지 필드 값은 그대로여야 한다:
 {chr(10).join(f"   - {rule}: {', '.join(paths)}" for rule, paths in RULE_PATCH_PATHS.items())}
+   DB·버킷·볼륨을 지우거나, 외부 DB(external)로 돌리거나, 보호 설정(공개 여부·암호화·버전 관리·백업)을 약하게 바꿔서
+   finding 을 없애지 않는다. 그런 패치는 코드가 버린다.
    value_json 에는 값의 JSON 표현을 넣는다 (예: "1", "\\"postgres\\"", "false").
    패치를 적용한 명세는 코드가 다시 검사한다. 대상 finding 이 사라지지 않거나 새 finding 이 생기면 패치는 버려진다.
 6. 패치는 최소로 한다. finding 과 관계없는 필드는 바꾸지 않는다.

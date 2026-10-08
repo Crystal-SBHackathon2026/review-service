@@ -11,9 +11,9 @@ from typing import Any
 
 import pytest
 
-from review_ai.graph import apply_human_edits, initial_state, run_graph
+from review_ai.graph import apply_human_edits, check_edited_ops, initial_state, run_graph
 from review_ai.judge.fake_llm import FAKES
-from review_ai.patching import apply_ops
+from review_ai.patching import PatchError, apply_ops
 from review_ai.retrieval.file_retriever import FileRetriever
 from review_ai.state import HumanDecision
 from review_ai.verdict import applied_ops
@@ -100,6 +100,18 @@ async def test_invalid_human_ops_fail_before_recheck() -> None:
     bad = _approved({"op": "replace", "path": "/runtime/replicas", "value": "two"})
     with pytest.raises(ValueError, match="replicas"):
         await apply_human_edits({**paused, "human_decision": bad})
+
+
+@pytest.mark.parametrize("path", ["/baseline/facts/database_has_data", "/baseline"])
+async def test_human_cannot_edit_observed_baseline(path: str) -> None:
+    """baseline 의 '데이터 없음'으로 바꾸면 DB-001(되돌릴 수 없는 엔진 변경)이 사라져 pass 가 됐다."""
+    paused = await _review("04-human-engine-change-with-data.yaml")
+    assert paused["status"] == "needs_human"
+    op = {"op": "replace", "path": path, "value": False} if path.endswith("has_data") else {"op": "remove", "path": path}
+    with pytest.raises(PatchError, match="baseline"):
+        check_edited_ops(paused["deploy_spec"], [op])
+    with pytest.raises(PatchError, match="baseline"):
+        await apply_human_edits({**paused, "human_decision": _approved(op)})
 
 
 async def test_autofix_commit_turns_fix_into_needs_human() -> None:

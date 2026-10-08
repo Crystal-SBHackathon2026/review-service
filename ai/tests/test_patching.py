@@ -4,7 +4,7 @@ import copy
 
 import pytest
 
-from review_ai.patching import PatchError, apply_ops
+from review_ai.patching import PatchError, apply_ops, changed_paths, path_under
 from tests.conftest import load_sample_dict
 
 
@@ -47,3 +47,27 @@ def test_remove_and_escaped_pointer() -> None:
 def test_invalid_ops_raise(op: dict) -> None:
     with pytest.raises(PatchError):
         apply_ops(load_sample_dict("02-pass-local-sqlite.yaml"), [op])
+
+
+def test_changed_paths_sees_leaves_not_op_paths() -> None:
+    before = {"db": {"engine": "mysql", "version": "8.0"}, "buckets": [{"name": "a", "public": True}], "env": {}}
+    after = {"db": {"engine": "mysql", "version": "16"}, "buckets": [], "env": {"X": "1"}}
+    assert changed_paths(before, after) == {
+        "/db/version", "/buckets", "/buckets/0/name", "/buckets/0/public", "/env", "/env/X",
+    }
+    assert changed_paths(before, copy.deepcopy(before)) == set()
+
+
+@pytest.mark.parametrize(
+    ("path", "pattern", "expected"),
+    [
+        ("/storage/buckets/0/public", "/storage/buckets/*/public", True),
+        ("/storage/buckets/0/name", "/storage/buckets/*/public", False),
+        ("/storage/buckets", "/storage/buckets/*/public", False),
+        ("/database/engine", "/database/engine", True),
+        ("/database/engineering", "/database/engine", False),
+        ("/storage/volumes/1/size", "/storage/volumes", True),
+    ],
+)
+def test_path_under_matches_wildcard_index(path: str, pattern: str, expected: bool) -> None:
+    assert path_under(path, pattern) is expected

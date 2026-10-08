@@ -34,7 +34,7 @@ pip install "./ai[qdrant]"        # 이미지 빌드 — catalog/·knowledge/ �
 | apply_patch | `verdict.round_snapshot(state)` · `patching.apply_ops(spec, patch["ops"])` | 참고 구현: `graph.apply_patch` |
 | 커밋 단계 | `verdict.applied_ops(final)` · `patching.apply_ops(원본, ops)` · `overlay.render_overlay(spec)` → `files`·`warnings`·`blocking` | **spec_ref 로 앱 레포에서 읽은 원본**에 `applied_ops(final)` 를 적용해 렌더링한다. ⚠️ `patch["ops"]` 가 아니다 — apply_patch 가 patch 를 rounds 로 옮기고 비우므로 고쳐서 통과한 최종 State 는 `patch=None` 이고, ops 는 `rounds[*].patch.ops` 에 회차 순서대로 있다. `applied_ops == []` 면 수정 없이 통과(원본 그대로). Kafka 사본은 가려져 있어 렌더러가 거절한다. 회차별 diff 는 `rounds[i].patch.files` 에 있다. `rendered.blocking` 이 비어 있지 않으면 커밋하지 말고 `blocked` 로 돌려준다 |
 | 커밋 노드 (`commit_overlay`, 배포 담당) | `state.DeployResult` → State 의 `deploy_result` | `{status: committed \| blocked, commit_sha, reason}`. verdict 가 pass 일 때만 쓴다. `status`(verdict 값)와 섞지 않는다. push 실패처럼 재시도할 오류는 `errors.TransientError`, DB·버킷이 없어 멈추는 건 `blocked` 로 정상 반환 |
-| 사람 확인 재개 (승인 API·워커) | `state.HumanDecision` → State 의 `human_decision`, `status` 에 `rejected` · `graph.apply_human_edits` · `graph.check_edited_ops(spec, ops)` | `{decision: approved \| rejected, approver, edited_ops}`. 승인 + `edited_ops` 없음 → `commit_overlay`, 승인 + 있음 → **`apply_human_edits` 노드 → `static_check`** 부터 재검사, 거절 → `status=rejected` 로 종료. `edited_ops` 는 원본이 아니라 **멈춘 State 의 `deploy_spec`(AI 가 고친 회차 반영) 기준**이다. `apply_human_edits` 가 needs_human 회차와 사람 ops 를 `rounds` 에 남기므로 커밋 노드는 그대로 `applied_ops(state)` 를 쓰면 사람 수정까지 들어간다. 사람이 고친 뒤 남은 문제는 AI 가 다시 고치지 않고 needs_human(LOOP_EXHAUSTED). 승인 API 는 재개 전에 `check_edited_ops` 로 검사해 422 를 돌려주면 워커가 재개 중에 실패하지 않는다 |
+| 사람 확인 재개 (승인 API·워커) | `state.HumanDecision` → State 의 `human_decision`, `status` 에 `rejected` · `graph.apply_human_edits` · `graph.check_edited_ops(spec, ops)` | `{decision: approved \| rejected, approver, edited_ops}`. 승인 + `edited_ops` 없음 → `commit_overlay`, 승인 + 있음 → **`apply_human_edits` 노드 → `static_check`** 부터 재검사, 거절 → `status=rejected` 로 종료. `edited_ops` 는 원본이 아니라 **멈춘 State 의 `deploy_spec`(AI 가 고친 회차 반영) 기준**이다. `apply_human_edits` 가 needs_human 회차와 사람 ops 를 `rounds` 에 남기므로 커밋 노드는 그대로 `applied_ops(state)` 를 쓰면 사람 수정까지 들어간다. 사람이 고친 뒤 남은 문제는 AI 가 다시 고치지 않고 needs_human(LOOP_EXHAUSTED). 승인 API 는 재개 전에 `check_edited_ops` 로 검사해 422 를 돌려주면 워커가 재개 중에 실패하지 않는다. `/baseline` 아래는 고칠 수 없다(관측 사실을 바꿔 DB-001 등을 우회하는 것을 막고, 원본엔 baseline 이 없어 커밋 단계에서 적용되지 않음) |
 | 결과 저장 (업무 DB·결과 화면) | 최종 State 의 `status`·`decision`·`findings`·`rounds` | `status` 는 `running \| pass \| fix \| needs_human \| rejected`. 고쳐서 통과하면 최종 `findings`·`decision.items`·`retrieved_docs` 는 재검사 결과라 비어 있다. **무엇을 왜 고쳤는지는 `rounds[i]`** 에 있다 — `{round, finding_ids, findings, verdict, reasons, items(why·cited_rule_ids), doc_ids, patch(ops·files)}`. 사람이 고친 회차는 `verdict: needs_human` + `human: {decision, approver}` 가 더 붙는다 |
 | 단독 실행·평가 | `graph.run_graph(initial_state(spec, review_id=), llm=, retriever=)` | 최종 State 에 `applied_ops`·`patched`(고친 적 있음) 를 더해 돌려준다. 멈춘 State 에 `human_decision` 을 넣어 다시 부르면 재개 경로를 탄다. 고쳐서 통과 = `status == "pass" and patched`. `scripts/run_eval.py` 가 이걸 쓴다 |
 
@@ -42,14 +42,16 @@ pip install "./ai[qdrant]"        # 이미지 빌드 — catalog/·knowledge/ �
 
 LLM 이 낸 패치는 아래를 모두 통과해야 `fix` 가 된다. 하나라도 어기면 패치를 버리고 `needs_human`(PATCH_OUT_OF_SCOPE)이다.
 
-1. 대상은 autofix allowed finding 만, ops 는 대상 규칙의 허용 경로(`judge/prompt.py` `RULE_PATCH_PATHS`) 아래만 — env·이미지·시크릿·네트워크는 어떤 규칙으로도 못 바꾼다
-2. 실제 명세에 적용되고 DeploySpec 형식을 통과한다 (allowed_cidrs 는 CIDR 형식 검사)
-3. DB 엔진·배치 변경은 데이터가 없고, `engine_policy: allow_convert` 이거나 대상이 DB-002 일 때만
-4. persistent 볼륨을 없애거나 비영속으로 바꾸거나 줄이지 않는다
-5. 비밀처럼 보이는 env 를 새로 넣지 않는다
-6. 적용한 명세를 다시 static_check 하면 대상 finding 이 사라지고 새 finding 이 생기지 않는다
+1. 대상은 autofix allowed finding 만. 적용 전후 명세에서 **실제로 바뀐 말단 필드**가 전부 대상 규칙의 허용 필드(`judge/prompt.py` `RULE_PATCH_PATHS`, `*` = 리스트 인덱스) 아래여야 한다 — 객체를 통째로 replace 해도 다른 필드가 바뀌면 버린다. env·이미지·시크릿·네트워크·baseline 은 어떤 규칙으로도 못 바꾼다
+2. op 경로도 허용 필드와 겹쳐야 하고, op 값에 `***MASKED***` 가 없어야 한다 — State 명세는 가린 사본이라, 가린 값을 다시 쓰는 op 는 여기선 변화가 없어도 원본에 적용하면 실제 값을 덮는다
+3. 실제 명세에 적용되고 DeploySpec 형식을 통과한다 (allowed_cidrs 는 CIDR 형식 검사)
+4. DB 엔진·배치 변경은 데이터가 없고, `engine_policy: allow_convert` 이거나 대상이 DB-002 일 때만
+5. persistent 볼륨을 없애거나 비영속으로 바꾸거나 줄이지 않는다
+6. **지워서 고치지 않는다** — DB 를 없애거나(engine none) 외부 DB(external)로 돌리거나, 버킷을 지우거나, 보호 설정(DB 공개·백업 보존일·버킷 공개·버전 관리·암호화)을 약하게 바꾸지 않는다. 대상 finding 은 사라지고 재검사도 통과하는 패치라 8번(재검사)만으로는 못 막는다
+7. 비밀처럼 보이는 env 를 새로 넣지 않는다
+8. 적용한 명세를 다시 static_check 하면 대상 finding 이 사라지고 새 finding 이 생기지 않는다
 
-6번 때문에 루프 안 재검사는 대부분 첫 회차에 끝난다. LOOP_EXHAUSTED 는 안전장치로 남아 있다.
+8번 때문에 루프 안 재검사는 대부분 첫 회차에 끝난다. LOOP_EXHAUSTED 는 안전장치로 남아 있다.
 LOOP_EXHAUSTED 는 "AI 가 또 고치려 한다" 는 뜻으로 두 경우에도 쓴다 — 봇 커밋을 다시 검토했는데 fix(`autofix_commit`),
 사람이 고친 명세를 재검사했는데 fix(`human_decision`). 사유 코드를 늘리지 않으려고 같은 코드를 쓴다.
 LLM 의 자유 텍스트(why·extra_opinions)는 비밀처럼 보이는 부분을 가리고, 개수·길이를 제한한다. 명세는 `< > &` 를 이스케이프해 프롬프트 구분 태그를 흉내 내지 못하게 한다.
@@ -108,6 +110,7 @@ S3 `review-docs` 버킷과 같은 구조다: `rules/{any,aws,gcp,local}/<ruleId>
 문서의 `## ` 섹션 하나가 청크다. P0 규칙 12개(구현한 규칙 전부) 문서가 있고, 환경별 청크 수는 테스트로 30개 이상을 유지한다.
 
 - 규칙 문서는 ruleId 정확 매칭(점수 1.0)으로 찾고, 사례·가이드는 의미 검색(dense cosine, 0.5 미만 버림)으로 보탠다.
+- 정확 매칭은 ruleId 당 최대 8청크이고 **규칙 문서를 먼저** 채운 뒤 related_rules 사례·가이드를 붙인다(`retrieval.exact_first`). 경로 순으로 자르면 사례가 많은 DB-003 은 규칙 문서가 통째로 빠졌다.
 - 임베딩은 로컬 `paraphrase-multilingual-MiniLM-L12-v2`(fastembed, 키 없음). 무관한 질문은 0.15~0.48 로 나와 임계값 0.5 아래다(검색 평가셋 참고).
 - `warnings/` 는 렌더러 경고(`RenderWarning.code`)마다 멈춘 이유·환경별 차이·고치는 법이다. `rule_ids` 가 비어 있어 judge 프롬프트(규칙 정확 매칭·의미 검색)에는 들어가지 않는다.
   커밋 단계·보고서는 `warning.to_dict()["doc"]`(= `warnings/<code>.md`, 버킷에서도 같은 경로)로 찾는다. 문서의 `blocking` 은 테스트로 렌더러와 맞춘다.

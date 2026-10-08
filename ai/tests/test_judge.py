@@ -14,6 +14,7 @@ from review_ai.judge.llm import CachedLLM, ClaudeLLM, LlmRefused, LlmUnavailable
 from review_ai.judge.node import judge_unavailable, make_judge
 from review_ai.judge.prompt import build_request
 from review_ai.judge.validate import validate_output
+from review_ai.masking import mask_spec
 from review_ai.retrieval.file_retriever import FileRetriever
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.static_check import run_static_check
@@ -100,6 +101,67 @@ async def test_patch_scope_rejections(ops: list[dict[str, Any]]) -> None:
     assert patch is None and validation["patch_scope_ok"] is False
 
 
+def _with_patch(state: dict[str, Any], ops: list[dict[str, Any]]) -> str:
+    out = oracle_text(state)
+    out["patch"]["ops"] = ops
+    return json.dumps(out)
+
+
+ENGINE_PG16 = [
+    {"op": "replace", "path": "/database/engine", "value_json": '"postgres"'},
+    {"op": "replace", "path": "/database/version", "value_json": '"16"'},
+]
+
+
+@pytest.mark.parametrize(
+    ("sample", "ops"),
+    [
+        ("05-fix-engine-unsupported-local.yaml", [{"op": "replace", "path": "/database", "value_json": '{"engine": "none"}'}]),
+        ("05-fix-engine-unsupported-local.yaml", [{"op": "replace", "path": "/database/engine", "value_json": '"none"'}]),
+        ("05-fix-engine-unsupported-local.yaml", [{"op": "replace", "path": "/database/placement", "value_json": '"external"'}]),
+        ("05-fix-engine-unsupported-local.yaml",
+         [*ENGINE_PG16, {"op": "add", "path": "/database/publicly_accessible", "value_json": "true"}]),
+        ("05-fix-engine-unsupported-local.yaml",
+         [*ENGINE_PG16, {"op": "add", "path": "/database/backup_retention_days", "value_json": "0"}]),
+        ("07-fix-public-bucket.yaml", [{"op": "remove", "path": "/storage/buckets/0"}]),
+        ("07-fix-public-bucket.yaml", [{"op": "replace", "path": "/storage/buckets/0", "value_json":
+         '{"name": "sample-app-uploads", "public": false, "versioning": false, "encryption": false}'}]),
+        ("07-fix-public-bucket.yaml", [{"op": "replace", "path": "/storage", "value_json": "{}"}]),
+        ("03-fix-sqlite-replicas-gcp.yaml", [{"op": "replace", "path": "/database", "value_json": '{"engine": "none"}'}]),
+    ],
+    ids=["db-replaced-by-none", "engine-none", "placement-external", "db-made-public", "backup-dropped",
+         "bucket-removed", "bucket-protection-off", "storage-emptied", "sqlite-db-removed"],
+)
+async def test_patch_cannot_fix_by_removing_or_weakening(sample: str, ops: list[dict[str, Any]]) -> None:
+    """대상 finding 만 사라지면 되는 게 아니다 — DB·버킷을 지우거나 보호를 끄는 '고친 척' 패치는 버린다."""
+    state = await prepared(sample)
+    _, validation, patch = validate_output(_with_patch(state, ops), state["findings"], state["retrieved_docs"],
+                                           state["deploy_spec"])
+    assert patch is None and validation["patch_scope_ok"] is False
+
+
+async def test_whole_object_replace_passes_when_only_allowed_field_changes() -> None:
+    state = await prepared("07-fix-public-bucket.yaml")
+    ops = [{"op": "replace", "path": "/storage/buckets/0", "value_json":
+            '{"name": "sample-app-uploads", "public": false, "versioning": true, "encryption": true}'}]
+    _, validation, patch = validate_output(_with_patch(state, ops), state["findings"], state["retrieved_docs"],
+                                           state["deploy_spec"])
+    assert patch is not None and validation["patch_scope_ok"] is True
+
+
+async def test_patch_cannot_write_masked_value_back() -> None:
+    """가린 사본에서는 변화 없음이지만, 원본에 적용하면 실제 값을 ***MASKED*** 로 덮는 op."""
+    state = await prepared("07-fix-public-bucket.yaml")
+    state["deploy_spec"]["storage"]["buckets"][0]["name"] = "uploader:pw1234@bucket-host"
+    state["deploy_spec"] = mask_spec(state["deploy_spec"])
+    state["findings"] = run_static_check(DeploySpec.model_validate(state["deploy_spec"]))
+    ops = [{"op": "replace", "path": "/storage/buckets/0", "value_json":
+            '{"name": "***MASKED***", "public": false, "versioning": true, "encryption": true}'}]
+    _, _, patch = validate_output(_with_patch(state, ops), state["findings"], state["retrieved_docs"],
+                                  state["deploy_spec"])
+    assert patch is None
+
+
 async def test_patch_cannot_drop_persistent_volume() -> None:
     state = await prepared("02-pass-local-sqlite.yaml")
     state["deploy_spec"]["runtime"]["replicas"] = 2  # DB-003
@@ -158,7 +220,7 @@ async def test_node_low_only_skips_llm() -> None:
 async def test_node_returns_patch_only_for_fix() -> None:
     out = await make_judge(FAKES["oracle"]())(await prepared("07-fix-public-bucket.yaml"))
     assert out["decision"]["verdict"] == "fix" and out["patch"] is not None
-    assert out["decision"]["llm"]["prompt_version"] == "judge-v1"
+    assert out["decision"]["llm"]["prompt_version"] == "judge-v2"
     human = await make_judge(FAKES["oracle"]())(await prepared("10-human-mixed-aws.yaml"))
     assert human["decision"]["verdict"] == "needs_human" and human["patch"] is None
 

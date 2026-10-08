@@ -75,3 +75,29 @@ def apply_ops(spec: dict[str, Any], ops: Sequence[PatchOp]) -> dict[str, Any]:
     for op in ops:
         _apply(doc, op)
     return doc
+
+
+def _escape(token: str) -> str:
+    return token.replace("~", "~0").replace("/", "~1")
+
+
+def _leaves(node: Any, path: str = "") -> dict[str, Any]:
+    """중첩 dict·list → {JSON Pointer: 말단 값}. 빈 dict·list 도 말단으로 본다 (항목이 생기거나 사라진 것을 잡으려고)."""
+    if isinstance(node, dict) and node:
+        return {p: v for key, child in node.items() for p, v in _leaves(child, f"{path}/{_escape(str(key))}").items()}
+    if isinstance(node, list) and node:
+        return {p: v for i, child in enumerate(node) for p, v in _leaves(child, f"{path}/{i}").items()}
+    return {path: node}
+
+
+def changed_paths(before: Any, after: Any) -> set[str]:
+    """두 문서에서 값이 다르거나 한쪽에만 있는 말단 경로. op 경로가 아니라 실제로 바뀐 필드를 본다."""
+    old, new = _leaves(before), _leaves(after)
+    missing = object()
+    return {p for p in old.keys() | new.keys() if old.get(p, missing) != new.get(p, missing)}
+
+
+def path_under(path: str, pattern: str) -> bool:
+    """path 가 pattern 과 같거나 그 아래인가. pattern 의 '*' 토큰은 아무 토큰 하나(리스트 인덱스 등)와 맞는다."""
+    tokens, expected = parse_pointer(path), parse_pointer(pattern)
+    return len(tokens) >= len(expected) and all(e in ("*", t) for e, t in zip(expected, tokens))

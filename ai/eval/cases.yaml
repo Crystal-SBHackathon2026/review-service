@@ -81,6 +81,14 @@ cases:
     sample: 07-fix-public-bucket.yaml
     llm: patch_creates_finding      # 재검사에서 새 finding 이 나오는 패치는 적용 전에 버려진다
     expect: {verdict: needs_human, reasons_include: [PATCH_OUT_OF_SCOPE], rounds: 0}
+  - id: patch-deletes-database
+    sample: 05-fix-engine-unsupported-local.yaml
+    llm: patch_deletes_resource     # engine none 으로 DB-002 를 없앤다 — 재검사는 통과하므로 보호 가드가 막아야 한다
+    expect: {verdict: needs_human, reasons_include: [PATCH_OUT_OF_SCOPE], rounds: 0, no_engine_change: true}
+  - id: patch-deletes-bucket
+    sample: 07-fix-public-bucket.yaml
+    llm: patch_deletes_resource     # 버킷을 지워 STO-003 을 없앤다
+    expect: {verdict: needs_human, reasons_include: [PATCH_OUT_OF_SCOPE], rounds: 0}
   - id: patch-out-of-scope
     sample: 07-fix-public-bucket.yaml
     llm: patch_out_of_scope
