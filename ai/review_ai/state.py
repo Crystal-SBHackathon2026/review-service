@@ -7,6 +7,8 @@
 - deploy_result 추가 — 커밋 단계(commit_overlay) 결과. 판정과 섞지 않으려고 status 와 따로 둔다
 - status 에 rejected 추가, human_decision 추가 — needs_human 뒤 사람 승인·거절로 재개 (Slack 10/08 합의)
   승인 + edited_ops 없음 → commit_overlay, 승인 + edited_ops 있음 → static_check 부터 재검사, 거절 → status=rejected 로 종료
+- status 에 running 추가 — initial_state 값. judge 가 verdict 로 바꾼다
+- autofix_commit 추가 — 워커가 applied_ops 를 커밋한 SHA 를 다시 검토할 때 True. 또 fix 면 needs_human(LOOP_EXHAUSTED)
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from typing import Annotated, Any, Literal, TypedDict
 Category = Literal["database", "secret", "network", "storage", "runtime"]
 Severity = Literal["high", "medium", "low"]
 Verdict = Literal["pass", "fix", "needs_human"]
-ReviewStatus = Literal[Verdict, "rejected"]  # verdict 값 그대로 + 사람이 거절한 경우
+ReviewStatus = Literal["running", Verdict, "rejected"]  # 판정 전 running → verdict 값 그대로, 사람이 거절하면 rejected
 TargetEnv = Literal["aws", "gcp", "local"]
 
 REASON_CODES = (
@@ -81,7 +83,7 @@ class DeployResult(TypedDict):
     """커밋 단계(commit_overlay, 배포 담당) 결과. verdict 가 pass 일 때만 쓰이고 판정에는 영향이 없다."""
 
     status: Literal["committed", "blocked"]
-    commit_sha: str | None  # committed 일 때 gitops 커밋 SHA — 배포 이벤트를 검토와 잇는 키
+    commit_sha: str | None  # committed 일 때 gitops 커밋 SHA. 배포 이벤트 매칭 키는 워커가 저장하는 앱 PR 병합 SHA
     reason: str | None  # blocked 일 때 멈춘 이유 (렌더러 blocking 경고의 code·설명 등)
 
 
@@ -90,7 +92,9 @@ class HumanDecision(TypedDict):
 
     decision: Literal["approved", "rejected"]
     approver: str
-    edited_ops: list[PatchOp]  # 사람이 고친 deploy_spec ops. 비어 있으면 고친 것 없이 승인
+    # 사람이 고친 ops. 원본이 아니라 State 의 현재 deploy_spec(AI 가 이미 고친 회차가 반영된 명세) 기준이다.
+    # 비어 있으면 고친 것 없이 승인
+    edited_ops: list[PatchOp]
 
 
 class ReviewState(TypedDict, total=False):
@@ -105,5 +109,6 @@ class ReviewState(TypedDict, total=False):
     rounds: Annotated[list[dict[str, Any]], operator.add]  # 회차별 스냅샷
     retry_count: int
     status: ReviewStatus  # verdict 값, 사람이 거절하면 rejected. 커밋 결과는 섞지 않고 deploy_result 에 둔다
-    human_decision: HumanDecision | None  # needs_human 뒤 재개할 때만 있다
+    human_decision: HumanDecision | None  # needs_human 뒤 재개할 때만 있다. 있으면 AI 가 다시 자동 수정하지 않는다
+    autofix_commit: bool  # 검토 대상 커밋이 워커가 applied_ops 를 커밋한 것(봇 커밋)이면 True — 재수정 루프 방지
     deploy_result: DeployResult | None  # commit_overlay 만 쓴다 (pass 가 아니면 없음)

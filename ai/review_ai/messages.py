@@ -41,6 +41,10 @@ class ReviewRequested(BaseModel):
     deploy_spec: dict[str, Any] = Field(description="mask_spec() 을 거친 명세. baseline 없음")
     requested_by: str
     requested_at: datetime
+    autofix_commit: bool = Field(
+        default=False,
+        description="spec_ref.commit 이 워커가 applied_ops 를 커밋한 것(봇 커밋)이면 True — 또 fix 면 needs_human",
+    )
 
     @model_validator(mode="after")
     def _safe_payload(self) -> ReviewRequested:
@@ -66,6 +70,7 @@ def build_review_requested(
     spec_ref: dict[str, str],
     requested_by: str,
     requested_at: datetime,
+    autofix_commit: bool = False,
 ) -> ReviewRequested:
     body = mask_spec({k: v for k, v in spec.items() if k != "baseline"})
     return ReviewRequested(
@@ -78,4 +83,5 @@ def build_review_requested(
         deploy_spec=body,
         requested_by=requested_by,
         requested_at=requested_at,
+        autofix_commit=autofix_commit,
     )

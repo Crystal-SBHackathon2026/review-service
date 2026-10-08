@@ -125,10 +125,10 @@ def build_patch(llm_patch: LlmPatch, findings: Sequence[Finding], spec: dict[str
     )
     if not all(guards):
         return None
-    return Patch(kind="config", ops=ops, target_finding_ids=sorted(targets), files=_overlay_files(before, after))
+    return Patch(kind="config", ops=ops, target_finding_ids=sorted(targets), files=overlay_files(before, after))
 
 
-def _overlay_files(before: DeploySpec, after: DeploySpec) -> list[dict[str, str]]:
+def overlay_files(before: DeploySpec, after: DeploySpec) -> list[dict[str, str]]:
     """State 의 명세가 Kafka 의 가린 사본이면 overlay 를 만들 수 없다 — diff 없이 ops 만 넘기고,
     커밋 단계가 spec_ref 로 읽은 원본에 ops 를 적용해 render_overlay 한다."""
     try:

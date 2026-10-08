@@ -6,6 +6,11 @@
 3. 남은 finding 이 전부 검증된 패치 대상 → fix
 4. 남은 것이 low 경고뿐 → pass
 
+3 에서 자동 수정이 막혀 있으면(autofix_allowed=False) fix 대신 needs_human(LOOP_EXHAUSTED) 이다. 둘 다 "AI 가 또 고치려는" 경우다.
+- 봇 커밋 재검토: 워커가 applied_ops 를 커밋한 SHA 를 다시 검토했는데 또 fix — 다시 커밋하면 무한 루프
+- 사람이 고친 뒤 재검사: 사람이 손댄 명세를 AI 가 이어서 고치지 않는다
+사유 코드를 새로 만들지 않고 LOOP_EXHAUSTED 를 쓴다 — 업무 DB 의 사유 코드 8개를 그대로 둔다.
+
 low finding 은 사람 확인 조건에서 뺀다 (결정 #6). 안 빼면 HTTP 전용 sample-app(NET-001)이 매번 needs_human 이 된다.
 단, LLM 출력이 틀렸으면(CITATION_INVALID) low 만 있어도 needs_human — 틀린 설명을 그대로 내보내지 않는다.
 """
@@ -96,6 +101,7 @@ def decide_verdict(
     *,
     rounds: Sequence[dict[str, Any]] = (),
     llm_meta: dict[str, Any] | None = None,
+    autofix_allowed: bool = True,
 ) -> Decision:
     items = [item.model_dump() for item in llm_out.items] if llm_out else []
     extra = list(llm_out.extra_opinions) if llm_out else []
@@ -107,7 +113,11 @@ def decide_verdict(
     if reasons:
         ordered = [code for code in REASON_CODES if code in reasons]
         return {**base, "verdict": "needs_human", "reasons": ordered}
-    return {**base, "verdict": "fix" if _counted(findings) else "pass"}
+    if not _counted(findings):
+        return base
+    if not autofix_allowed:
+        return {**base, "verdict": "needs_human", "reasons": ["LOOP_EXHAUSTED"]}
+    return {**base, "verdict": "fix"}
 
 
 def round_snapshot(state: dict[str, Any]) -> dict[str, Any]:

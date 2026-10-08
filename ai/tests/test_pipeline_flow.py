@@ -24,7 +24,6 @@ from tests.conftest import SAMPLES, load_sample_dict
 SPEC_REF = {"repository": "github.com/crystal/sample-app", "commit": "abc123", "path": "deploy.yaml"}
 SAMPLE_NAMES = sorted(p.name for p in SAMPLES.glob("[0-9]*.yaml"))
 BLOCKED_AFTER_PASS = {
-    "02-pass-local-sqlite.yaml": {"INGRESS_CIDRS_NOT_ENFORCED"},
     "05-fix-engine-unsupported-local.yaml": {"DB_PROVISIONING_REQUIRED", "INGRESS_CIDRS_NOT_ENFORCED"},
     "07-fix-public-bucket.yaml": {"BUCKET_PROVISIONING_REQUIRED"},
 }
