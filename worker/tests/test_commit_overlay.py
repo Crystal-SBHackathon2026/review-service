@@ -9,9 +9,9 @@ import pytest
 import yaml
 
 from review_ai.errors import TransientError
-from worker.commit_overlay import commit_message, make_commit_overlay
+from review_worker.commit_overlay import commit_message, make_commit_overlay
 
-SAMPLES = Path(__file__).resolve().parent.parent / "ai" / "samples"
+SAMPLES = Path(__file__).resolve().parents[2] / "ai" / "samples"
 REPO = "Crystal-SBHackathon2026/sample-app"
 COMMIT = "b084c24e5a45f307981a9a005fa9d4e1e1079062"
 
