@@ -9,8 +9,8 @@
 |---|---|
 | `review_ai/spec/deploy_spec.py` | Pydantic 모델(정본). 형식 검사와 `load_spec()` |
 | `schema/deploy_spec.schema.json` | 위 모델에서 내보낸 JSON Schema. 파이프라인 쪽 FastAPI 나 다른 언어가 쓸 수 있다 |
-| `catalog/rules.yaml` | 정적 검사 규칙 26개 (P0 11개) |
-| `catalog/targets.yaml` | 대상 환경 능력표 (aws·gcp·local). 아직 실측 전 |
+| `catalog/rules.yaml` | 정적 검사 규칙 26개 (P0 12개 — STO-001 추가) |
+| `catalog/targets.yaml` | 대상 환경 능력표 (aws·gcp·local). aws 만 실측(10/08) |
 | `samples/*.yaml` | 샘플 명세 10개 |
 | `samples/cases.yaml` | 샘플별 기대 finding·verdict·사유 |
 | `scripts/validate_samples.py` | 위 파일이 서로 맞는지 확인하고 스키마를 다시 내보낸다 |
@@ -97,7 +97,7 @@ evidence 에도 값을 남기지 않는다. `source: generated` 는 배포 시 �
 4. **decide_verdict 보완.** low finding 은 `forbidden` 이어도 사람 조건에서 빼야 한다.
    안 그러면 HTTP 전용인 지금의 sample-app(NET-001)이 매번 needs_human 이 된다.
 5. ~~**명세 → kustomize overlay 변환은 누가 하나.**~~ → 검토 서비스 코드(`review_ai/overlay`)가 만든다. 지금 sample-app overlay 3개를 그대로 재현한다 — [review-ai.md](review-ai.md#overlay-렌더러-결정-7-검토-서비스-코드가-만든다)
-6. **능력표 실측.** EKS 노드 아키텍처, GKE·Cloud SQL 유무, busan-local 노드 아키텍처.
+6. **능력표 실측.** ~~EKS~~ → aws 실측 반영(10/08): amd64, EBS CSI 없음 → 볼륨·in-cluster DB·SQLite 볼륨 불가, 앱별 DB 생성 수단 없음. 남은 것: GKE·Cloud SQL 유무, busan-local 노드 아키텍처.
 7. **`source: generated` 시크릿은 누가 만드나.**
 
 ## 범위 밖

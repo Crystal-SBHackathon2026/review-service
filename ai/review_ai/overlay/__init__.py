@@ -4,6 +4,7 @@
   gitops 레포에 커밋하는 일은 파이프라인 커밋 단계가 한다.
 - 전제: apps/<app>/base 에 Rollout·Service(이름 = metadata.name)가 있다 — 지금 sample-app base 구조.
 - overlay 로 표현할 수 없는 것(DB·버킷 프로비저닝, Secret 값 생성)은 warnings 로 돌려준다. 조용히 빼지 않는다.
+  경고마다 code·blocking 이 있다(overlay/warnings.py). blocking 이 하나라도 있으면 커밋하지 말고 멈춘다 — RenderedOverlay.blocking.
 """
 
 from __future__ import annotations
@@ -12,8 +13,9 @@ import difflib
 from dataclasses import dataclass
 from typing import Any
 
-from review_ai.catalog import load_targets
+from review_ai.catalog import TargetCaps, load_targets
 from review_ai.overlay.ingress import render_ingress
+from review_ai.overlay.warnings import RenderWarning
 from review_ai.overlay.workload import pvc, rollout_ops, secret_name, service_ops
 from review_ai.overlay.yaml_io import dump, dump_with_header
 from review_ai.secrets_pattern import MASK
@@ -29,7 +31,12 @@ HEADER = (
 class RenderedOverlay:
     directory: str
     files: dict[str, str]  # 파일 이름 → 내용
-    warnings: tuple[str, ...]
+    warnings: tuple[RenderWarning, ...]
+
+    @property
+    def blocking(self) -> tuple[RenderWarning, ...]:
+        """커밋하면 배포가 깨지거나 명세가 요구한 보호가 빠지는 경고. 비어 있어야 커밋한다."""
+        return tuple(w for w in self.warnings if w.blocking)
 
 
 def _images(spec: AppSpec) -> list[dict[str, str]]:
@@ -41,17 +48,36 @@ def _images(spec: AppSpec) -> list[dict[str, str]]:
     return [image]
 
 
-def _warnings(spec: AppSpec) -> list[str]:
+def _warnings(spec: AppSpec, caps: TargetCaps) -> list[RenderWarning]:
     out = []
     if spec.secrets:
         names = ", ".join(s.name for s in spec.secrets)
-        out.append(f"Secret {secret_name(spec)} 에 키 [{names}] 가 미리 있어야 한다 (값 생성·동기화 주체는 결정 #8)")
+        out.append(RenderWarning(
+            "SECRET_KEYS_REQUIRED",
+            f"Secret {secret_name(spec)} 에 키 [{names}] 가 미리 있어야 한다 (값 생성·동기화 주체는 결정 #8)",
+        ))
     if spec.database.engine != "none" and spec.database.placement != "volume":
-        out.append(f"database ({spec.database.placement} {spec.database.engine}) 는 overlay 로 만들지 않는다 — 인프라 프로비저닝 필요")
+        out.append(RenderWarning(
+            "DB_PROVISIONING_REQUIRED",
+            f"database ({spec.database.placement} {spec.database.engine}) 는 overlay 로 만들지 않는다 — 인프라 프로비저닝 필요",
+        ))
     if spec.storage.buckets:
-        out.append("storage.buckets 는 overlay 로 만들지 않는다 — Terraform 등 인프라 쪽에서 반영 필요")
+        out.append(RenderWarning(
+            "BUCKET_PROVISIONING_REQUIRED",
+            "storage.buckets 는 overlay 로 만들지 않는다 — Terraform 등 인프라 쪽에서 반영 필요",
+        ))
+    for v in spec.storage.volumes:
+        if v.persistent and v.access_mode not in caps.volume_access_modes:
+            supported = ", ".join(sorted(caps.volume_access_modes)) or "없음"
+            out.append(RenderWarning(
+                "VOLUME_UNSUPPORTED",
+                f"{caps.env}: 볼륨 {v.name} ({v.access_mode}) 를 만들 수 없다 — 지원 접근 모드: {supported} (STO-001)",
+            ))
     if not spec.image.digest:
-        out.append("image.digest 가 없어 태그로만 고정된다 — 같은 태그 재푸시 시 다른 이미지가 배포된다")
+        out.append(RenderWarning(
+            "IMAGE_DIGEST_MISSING",
+            "image.digest 가 없어 태그로만 고정된다 — 같은 태그 재푸시 시 다른 이미지가 배포된다",
+        ))
     return out
 
 
@@ -62,7 +88,7 @@ def render_overlay(spec: AppSpec, *, apps_root: str = "apps") -> RenderedOverlay
     caps = load_targets()[spec.target.env]
     name = spec.metadata.name
     files: dict[str, str] = {}
-    warnings = _warnings(spec)
+    warnings = _warnings(spec, caps)
     resources = ["../../base"]
     if spec.network.ingress is not None:
         ingress, ingress_warnings = render_ingress(spec, caps)

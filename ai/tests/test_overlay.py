@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import copy
+import pickle
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 import yaml
 
-from review_ai.overlay import overlay_diff, render_overlay
+from review_ai.overlay import RenderedOverlay, overlay_diff, render_overlay
+from review_ai.overlay.warnings import BLOCKING, RenderWarning, WarningCode
 from review_ai.spec.deploy_spec import DeploySpec
 from tests.conftest import load_sample_dict
 
@@ -21,6 +23,10 @@ def spec_of(name: str, **changes: Any) -> DeploySpec:
     raw = load_sample_dict(name)
     raw.update(changes)
     return DeploySpec.model_validate(raw)
+
+
+def codes(rendered: RenderedOverlay) -> set[str]:
+    return {w.code for w in rendered.warnings}
 
 
 def build(overlay_dir: Path) -> dict[str, dict[str, Any]]:
@@ -94,15 +100,53 @@ def test_secrets_render_as_secret_key_refs_without_values() -> None:
     text = rendered.files["kustomization.yaml"]
     assert "secretKeyRef" in text and "orders-secrets" in text
     assert "orders/database-url" not in text
-    assert any("orders-secrets" in w for w in rendered.warnings)
-    assert any("database" in w for w in rendered.warnings)
+    assert any("orders-secrets" in w for w in rendered.warnings)  # RenderWarning 은 str 이라 문자열 검색도 된다
+    assert codes(rendered) == {"SECRET_KEYS_REQUIRED", "DB_PROVISIONING_REQUIRED"}
+    assert [w.code for w in rendered.blocking] == ["DB_PROVISIONING_REQUIRED"]
 
 
 def test_buckets_and_allowed_cidrs_are_reported_not_dropped() -> None:
     rendered = render_overlay(spec_of("07-fix-public-bucket.yaml"))
-    assert any("buckets" in w for w in rendered.warnings)
+    assert "BUCKET_PROVISIONING_REQUIRED" in codes(rendered)
     local = render_overlay(spec_of("05-fix-engine-unsupported-local.yaml"))
-    assert any("allowed_cidrs" in w for w in local.warnings)
+    assert "INGRESS_CIDRS_NOT_ENFORCED" in codes(local)
+
+
+def test_sample_app_has_no_blocking_warning() -> None:
+    """데모 경로: 태그만 쓴 sample-app 은 digest 경고만 있고 커밋할 수 있다."""
+    raw = load_sample_dict("01-pass-sample-app-aws.yaml")
+    raw["image"].pop("digest", None)
+    rendered = render_overlay(DeploySpec.model_validate(raw))
+    assert codes(rendered) == {"IMAGE_DIGEST_MISSING"}
+    assert rendered.blocking == ()
+
+
+def test_volume_on_aws_blocks_because_eks_has_no_csi_driver() -> None:
+    raw = load_sample_dict("01-pass-sample-app-aws.yaml")
+    raw["storage"] = {"volumes": [{"name": "data", "mount_path": "/data", "size": "1Gi"}]}
+    rendered = render_overlay(DeploySpec.model_validate(raw))
+    assert [w.code for w in rendered.blocking] == ["VOLUME_UNSUPPORTED"]
+    local = load_sample_dict("02-pass-local-sqlite.yaml")
+    assert "VOLUME_UNSUPPORTED" not in codes(render_overlay(DeploySpec.model_validate(local)))
+
+
+def test_tls_without_host_blocks_tls_secret_does_not() -> None:
+    raw = load_sample_dict("05-fix-engine-unsupported-local.yaml")
+    raw["network"]["ingress"] = {"public": True, "tls": True}
+    assert "TLS_HOST_MISSING" in {w.code for w in render_overlay(DeploySpec.model_validate(raw)).blocking}
+    raw["network"]["ingress"] = {"public": True, "tls": True, "host": "a.example.com"}
+    rendered = render_overlay(DeploySpec.model_validate(raw))
+    assert "TLS_SECRET_REQUIRED" in codes(rendered)
+    assert "TLS_SECRET_REQUIRED" not in {w.code for w in rendered.blocking}
+
+
+def test_render_warning_is_a_str_with_code_and_survives_pickle() -> None:
+    w = RenderWarning("DB_PROVISIONING_REQUIRED", "설명")
+    assert (w, w.code, w.blocking) == ("설명", "DB_PROVISIONING_REQUIRED", True)
+    copied = pickle.loads(pickle.dumps(w))
+    assert (copied.code, copied.blocking, str(copied)) == (w.code, True, "설명")
+    assert w.to_dict() == {"code": "DB_PROVISIONING_REQUIRED", "blocking": True, "message": "설명"}
+    assert set(BLOCKING) == set(get_args(WarningCode))
 
 
 def test_aws_tls_and_internal_annotations() -> None:

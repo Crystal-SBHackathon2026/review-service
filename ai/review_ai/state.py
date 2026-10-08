@@ -4,6 +4,7 @@
 - Finding.category 에 'runtime' 추가 (결정 #5 제안)
 - Finding 에 title·irreversible 추가 — decide_verdict 가 규칙 목록을 다시 읽지 않도록
 - Patch 는 deploy_spec 에 대한 JSON Patch(ops) 가 정본이고, files 는 ops 를 overlay 로 렌더링한 diff 다
+- deploy_result 추가 — 커밋 단계(commit_overlay) 결과. 판정과 섞지 않으려고 status 와 따로 둔다
 """
 
 from __future__ import annotations
@@ -73,6 +74,14 @@ class Patch(TypedDict):
     files: list[dict[str, str]]  # {path, diff} — ops 적용 전후 overlay 렌더링 차이
 
 
+class DeployResult(TypedDict):
+    """커밋 단계(commit_overlay, 배포 담당) 결과. verdict 가 pass 일 때만 쓰이고 판정에는 영향이 없다."""
+
+    status: Literal["committed", "blocked"]
+    commit_sha: str | None  # committed 일 때 gitops 커밋 SHA — 배포 이벤트를 검토와 잇는 키
+    reason: str | None  # blocked 일 때 멈춘 이유 (렌더러 blocking 경고의 code·설명 등)
+
+
 class ReviewState(TypedDict, total=False):
     review_id: str
     target_env: TargetEnv
@@ -84,4 +93,5 @@ class ReviewState(TypedDict, total=False):
     patch: Patch | None
     rounds: Annotated[list[dict[str, Any]], operator.add]  # 회차별 스냅샷
     retry_count: int
-    status: str
+    status: str  # verdict 값. 커밋 결과는 섞지 않고 deploy_result 에 둔다
+    deploy_result: DeployResult | None  # commit_overlay 만 쓴다 (pass 가 아니면 없음)

@@ -192,6 +192,41 @@ def test_sto005_volume_shrink(sample_app: dict[str, Any], prev: str, cur: str, h
     assert ("STO-005" in rule_ids(spec)) is hit
 
 
+@pytest.mark.parametrize(
+    ("env", "volume", "hit"),
+    [
+        ("aws", {"persistent": True}, True),  # EBS CSI 없음 — 지원 접근 모드가 없다
+        ("aws", {"persistent": False}, False),  # emptyDir 은 PVC 가 아니다
+        ("local", {"persistent": True}, False),
+        ("local", {"persistent": True, "access_mode": "ReadWriteMany"}, True),
+    ],
+)
+def test_sto001_volume_access_mode_must_be_supported(
+    sample_app: dict[str, Any], env: str, volume: dict[str, Any], hit: bool
+) -> None:
+    vol = {"name": "uploads", "mount_path": "/u", "size": "1Gi", **volume}
+    spec = {**sample_app, "storage": {"volumes": [vol]}, "target": {"env": env, "region": "r"}}
+    found = findings_of(spec, "STO-001")
+    assert bool(found) is hit
+    if hit:
+        assert (found[0]["autofix"], found[0]["location"]["spec_path"]) == ("forbidden", "/storage/volumes/0/access_mode")
+
+
+@pytest.mark.parametrize(
+    ("db", "hit"),
+    [
+        ({"engine": "postgres", "placement": "in-cluster", "version": "16"}, True),
+        ({"engine": "sqlite", "placement": "volume", "volume": "data"}, True),
+        ({"engine": "postgres", "placement": "managed", "version": "16"}, False),
+    ],
+    ids=["in-cluster", "sqlite-volume", "managed"],
+)
+def test_db002_aws_has_no_pvc_backed_database(sample_app: dict[str, Any], db: dict[str, Any], hit: bool) -> None:
+    """2026-10-08 실측: EKS 에 EBS CSI 가 없어 PVC 를 쓰는 DB 배치는 AWS 에서 못 쓴다."""
+    spec = {**sample_app, "database": db, "secrets": DB_SECRET}
+    assert ("DB-002" in rule_ids(spec)) is hit
+
+
 def test_run001_missing_readiness(sample_app: dict[str, Any]) -> None:
     sample_app["runtime"]["health"] = {"liveness": "/healthz"}
     f = findings_of(sample_app, "RUN-001")[0]

@@ -17,6 +17,7 @@ CHECKS: dict[str, Check] = {
     "SEC-001": secret.plaintext_secret,
     "SEC-005": secret.missing_db_secret,
     "NET-001": network.public_without_tls,
+    "STO-001": storage.unsupported_access_mode,
     "STO-003": storage.public_bucket,
     "STO-005": storage.volume_shrink,
     "RUN-001": runtime.missing_readiness,

@@ -13,6 +13,7 @@ from review_ai.retrieval.knowledge import load_chunks, parse_document
 from review_ai.retrieval.qdrant_retriever import QdrantRetriever, index_chunks
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.static_check import run_static_check
+from review_ai.static_check.rules import CHECKS
 from tests.conftest import load_sample_dict
 
 
@@ -20,10 +21,11 @@ def findings_for(name: str):
     return run_static_check(DeploySpec.model_validate(load_sample_dict(name)))
 
 
-def test_every_p0_rule_has_a_document() -> None:
+def test_every_p0_and_implemented_rule_has_a_document() -> None:
     p0 = {r.id for r in load_rules().values() if r.priority == "P0"}
     documented = {rid for c in load_chunks() if c.doc_type == "rule" for rid in c.rule_ids}
     assert p0 <= documented
+    assert set(CHECKS) <= documented  # 구현한 규칙에 근거 문서가 없으면 judge 인용이 깨진다
 
 
 def test_chunk_counts_per_env_meet_target() -> None:
