@@ -121,8 +121,9 @@ def test_round_snapshot_shape() -> None:
     findings = findings_for("07-fix-public-bucket.yaml")
     decision = decide(findings)
     snap = round_snapshot({"findings": findings, "decision": decision, "patch": None, "retry_count": 0})
-    assert snap == {"round": 0, "finding_ids": [findings[0]["finding_id"]], "verdict": "fix",
-                    "reasons": [], "patch": None}
+    assert snap == {"round": 0, "finding_ids": [findings[0]["finding_id"]], "findings": findings, "verdict": "fix",
+                    "reasons": [], "items": decision["items"], "doc_ids": [], "patch": None}
+    assert snap["findings"] is not findings  # 이후 State 변경이 기록에 번지지 않게 복사
 
 
 def _op(path: str, value: Any) -> dict[str, Any]:

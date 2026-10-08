@@ -111,13 +111,20 @@ def decide_verdict(
 
 
 def round_snapshot(state: dict[str, Any]) -> dict[str, Any]:
-    """apply_patch 직전에 rounds 에 추가할 회차 기록. 덮어쓰지 않고 쌓는다."""
+    """apply_patch 직전에 rounds 에 추가할 회차 기록. 덮어쓰지 않고 쌓는다.
+
+    고쳐서 통과하면 최종 findings·decision·retrieved_docs 는 재검사 결과(비어 있음)로 바뀌므로,
+    무엇을 왜 고쳤는지(finding·AI 설명·근거 문서 ID)는 이 기록에만 남는다. 결과 화면·업무 DB 가 여기서 읽는다.
+    """
     decision = state["decision"]
     return {
         "round": state.get("retry_count", 0),
         "finding_ids": [f["finding_id"] for f in state["findings"]],
+        "findings": copy.deepcopy(state["findings"]),
         "verdict": decision["verdict"],
         "reasons": list(decision["reasons"]),
+        "items": copy.deepcopy(decision["items"]),
+        "doc_ids": [d["chunk_id"] for d in state.get("retrieved_docs") or []],
         "patch": state.get("patch"),
     }
 

@@ -64,3 +64,14 @@ async def test_fixed_spec_is_lost_if_commit_stage_reads_patch() -> None:
 
     assert final["patch"] is None
     assert final["applied_ops"]
+
+
+async def test_fixed_review_keeps_what_was_fixed_and_why() -> None:
+    """고쳐서 통과하면 최종 findings·decision·retrieved_docs 는 재검사 결과(비어 있음)라, 설명은 rounds 에 남아야 한다."""
+    final = await _review_like_pipeline(load_sample_dict("03-fix-sqlite-replicas-gcp.yaml"))
+
+    assert (final["findings"], final["retrieved_docs"]) == ([], [])
+    fixed_round = final["rounds"][0]
+    assert [f["rule_id"] for f in fixed_round["findings"]] == ["DB-003"]
+    assert fixed_round["items"] and all(item["why"] and item["cited_rule_ids"] for item in fixed_round["items"])
+    assert fixed_round["doc_ids"]
