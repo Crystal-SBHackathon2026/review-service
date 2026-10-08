@@ -1,0 +1,29 @@
+# Review API. 개발: pip install -e ./ai -e ./common -e "./api[dev]"
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "review-api"
+version = "0.1.0"
+description = "Review API — 검토 요청·사람 결정·GitHub/Argo CD 웹훅"
+requires-python = ">=3.13"
+dependencies = [
+    "review-ai",
+    "review-common",
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "aiokafka>=0.12,<1",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9", "pytest-asyncio>=1", "httpx>=0.27,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["review_api"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["."]

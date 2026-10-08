@@ -1,0 +1,28 @@
+# 검토 워커. 개발: pip install -e ./ai -e ./common -e "./worker[dev]"
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "review-worker"
+version = "0.1.0"
+description = "검토 워커 — Kafka review.requested·review.resumed → LangGraph 검토 그래프"
+requires-python = ">=3.13"
+dependencies = [
+    "review-ai",
+    "review-common",
+    "aiokafka>=0.12,<1",
+    "langgraph>=1.2,<2",
+    "langgraph-checkpoint-postgres>=3,<4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9", "pytest-asyncio>=1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["review_worker"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["."]

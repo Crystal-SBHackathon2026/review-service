@@ -1,0 +1,21 @@
+# Review API·워커가 같이 쓰는 업무 DB 접근·마이그레이션·review.resumed 메시지.
+#   pip install -e ./common
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "review-common"
+version = "0.1.0"
+description = "검토 파이프라인 공통 — 업무 DB 저장소, 마이그레이션, review.resumed 메시지"
+requires-python = ">=3.13"
+dependencies = [
+    "review-ai",
+    "pydantic>=2.7,<3",
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
+    "httpx>=0.27,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["review_common"]
