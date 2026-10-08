@@ -19,8 +19,8 @@ static_check → retrieve_evidence → judge ─┬─ pass / needs_human → �
 | 워커 그래프 | `judge.node.make_judge(llm)` | `CachedLLM(ClaudeLLM())` 권장. `llm=None` 이면 LLM_UNAVAILABLE |
 | 워커 재시도 실패 시 | `judge.node.judge_unavailable(state, error=...)` | RetryPolicy 소진 뒤 이 결과로 State 를 채우고 계속. 원인은 `decision.llm.error` |
 | apply_patch | `verdict.round_snapshot(state)` · `patching.apply_ops(spec, patch["ops"])` | 참고 구현: `graph.apply_patch` |
-| 커밋 단계 | `overlay.render_overlay(spec)` → `files`·`warnings` | **spec_ref 로 앱 레포에서 읽은 원본**에 `patch["ops"]` 를 적용해 렌더링한다. Kafka 사본은 가려져 있어 렌더러가 거절한다. 원본이 State 에 있으면 diff 가 `patch["files"]` 에 이미 있다 |
-| 단독 실행·평가 | `graph.run_graph(initial_state(spec, review_id=), llm=, retriever=)` | `scripts/run_eval.py` 가 이걸 쓴다 |
+| 커밋 단계 | `verdict.applied_ops(final)` · `patching.apply_ops(원본, ops)` · `overlay.render_overlay(spec)` → `files`·`warnings` | **spec_ref 로 앱 레포에서 읽은 원본**에 `applied_ops(final)` 를 적용해 렌더링한다. ⚠️ `patch["ops"]` 가 아니다 — apply_patch 가 patch 를 rounds 로 옮기고 비우므로 고쳐서 통과한 최종 State 는 `patch=None` 이고, ops 는 `rounds[*].patch.ops` 에 회차 순서대로 있다. `applied_ops == []` 면 수정 없이 통과(원본 그대로). Kafka 사본은 가려져 있어 렌더러가 거절한다. 회차별 diff 는 `rounds[i].patch.files` 에 있다 |
+| 단독 실행·평가 | `graph.run_graph(initial_state(spec, review_id=), llm=, retriever=)` | 최종 State 에 `status`·`applied_ops`·`patched`(고친 적 있음) 를 더해 돌려준다. 고쳐서 통과 = `status == "pass" and patched`. `scripts/run_eval.py` 가 이걸 쓴다 |
 
 ## 패치 게이트
 

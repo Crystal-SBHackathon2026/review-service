@@ -4,10 +4,13 @@ from typing import Any
 
 import pytest
 
-from review_ai.evaluation import load_eval_cases, run_case, summarize
+from review_ai.evaluation import build_spec, load_eval_cases, run_case, summarize
 from review_ai.graph import initial_state, run_graph
 from review_ai.judge.fake_llm import FAKES
+from review_ai.patching import apply_ops
 from review_ai.retrieval.file_retriever import FileRetriever
+from review_ai.spec.deploy_spec import DeploySpec
+from review_ai.static_check import run_static_check
 from tests.conftest import load_sample_dict
 
 
@@ -43,3 +46,28 @@ async def test_without_llm_static_results_survive() -> None:
                             llm=None, retriever=FileRetriever())
     assert final["decision"]["reasons"] == ["AUTOFIX_FORBIDDEN", "LLM_UNAVAILABLE"]
     assert [f["rule_id"] for f in final["findings"]] == ["RUN-001", "STO-003"]
+
+
+async def test_fix_loop_exposes_applied_ops_for_commit_stage() -> None:
+    original = load_sample_dict("03-fix-sqlite-replicas-gcp.yaml")
+    final = await run_graph(initial_state(original, review_id="t"), llm=FAKES["oracle"](), retriever=FileRetriever())
+    assert (final["status"], final["patch"], final["patched"]) == ("pass", None, True)
+    assert final["applied_ops"] == [{"op": "replace", "path": "/runtime/replicas", "value": 1}]
+    committed = apply_ops(original, final["applied_ops"])  # 커밋 단계가 spec_ref 원본에 하는 일
+    assert run_static_check(DeploySpec.model_validate(committed)) == []
+    assert original["runtime"]["replicas"] != 1  # 입력은 바뀌지 않는다
+
+
+@pytest.mark.parametrize("name", ["01-pass-sample-app-aws.yaml", "02-pass-local-sqlite.yaml"])
+async def test_pass_without_fix_has_no_applied_ops(name: str) -> None:
+    final = await run_graph(initial_state(load_sample_dict(name), review_id="t"),
+                            llm=FAKES["oracle"](), retriever=FileRetriever())
+    assert (final["status"], final["applied_ops"], final["patched"]) == ("pass", [], False)
+
+
+@pytest.mark.parametrize("case", load_eval_cases(), ids=lambda c: c["id"])
+async def test_applied_ops_reproduce_final_spec(case: dict[str, Any]) -> None:
+    spec = build_spec(case)
+    final = await run_graph(initial_state(spec, review_id="t"), llm=FAKES["oracle"](), retriever=FileRetriever())
+    assert apply_ops(spec, final["applied_ops"]) == final["deploy_spec"]
+    assert final["patched"] == bool(final["rounds"])

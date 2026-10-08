@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import pytest
@@ -8,7 +9,7 @@ from review_ai.judge.schema import LlmItem, LlmPatch, LlmPatchOp, LlmReview
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.state import Doc, Finding
 from review_ai.static_check import run_static_check
-from review_ai.verdict import MAX_PATCH_ROUNDS, Validation, decide_verdict, round_snapshot
+from review_ai.verdict import MAX_PATCH_ROUNDS, Validation, applied_ops, decide_verdict, round_snapshot
 from tests.conftest import load_cases, load_sample_dict
 
 OK = Validation(llm_available=True, schema_ok=True, citations_ok=True, patch_scope_ok=True)
@@ -122,3 +123,32 @@ def test_round_snapshot_shape() -> None:
     snap = round_snapshot({"findings": findings, "decision": decision, "patch": None, "retry_count": 0})
     assert snap == {"round": 0, "finding_ids": [findings[0]["finding_id"]], "verdict": "fix",
                     "reasons": [], "patch": None}
+
+
+def _op(path: str, value: Any) -> dict[str, Any]:
+    return {"op": "replace", "path": path, "value": value}
+
+
+def test_applied_ops_concatenates_rounds_in_order_then_pending_fix() -> None:
+    state = {
+        "rounds": [{"patch": {"ops": [_op("/a", 1), _op("/b", 2)]}}, {"patch": {"ops": [_op("/c", 3)]}}],
+        "decision": {"verdict": "fix"},
+        "patch": {"ops": [_op("/d", 4)]},
+    }
+    before = copy.deepcopy(state)
+    ops = applied_ops(state)
+    assert [op["path"] for op in ops] == ["/a", "/b", "/c", "/d"]
+    ops[0]["value"] = 99
+    assert state == before  # 입력 State 는 그대로
+
+
+@pytest.mark.parametrize("verdict", ["pass", "needs_human"])
+def test_applied_ops_ignores_patch_unless_verdict_is_fix(verdict: str) -> None:
+    state = {"rounds": [{"patch": {"ops": [_op("/a", 1)]}}], "decision": {"verdict": verdict},
+             "patch": {"ops": [_op("/z", 0)]}}
+    assert applied_ops(state) == [_op("/a", 1)]
+
+
+def test_applied_ops_empty_without_rounds_or_patch() -> None:
+    assert applied_ops({"rounds": [], "decision": {"verdict": "pass"}, "patch": None}) == []
+    assert applied_ops({}) == []
