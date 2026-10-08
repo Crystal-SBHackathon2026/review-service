@@ -57,16 +57,15 @@ class Target(_Frozen):
 
 
 class Image(_Frozen):
-    repository: str = Field(min_length=1)
-    tag: str | None = None
-    digest: str | None = Field(default=None, pattern=IMAGE_DIGEST)
-    platforms: tuple[Arch, ...] = Field(min_length=1)
+    """배포할 이미지 버전(태그)은 CI 가 gitops base 에 쓴다. 명세는 어떤 이미지·어떤 아키텍처인지만 말한다.
 
-    @model_validator(mode="after")
-    def _tag_or_digest(self) -> Image:
-        if self.tag is None and self.digest is None:
-            raise ValueError("image.tag 또는 image.digest 중 하나는 있어야 한다")
-        return self
+    병합 전 PR 에서는 병합 SHA 태그가 아직 없으므로 tag·digest 는 선택이다. overlay 렌더러는 둘 다 쓰지 않는다.
+    """
+
+    repository: str = Field(min_length=1)
+    tag: str | None = Field(default=None, description="참고용. 배포 태그는 CI 가 정한다")
+    digest: str | None = Field(default=None, pattern=IMAGE_DIGEST, description="참고용. 배포 태그는 CI 가 정한다")
+    platforms: tuple[Arch, ...] = Field(min_length=1)
 
 
 class Health(_Frozen):

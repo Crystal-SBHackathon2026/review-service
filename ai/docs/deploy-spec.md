@@ -28,7 +28,7 @@ api_version: crystal.review/v1alpha1
 kind: DeploySpec
 metadata: {name, repository, commit}          # 어떤 앱의 어떤 커밋인가
 target:   {env: aws|gcp|local, region, namespace?}
-image:    {repository, tag?, digest?, platforms: [amd64|arm64]}
+image:    {repository, tag?, digest?, platforms: [amd64|arm64]}   # tag·digest 는 참고용 — 배포 태그는 CI 가 gitops base 에 쓴다
 runtime:  {port, replicas, health{readiness,liveness}, resources, env{평문만}, termination_grace_seconds}
 requirements: {persistence}                    # 재배포 뒤에도 데이터가 남아야 하는가
 database: {engine: none|postgres|mysql|sqlite, version, placement: managed|in-cluster|volume|external,

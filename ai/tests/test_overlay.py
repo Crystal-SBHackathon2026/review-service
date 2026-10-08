@@ -45,12 +45,13 @@ def write_rendered(tmp_path: Path, spec: DeploySpec) -> Path:
     return target
 
 
+CI_TAGGED_IMAGE = "ghcr.io/crystal-sbhackathon2026/sample-app:b084c24e5a45f307981a9a005fa9d4e1e1079062"
+
+
 def _normalize(docs: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """팀 overlay 와 의도적으로 다른 두 곳(이미지 digest 고정, 종료 유예 명시)을 지운다."""
+    """팀 overlay 와 의도적으로 다른 한 곳(종료 유예 명시)을 지운다."""
     docs = copy.deepcopy(docs)
-    pod = docs["Rollout"]["spec"]["template"]["spec"]
-    pod.pop("terminationGracePeriodSeconds", None)
-    pod["containers"][0].pop("image")
+    docs["Rollout"]["spec"]["template"]["spec"].pop("terminationGracePeriodSeconds", None)
     return docs
 
 
@@ -59,8 +60,15 @@ def test_sample_app_aws_reproduces_team_overlay(tmp_path: Path) -> None:
     ours = build(write_rendered(tmp_path, spec_of("01-pass-sample-app-aws.yaml")))
     team = build(FIXTURE_APPS / "sample-app" / "overlays" / "aws")
     assert _normalize(ours) == _normalize(team)
-    image = ours["Rollout"]["spec"]["template"]["spec"]["containers"][0]["image"]
-    assert image.endswith("@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+
+
+@needs_kubectl
+def test_image_tag_comes_from_ci_not_spec(tmp_path: Path) -> None:
+    """이미지 태그는 CI 가 base 에 쓴다. 명세의 tag·digest 로 덮으면 CI 태그 갱신이 무시된다."""
+    rendered = render_overlay(spec_of("01-pass-sample-app-aws.yaml"))
+    assert "images" not in yaml.safe_load(rendered.files["kustomization.yaml"])
+    ours = build(write_rendered(tmp_path, spec_of("01-pass-sample-app-aws.yaml")))
+    assert ours["Rollout"]["spec"]["template"]["spec"]["containers"][0]["image"] == CI_TAGGED_IMAGE
 
 
 TEAM_ENVS = {
@@ -113,12 +121,11 @@ def test_buckets_and_allowed_cidrs_are_reported_not_dropped() -> None:
 
 
 def test_sample_app_has_no_blocking_warning() -> None:
-    """데모 경로: 태그만 쓴 sample-app 은 digest 경고만 있고 커밋할 수 있다."""
+    """데모 경로: 태그·digest 없이 쓴 sample-app 은 경고 없이 커밋할 수 있다 (이미지는 CI 몫)."""
     raw = load_sample_dict("01-pass-sample-app-aws.yaml")
-    raw["image"].pop("digest", None)
+    raw["image"] = {k: v for k, v in raw["image"].items() if k not in ("tag", "digest")}
     rendered = render_overlay(DeploySpec.model_validate(raw))
-    assert codes(rendered) == {"IMAGE_DIGEST_MISSING"}
-    assert rendered.blocking == ()
+    assert rendered.warnings == ()
 
 
 def test_volume_on_aws_blocks_because_eks_has_no_csi_driver() -> None:

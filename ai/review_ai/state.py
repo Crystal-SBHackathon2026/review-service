@@ -5,6 +5,8 @@
 - Finding 에 title·irreversible 추가 — decide_verdict 가 규칙 목록을 다시 읽지 않도록
 - Patch 는 deploy_spec 에 대한 JSON Patch(ops) 가 정본이고, files 는 ops 를 overlay 로 렌더링한 diff 다
 - deploy_result 추가 — 커밋 단계(commit_overlay) 결과. 판정과 섞지 않으려고 status 와 따로 둔다
+- status 에 rejected 추가, human_decision 추가 — needs_human 뒤 사람 승인·거절로 재개 (Slack 10/08 합의)
+  승인 + edited_ops 없음 → commit_overlay, 승인 + edited_ops 있음 → static_check 부터 재검사, 거절 → status=rejected 로 종료
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from typing import Annotated, Any, Literal, TypedDict
 Category = Literal["database", "secret", "network", "storage", "runtime"]
 Severity = Literal["high", "medium", "low"]
 Verdict = Literal["pass", "fix", "needs_human"]
+ReviewStatus = Literal[Verdict, "rejected"]  # verdict 값 그대로 + 사람이 거절한 경우
 TargetEnv = Literal["aws", "gcp", "local"]
 
 REASON_CODES = (
@@ -82,6 +85,14 @@ class DeployResult(TypedDict):
     reason: str | None  # blocked 일 때 멈춘 이유 (렌더러 blocking 경고의 code·설명 등)
 
 
+class HumanDecision(TypedDict):
+    """needs_human 뒤 사람 결정. 승인 API 가 review.resumed 로 보내고, 워커가 같은 thread_id 로 재개할 때 넣는다."""
+
+    decision: Literal["approved", "rejected"]
+    approver: str
+    edited_ops: list[PatchOp]  # 사람이 고친 deploy_spec ops. 비어 있으면 고친 것 없이 승인
+
+
 class ReviewState(TypedDict, total=False):
     review_id: str
     target_env: TargetEnv
@@ -93,5 +104,6 @@ class ReviewState(TypedDict, total=False):
     patch: Patch | None
     rounds: Annotated[list[dict[str, Any]], operator.add]  # 회차별 스냅샷
     retry_count: int
-    status: str  # verdict 값. 커밋 결과는 섞지 않고 deploy_result 에 둔다
+    status: ReviewStatus  # verdict 값, 사람이 거절하면 rejected. 커밋 결과는 섞지 않고 deploy_result 에 둔다
+    human_decision: HumanDecision | None  # needs_human 뒤 재개할 때만 있다
     deploy_result: DeployResult | None  # commit_overlay 만 쓴다 (pass 가 아니면 없음)
