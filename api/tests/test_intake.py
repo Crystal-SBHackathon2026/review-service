@@ -28,6 +28,16 @@ class FakeGitHub:
         self.statuses: list[dict[str, Any]] = []
         self.status_error: GitHubError | None = None
         self.commit_error: Exception | None = None
+        self.tree: dict[str, str] = {}  # PR head 의 파일 — 레포 분석이 읽는다
+        self.read_error: GitHubError | None = None
+
+    async def list_files(self, repository: str, ref: str) -> list[str]:
+        if self.read_error:
+            raise self.read_error
+        return list(self.tree)
+
+    async def get_file(self, repository: str, path: str, ref: str) -> str:
+        return self.tree[path]
 
     async def prepare_file_commit(self, repository: str, *, parent: str, path: str, content: str,
                                   message: str) -> str:
@@ -129,6 +139,31 @@ async def test_generated_commit_is_reviewed_and_linked(ienv: IntakeEnv) -> None:
     assert topic == "review.requested"
 
 
+SAMPLE_TREE = {
+    "Dockerfile": "FROM node:22-alpine\nEXPOSE 8080\nHEALTHCHECK CMD wget -qO- http://127.0.0.1:8080/healthz\n",
+    "package.json": '{"dependencies": {"express": "^4.21.2"}}',
+    ".github/workflows/ci.yml": "env:\n  IMAGE: ghcr.io/crystal-sbhackathon2026/sample-app\n"
+                                "jobs:\n  b:\n    runs-on: ubuntu-latest\n",
+    "src/server.js": "const port = Number(process.env.PORT || 8080);\n",
+    "README.md": "# sample\n",
+}
+
+
+async def test_new_app_is_generated_from_repo_analysis(ienv: IntakeEnv) -> None:
+    ienv.github.tree = dict(SAMPLE_TREE)
+    send_pr(ienv, pr_event("opened"))
+
+    row = ienv.only_intake()
+    commit = row["result_commit_sha"]
+    assert (row["status"], row["reason"], ienv.github.branch) == ("generated", "GENERATED", commit)
+    spec = AppSpec.model_validate(yaml.safe_load(ienv.github.contents[commit]))
+    assert (spec.metadata.name, spec.target.env, spec.runtime.port, spec.runtime.health.readiness) == (
+        "sample-app", "aws", 8080, "/healthz")
+    assert spec.image.repository == "ghcr.io/crystal-sbhackathon2026/sample-app"
+    assert "레포 분석" in ienv.github.last_message
+    assert "- /runtime: Dockerfile — EXPOSE 8080, HEALTHCHECK /healthz" in ienv.github.last_message.splitlines()
+
+
 # --- 배포 대상이 아닌 레포 ---------------------------------------------------------------------------
 
 def test_missing_spec_in_unknown_repo_is_skipped_quietly() -> None:
@@ -164,7 +199,9 @@ async def test_new_app_without_baseline_is_rejected_unverified(ienv: IntakeEnv) 
 
     row = ienv.only_intake()
     assert (row["status"], row["reason"], row["result_commit_sha"]) == ("rejected", "UNVERIFIED", None)
-    assert "RUNTIME_UNVERIFIED" in row["message"] and row["details"]
+    assert "RUNTIME_UNVERIFIED" in row["message"]
+    runtime = next(d for d in row["details"] if d["path"] == "/runtime")
+    assert "Dockerfile 이 없어" in runtime["message"]  # 레포 분석이 못 채운 이유
     assert ienv.github.parents == {} and ienv.states() == [(HEAD, "pending"), (HEAD, "failure")]
     verify = ienv.client.get("/verify", params={"sha": HEAD}).json()
     assert (verify["passed"], verify["status"], verify["reasons"], verify["intake_id"]) == (
@@ -263,6 +300,13 @@ async def test_status_permission_error_keeps_the_record(ienv: IntakeEnv) -> None
     send_pr(ienv, pr_event("opened"))
 
     assert ienv.only_intake()["status"] == "generated" and ienv.github.statuses == []
+
+
+async def test_repo_read_failure_marks_failed(ienv: IntakeEnv) -> None:
+    ienv.github.read_error = GitHubError("트리 조회 실패 503", 503)
+    send_pr(ienv, pr_event("opened"))
+
+    assert (ienv.only_intake()["status"], ienv.only_intake()["reason"]) == ("failed", "ERROR")
 
 
 async def test_github_failure_marks_failed_with_error_status(ienv: IntakeEnv) -> None:

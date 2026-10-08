@@ -73,7 +73,8 @@ docker compose --profile app up -d --build
 | 종류(`kind`) | 처리 | 결과(`status`·`reason`) |
 |---|---|---|
 | `missing`·`empty` | 그 레포의 최근 baseline(없으면 `DEFAULT_TARGET`)으로 `review_ai.intake.prepare_intake` → PR 브랜치에 `deploy.yaml` 커밋 → synchronize 웹훅이 그 커밋을 **일반 검토**로 시작(`autofix_commit` 아님), `review_id` 로 연결 | `generated`·`GENERATED` |
-| `missing`·`empty` (새 앱, 확인 안 된 값 남음) | 추정값은 자동 병합·배포로 이어질 수 있어 커밋하지 않는다. 레포 분석이 붙으면 줄어든다 | `rejected`·`UNVERIFIED` |
+| `missing`·`empty` (새 앱 — baseline 없음) | PR head 의 Dockerfile·의존성 파일·CI 워크플로·소스를 읽어 근거가 분명한 값만 채운다(`review_ai.intake.analyze`, LLM 없음). 다 채워지면 위와 같이 커밋하고, 커밋 메시지에 값마다 근거 파일을 적는다 | `generated`·`GENERATED` |
+| `missing`·`empty` (새 앱, 확인 안 된 값 남음) | 추정값은 자동 병합·배포로 이어질 수 있어 커밋하지 않는다. `details` 에 항목별로 레포 분석이 못 채운 이유(DB 드라이버는 있는데 배치 모름, 비밀 이름의 환경변수 등) | `rejected`·`UNVERIFIED` |
 | `yaml_error`·`schema_error` | 기본값으로 덮지 않는다. 자동 복구(LLM)는 아직 없다. 오류는 줄·칸·경로만 남긴다(원문 조각 없음) | `rejected`·`REPAIR_UNAVAILABLE` |
 
 - 그 밖의 거절: 포크 PR(`FORK_PR`), 대상 환경 모름(`NO_TARGET`), 처리 중 새 커밋(`BRANCH_MOVED`), 생성 커밋이 다시 intake 대상(`LOOP_GUARD` — 웹훅·커밋 무한 반복 방지), GitHub 오류(`failed`·`ERROR`)

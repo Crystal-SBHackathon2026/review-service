@@ -1,4 +1,4 @@
-"""GitHub REST — Review API 는 deploy.yaml 을 읽고 명세 생성 커밋·PR 커밋 상태를 쓰고, 워커는 CI 상태 확인·AI 수정 커밋·PR 병합·gitops 커밋을 한다.
+"""GitHub REST — Review API 는 deploy.yaml·레포 파일을 읽고 명세 생성 커밋·PR 커밋 상태를 쓰고, 워커는 CI 상태 확인·AI 수정 커밋·PR 병합·gitops 커밋을 한다.
 
 GITHUB_TOKEN 이 없으면 미인증(시간당 60회). 워커는 앱 레포·gitops 레포 Contents·Pull requests 쓰기 권한이 있는
 토큰(oneaction/gitops-token)을 쓴다.
@@ -86,6 +86,10 @@ class GitHubClient:
         if resp.status_code != 200:
             raise GitHubError(f"GitHub contents API {resp.status_code}", resp.status_code)
         return resp.text
+
+    async def list_files(self, repository: str, ref: str) -> list[str]:
+        """그 커밋의 모든 파일 경로 — 레포 분석이 읽을 파일을 고른다."""
+        return list(await self.tree_blobs(repository, await self.commit_tree_sha(repository, ref)))
 
     async def check_suites(self, repository: str, sha: str) -> list[dict[str, Any]]:
         """GET /repos/{owner}/{repo}/commits/{sha}/check-suites — 그 커밋의 CI 진행 상태."""
