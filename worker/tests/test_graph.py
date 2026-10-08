@@ -177,6 +177,7 @@ async def test_05_fix_commits_to_pr_branch_and_rereviews(harness: Harness) -> No
     assert row["superseded_by"] == msg.review_id
     new = harness.row(msg.review_id)
     assert (new["status"], new["pr_head_sha"], new["requested_by"]) == ("received", FIX_SHA, f"autofix:{RID}")
+    assert new["pr_number"] == 7  # 같은 PR 의 다음 커밋이 오면 이 검토도 superseded 대상
     assert harness.github.prepared == {}  # 커밋을 만들고 → DB 에 넣고 → 브랜치를 옮겼다
 
     await harness.deliver_published()  # 수정 커밋을 다시 검토 — 이번엔 고칠 것이 없다

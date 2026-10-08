@@ -20,6 +20,7 @@ ReviewDbStatus = Literal[
     "superseded",
 ]
 FINISHED: frozenset[str] = frozenset({"committed", "blocked", "rejected", "failed", "superseded"})
+OPEN: tuple[str, ...] = ("received", "reviewing", "needs_human", "waiting_ci")  # 새 커밋이 오면 superseded 로 넘길 상태
 
 JSON_COLUMNS = frozenset({"spec_ref", "decision", "findings", "rounds", "human_decision", "deploy_result", "final_spec"})
 UPDATABLE = JSON_COLUMNS | {"status", "verdict", "reasons", "merge_sha", "gitops_commit_sha", "error", "superseded_by"}
@@ -37,11 +38,14 @@ def _check_fields(fields: Iterable[str]) -> None:
 
 class ReviewRepository(Protocol):
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
-                            spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str) -> None: ...
+                            spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
+                            pr_number: int | None = None) -> None: ...
 
     async def get_review(self, review_id: str) -> dict[str, Any] | None: ...
 
-    async def update_review(self, review_id: str, **fields: Any) -> None: ...
+    async def update_review(self, review_id: str, **fields: Any) -> None:
+        """필드를 바꾼다. 단 superseded 인 검토의 status 는 바꾸지 않는다 — 워커가 돌던 중 새 커밋에 밀린 경우."""
+        ...
 
     async def claim(self, review_id: str, *, from_statuses: Sequence[str], to_status: str,
                     pr_head_sha: str | None = None) -> bool:
@@ -49,6 +53,14 @@ class ReviewRepository(Protocol):
         ...
 
     async def latest_by_head_sha(self, sha: str) -> dict[str, Any] | None: ...
+
+    async def find_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
+        """같은 레포(spec_ref.repository)·같은 head SHA 검토. 가장 최근 것."""
+        ...
+
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str) -> list[str]:
+        """그 PR 의 끝나지 않은 검토를 superseded 로 넘긴다 (superseded_by 자신은 빼고). 넘긴 review_id 들."""
+        ...
 
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]: ...
 
@@ -91,11 +103,12 @@ class PostgresReviewRepository:
             return cur.rowcount
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
-                            spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str) -> None:
+                            spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
+                            pr_number: int | None = None) -> None:
         await self._execute(
-            "INSERT INTO reviews (review_id, app, target_env, repo_id, spec_ref, pr_head_sha, requested_by, status)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, 'received')",
-            (review_id, app, target_env, repo_id, Jsonb(spec_ref), pr_head_sha, requested_by),
+            "INSERT INTO reviews (review_id, app, target_env, repo_id, spec_ref, pr_head_sha, requested_by,"
+            " pr_number, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'received')",
+            (review_id, app, target_env, repo_id, Jsonb(spec_ref), pr_head_sha, requested_by, pr_number),
         )
 
     async def get_review(self, review_id: str) -> dict[str, Any] | None:
@@ -106,7 +119,9 @@ class PostgresReviewRepository:
             return
         _check_fields(fields)
         columns = sorted(fields)
-        assignments = ", ".join(f"{c} = %s" for c in columns)
+        assignments = ", ".join(
+            "status = CASE WHEN status = 'superseded' THEN status ELSE %s END" if c == "status" else f"{c} = %s"
+            for c in columns)
         values = [Jsonb(fields[c]) if c in JSON_COLUMNS and fields[c] is not None else fields[c] for c in columns]
         await self._execute(f"UPDATE reviews SET {assignments}, updated_at = now() WHERE review_id = %s",
                             (*values, review_id))
@@ -123,6 +138,18 @@ class PostgresReviewRepository:
     async def latest_by_head_sha(self, sha: str) -> dict[str, Any] | None:
         return await self._fetchone(
             "SELECT * FROM reviews WHERE pr_head_sha = %s ORDER BY created_at DESC LIMIT 1", (sha,))
+
+    async def find_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT * FROM reviews WHERE spec_ref->>'repository' = %s AND pr_head_sha = %s"
+            " ORDER BY created_at DESC LIMIT 1", (repository, sha))
+
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str) -> list[str]:
+        rows = await self._fetchall(
+            "UPDATE reviews SET status = 'superseded', superseded_by = %s, updated_at = now()"
+            " WHERE spec_ref->>'repository' = %s AND pr_number = %s AND review_id <> %s AND status = ANY(%s)"
+            " RETURNING review_id", (superseded_by, repository, pr_number, superseded_by, list(OPEN)))
+        return [r["review_id"] for r in rows]
 
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]:
         return await self._fetchall(
@@ -169,7 +196,8 @@ class InMemoryReviewRepository:
         self.deploy_events: list[dict[str, Any]] = []
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
-                            spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str) -> None:
+                            spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
+                            pr_number: int | None = None) -> None:
         if review_id in self.reviews:
             raise ValueError(f"review_id 중복: {review_id}")
         now = _now()
@@ -179,7 +207,7 @@ class InMemoryReviewRepository:
             "status": "received", "verdict": None, "reasons": [], "decision": None, "findings": None,
             "rounds": None, "human_decision": None, "deploy_result": None, "gitops_commit_sha": None,
             "final_spec": None, "error": None, "superseded_by": None, "requested_by": requested_by,
-            "created_at": now, "updated_at": now,
+            "pr_number": pr_number, "created_at": now, "updated_at": now,
         }
 
     async def get_review(self, review_id: str) -> dict[str, Any] | None:
@@ -188,8 +216,13 @@ class InMemoryReviewRepository:
 
     async def update_review(self, review_id: str, **fields: Any) -> None:
         _check_fields(fields)
-        if review_id in self.reviews:
-            self.reviews[review_id].update(copy.deepcopy(fields), updated_at=_now())
+        row = self.reviews.get(review_id)
+        if row is None:
+            return
+        fields = copy.deepcopy(fields)
+        if row["status"] == "superseded":
+            fields.pop("status", None)
+        row.update(fields, updated_at=_now())
 
     async def claim(self, review_id: str, *, from_statuses: Sequence[str], to_status: str,
                     pr_head_sha: str | None = None) -> bool:
@@ -207,6 +240,19 @@ class InMemoryReviewRepository:
 
     async def latest_by_head_sha(self, sha: str) -> dict[str, Any] | None:
         return self._latest(r for r in self.reviews.values() if r["pr_head_sha"] == sha)
+
+    async def find_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
+        return self._latest(r for r in self.reviews.values()
+                            if r["spec_ref"].get("repository") == repository and r["pr_head_sha"] == sha)
+
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str) -> list[str]:
+        done = []
+        for r in sorted(self.reviews.values(), key=lambda r: r["created_at"]):
+            if (r["spec_ref"].get("repository") == repository and r["pr_number"] == pr_number
+                    and r["review_id"] != superseded_by and r["status"] in OPEN):
+                r.update(status="superseded", superseded_by=superseded_by, updated_at=_now())
+                done.append(r["review_id"])
+        return done
 
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]:
         rows = [r for r in self.reviews.values() if r["pr_head_sha"] == sha and r["status"] == "waiting_ci"]
