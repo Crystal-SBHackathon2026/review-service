@@ -403,15 +403,23 @@
           "type": "string"
         },
         "commit": {
-          "pattern": "^[0-9a-f]{7,40}$",
-          "title": "Commit",
-          "type": "string"
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{7,40}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "앱 레포 deploy.yaml 은 자기 커밋을 모르니 비워 둔다. 검토한 커밋은 spec_ref.commit",
+          "title": "Commit"
         }
       },
       "required": [
         "name",
-        "repository",
-        "commit"
+        "repository"
       ],
       "title": "Metadata",
       "type": "object"

@@ -47,7 +47,10 @@ class _Frozen(BaseModel):
 class Metadata(_Frozen):
     name: str = Field(pattern=DNS_LABEL)
     repository: str = Field(pattern=REPOSITORY, description="owner/repo")
-    commit: str = Field(pattern=COMMIT_SHA)
+    commit: str | None = Field(
+        default=None, pattern=COMMIT_SHA,
+        description="앱 레포 deploy.yaml 은 자기 커밋을 모르니 비워 둔다. 검토한 커밋은 spec_ref.commit",
+    )
 
 
 class Target(_Frozen):
