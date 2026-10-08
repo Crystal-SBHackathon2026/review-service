@@ -11,7 +11,7 @@ import logging
 import os
 import signal
 
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from review_ai.judge.llm import CachedLLM, ClaudeLLM, LlmUnavailable
@@ -52,6 +52,12 @@ async def run() -> None:
         max_poll_records=1,
         max_poll_interval_ms=int(os.environ.get("KAFKA_MAX_POLL_INTERVAL_MS", "900000")),  # judge 재시도까지 기다린다
     )
+    producer = AIOKafkaProducer(bootstrap_servers=kafka_bootstrap(), acks="all", enable_idempotence=True)
+
+    class KafkaPublisher:
+        async def send(self, topic: str, key: str, value: bytes) -> None:
+            await producer.send_and_wait(topic, value=value, key=key.encode())
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -60,7 +66,10 @@ async def run() -> None:
         checkpointer = AsyncPostgresSaver(pool)
         await checkpointer.setup()
         repo = PostgresReviewRepository(pool)
-        graph = build_graph(Deps(repo=repo, github=github, llm=make_llm(), retriever=FileRetriever()), checkpointer)
+        await producer.start()
+        deps = Deps(repo=repo, github=github, publisher=KafkaPublisher(), llm=make_llm(), retriever=FileRetriever(),
+                    ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None)
+        graph = build_graph(deps, checkpointer)
         handler = ReviewHandler(repo, graph)
         await consumer.start()
         log.info("review-worker 시작: %s", consumer.subscription())
@@ -72,6 +81,7 @@ async def run() -> None:
                     await consumer.commit()
     finally:
         await consumer.stop()
+        await producer.stop()
         await github.aclose()
         await pool.close()
 

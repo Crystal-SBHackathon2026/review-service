@@ -15,7 +15,6 @@ import hashlib
 import hmac
 import json
 import logging
-import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -26,11 +25,13 @@ import yaml
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from review_ai.graph import check_edited_ops
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.spec.deploy_spec import REPOSITORY, DeploySpec
 from review_api.argocd import ArgoCdEvent
 from review_common.github import GitHubError, SpecNotFound
+from review_common.ids import new_review_id
 from review_common.repository import ReviewRepository
 from review_common.resumed import TOPIC as RESUMED_TOPIC
 from review_common.resumed import CiCompletedResumed, CiResult, HumanDecisionModel, HumanDecisionResumed
@@ -71,11 +72,6 @@ class ReviewIn(BaseModel):
 
     spec_ref: SpecRefIn
     requested_by: str = Field(min_length=1)
-
-
-def new_review_id(now: datetime | None = None) -> str:
-    now = now or datetime.now(UTC)
-    return f"rv_{now:%Y%m%d}_{secrets.token_hex(4)}"
 
 
 def _errors(exc: ValidationError) -> list[dict[str, Any]]:
@@ -137,7 +133,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             raise HTTPException(404, "검토가 없다")
         keys = ("review_id", "app", "target_env", "spec_ref", "status", "verdict", "reasons", "findings", "decision",
                 "rounds", "human_decision", "deploy_result", "merge_sha", "gitops_commit_sha", "error",
-                "requested_by", "created_at", "updated_at")
+                "superseded_by", "requested_by", "created_at", "updated_at")
         return {k: row.get(k) for k in keys}
 
     @app.get("/verify")
@@ -156,6 +152,14 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             raise HTTPException(404, "검토가 없다")
         if row["status"] != "needs_human":
             raise HTTPException(409, f"needs_human 상태에서만 결정할 수 있다 (지금 {row['status']})")
+        if body.decision == "approved" and body.edited_ops:
+            # edited_ops 는 멈춘 State 의 deploy_spec 기준 — 워커가 멈출 때 final_spec 에 남긴 것과 같다
+            if row["final_spec"] is None:
+                raise HTTPException(409, "검토 중인 명세가 아직 기록되지 않았다")
+            try:
+                check_edited_ops(row["final_spec"], [op.as_op() for op in body.edited_ops])
+            except ValueError as exc:
+                raise HTTPException(422, {"message": "edited_ops 를 적용할 수 없다", "errors": str(exc)}) from exc
         msg = HumanDecisionResumed(review_id=review_id, human_decision=body, resumed_at=datetime.now(UTC))
         await deps_.publisher.send(RESUMED_TOPIC, review_id, msg.model_dump_json().encode())
         return {"review_id": review_id}

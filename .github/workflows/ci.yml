@@ -1,4 +1,5 @@
-# CI: 테스트 → 이미지 빌드(api·worker) → 취약점 검사 → (main만) GHCR 푸시
+# CI: 테스트(api·worker) → 이미지 빌드(api·worker) → 취약점 검사 → (main만) GHCR 푸시
+# ai/ 테스트·정합성 검사는 ai-ci.yml 이 따로 돈다.
 # 배포 매니페스트는 gitops 레포 apps/review-service/ 에 있다. 이미지 태그 갱신은 지금은 사람이 PR 로 한다.
 name: ci
 
@@ -19,9 +20,6 @@ jobs:
           cache-dependency-path: "**/pyproject.toml"
       - name: 의존성 설치
         run: pip install -e "./ai[dev]" -e ./common -e "./api[dev]" -e "./worker[dev]"
-      - name: ai 테스트
-        working-directory: ai
-        run: pytest -q
       - name: api 테스트
         working-directory: api
         run: pytest -q

@@ -16,12 +16,13 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 ReviewDbStatus = Literal[
-    "received", "reviewing", "needs_human", "waiting_ci", "merging", "committed", "blocked", "rejected", "failed"
+    "received", "reviewing", "needs_human", "waiting_ci", "merging", "committed", "blocked", "rejected", "failed",
+    "superseded",
 ]
-FINISHED: frozenset[str] = frozenset({"committed", "blocked", "rejected", "failed"})
+FINISHED: frozenset[str] = frozenset({"committed", "blocked", "rejected", "failed", "superseded"})
 
 JSON_COLUMNS = frozenset({"spec_ref", "decision", "findings", "rounds", "human_decision", "deploy_result", "final_spec"})
-UPDATABLE = JSON_COLUMNS | {"status", "verdict", "reasons", "merge_sha", "gitops_commit_sha", "error"}
+UPDATABLE = JSON_COLUMNS | {"status", "verdict", "reasons", "merge_sha", "gitops_commit_sha", "error", "superseded_by"}
 
 
 def _now() -> datetime:
@@ -177,7 +178,8 @@ class InMemoryReviewRepository:
             "spec_ref": copy.deepcopy(spec_ref), "pr_head_sha": pr_head_sha, "merge_sha": None,
             "status": "received", "verdict": None, "reasons": [], "decision": None, "findings": None,
             "rounds": None, "human_decision": None, "deploy_result": None, "gitops_commit_sha": None,
-            "final_spec": None, "error": None, "requested_by": requested_by, "created_at": now, "updated_at": now,
+            "final_spec": None, "error": None, "superseded_by": None, "requested_by": requested_by,
+            "created_at": now, "updated_at": now,
         }
 
     async def get_review(self, review_id: str) -> dict[str, Any] | None:

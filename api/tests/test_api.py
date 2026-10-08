@@ -14,7 +14,8 @@ import yaml
 from fastapi.testclient import TestClient
 
 from review_ai.messages import ReviewRequested
-from review_api.app import ApiDeps, create_app, new_review_id
+from review_api.app import ApiDeps, create_app
+from review_common.ids import new_review_id
 from review_common.github import SpecNotFound
 from review_common.repository import InMemoryReviewRepository
 from review_common.resumed import parse_review_resumed
@@ -173,7 +174,7 @@ async def test_decision_only_when_needs_human(env: Env) -> None:
 
     assert env.client.post(f"/reviews/{rid}/decision", json=decision).status_code == 409
 
-    await env.set_status(rid, status="needs_human")
+    await env.set_status(rid, status="needs_human", final_spec=yaml.safe_load(sample_text()))
     assert env.client.post(f"/reviews/{rid}/decision", json=decision).status_code == 202
     topic, key, value = env.publisher.sent[-1]
     msg = parse_review_resumed(value)
@@ -188,6 +189,25 @@ async def test_decision_rejects_bad_ops(env: Env) -> None:
     resp = env.client.post(f"/reviews/{rid}/decision",
                            json={"decision": "approved", "approver": "x", "edited_ops": [{"op": "move", "path": "a"}]})
     assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("ops", [
+    [{"op": "replace", "path": "/runtime/no_such_field", "value": 1}],  # 경로 없음
+    [{"op": "replace", "path": "/runtime/replicas", "value": "many"}],  # 명세 형식을 깸
+])
+async def test_decision_edited_ops_checked_against_paused_spec(env: Env, ops: list) -> None:
+    """check_edited_ops 로 멈춘 명세(final_spec)에 미리 적용해 보고, 안 되면 재개 전에 422."""
+    env.put_spec(sample_text())
+    rid = env.request_review().json()["review_id"]
+    await env.set_status(rid, status="needs_human", final_spec=yaml.safe_load(sample_text()))
+    sent = len(env.publisher.sent)
+    resp = env.client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "x", "edited_ops": ops})
+
+    assert resp.status_code == 422
+    assert len(env.publisher.sent) == sent
+
+    rejected = env.client.post(f"/reviews/{rid}/decision", json={"decision": "rejected", "approver": "x", "edited_ops": ops})
+    assert rejected.status_code == 202  # 거절이면 ops 를 보지 않는다
 
 
 # --- POST /webhooks/github -------------------------------------------------------------------------

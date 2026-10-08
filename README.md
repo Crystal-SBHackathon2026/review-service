@@ -47,9 +47,9 @@ docker compose --profile app up -d --build
 | `DB_HOST` `DB_PORT` `DB_NAME` `DB_USERNAME` `DB_PASSWORD` | API·워커 | 업무 DB. 클러스터에서는 계정을 `review-db-credentials` Secret 에서 |
 | `DB_SSLMODE` | API·워커 | 기본 `prefer`. RDS 는 `require` |
 | `KAFKA_BOOTSTRAP` | API·워커 | MSK PLAINTEXT bootstrap (Terraform `infra/msk` output `bootstrap_brokers`) |
-| `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기, 워커는 PR 병합. 없으면 미인증(시간당 60회) |
+| `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기. 워커는 CI 상태 조회·AI 수정 커밋·PR 병합이라 앱 레포 Contents·Pull requests **쓰기** 권한이 필요하다 |
 | `GITHUB_WEBHOOK_SECRET` | API | `/webhooks/github` HMAC 검증. 없으면 웹훅을 503 으로 거절 |
-| `GITHUB_CI_APP_SLUG` | API | 이 GitHub App 의 `check_suite` 만 CI 결과로 본다. 기본 `github-actions`, 빈 값이면 전부 |
+| `GITHUB_CI_APP_SLUG` | API·워커 | 이 GitHub App 의 `check_suite` 만 CI 결과로 본다. 기본 `github-actions`, 빈 값이면 전부 |
 | `ARGOCD_WEBHOOK_TOKEN` | API | 있으면 `/webhooks/argocd` 가 `Authorization: Bearer <토큰>` 을 확인한다 |
 | `ANTHROPIC_API_KEY` `REVIEW_LLM_MODEL` | 워커 | judge LLM. 키가 없으면 판단이 필요한 검토는 `LLM_UNAVAILABLE` 로 사람에게 간다 |
 
@@ -59,9 +59,15 @@ docker compose --profile app up -d --build
 received → reviewing ─┬─ needs_human ─┬─ (승인) → waiting_ci
                       │               ├─ (승인 + edited_ops) → reviewing → …재검사
                       │               └─ (거절) → rejected
+                      ├─ superseded   (고쳐서 통과 → PR 브랜치에 수정 커밋 → 그 커밋을 새 검토로, superseded_by)
                       └─ waiting_ci ─┬─ (CI success) → merging → committed | blocked
                                      └─ (CI 실패) → failed
 ```
 
-그래프 오류·PR head 불일치·병합 실패도 `failed` 이고 원인은 `error` 열에 남는다.
-`commit_overlay` 는 아직 스텁이라 병합 뒤 `blocked`(`COMMIT_OVERLAY_NOT_IMPLEMENTED`)로 끝난다.
+- **CI 대기:** waiting_ci 로 바꾼 뒤 GitHub check-suites 를 먼저 조회해 이미 끝났으면 기다리지 않는다(gitops#9).
+  안 끝났으면 `check_suite` 웹훅으로 재개하고, 재개 때 다시 조회해 다른 suite 가 남았으면 계속 기다린다.
+- **AI 수정 커밋:** 고친 것이 있으면(`applied_ops`, 사람 수정 포함) 원본 deploy.yaml 에 적용해 PR 브랜치에 커밋한다.
+  새 커밋은 `autofix_commit=True` 로 다시 검토하고, 거기서 또 fix 면 needs_human(LOOP_EXHAUSTED) 이다.
+  포크 PR 은 커밋할 수 없어 failed. 커밋한 deploy.yaml 은 YAML 을 다시 쓰므로 원래 주석은 사라진다.
+- 그래프 오류·PR head 불일치·병합 실패도 `failed` 이고 원인은 `error` 열에 남는다.
+- `commit_overlay` 는 아직 스텁이라 병합 뒤 `blocked`(`COMMIT_OVERLAY_NOT_IMPLEMENTED`)로 끝난다.

@@ -68,6 +68,16 @@ class FakeGitHub:
     def __init__(self, spec_text: str) -> None:
         self.spec_text = spec_text
         self.merged: list[int] = []
+        self.suites: list[dict[str, Any]] = []
+
+    async def check_suites(self, repository: str, sha: str) -> list[dict[str, Any]]:
+        return self.suites
+
+    async def get_file_blob(self, repository: str, path: str, ref: str) -> tuple[str, str]:
+        return await self.get_file(repository, path, ref), "blob"
+
+    async def put_file(self, repository: str, path: str, **_: Any) -> str:
+        raise AssertionError("수정 없는 샘플은 커밋하지 않는다")
 
     async def get_file(self, repository: str, path: str, ref: str) -> str:
         if (repository, path, ref) != (REPO, "deploy.yaml", HEAD):
@@ -82,13 +92,19 @@ class FakeGitHub:
         return MERGE_SHA
 
 
+class NullPublisher:
+    async def send(self, topic: str, key: str, value: bytes) -> None:
+        raise AssertionError("수정 없는 샘플은 재검토를 발행하지 않는다")
+
+
 def worker_graph(repo: PostgresReviewRepository, github: FakeGitHub, checkpointer: Any) -> Any:
-    deps = Deps(repo=repo, github=github, llm=ScriptedLLM(oracle_review), retriever=FileRetriever())
+    deps = Deps(repo=repo, github=github, publisher=NullPublisher(), llm=ScriptedLLM(oracle_review),
+                retriever=FileRetriever())
     return build_graph(deps, checkpointer)
 
 
 async def test_migrate_is_idempotent(conninfo: str) -> None:
-    assert await migrate(conninfo) == ["0001_init.sql"]
+    assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -124,6 +140,10 @@ async def test_repository_on_postgres(pool: Any) -> None:
         await repo.update_review("rv_1", status="nope")
     with pytest.raises(psycopg.errors.CheckViolation):
         await repo.update_review("rv_1", reasons=["MADE_UP"])
+    await repo.insert_review(review_id="rv_2", app="sample-app", target_env="aws", repo_id=REPO, spec_ref=ref,
+                             pr_head_sha="b" * 40, requested_by="autofix:rv_1")
+    await repo.update_review("rv_1", status="superseded", superseded_by="rv_2")
+    assert (await repo.get_review("rv_1"))["superseded_by"] == "rv_2"
 
 
 async def test_checkpoint_survives_worker_restart(pool: Any) -> None:
@@ -146,6 +166,7 @@ async def test_checkpoint_survives_worker_restart(pool: Any) -> None:
     await first.handle("review.requested", msg.model_dump_json().encode())
     assert (await repo.get_review("rv_ckpt"))["status"] == "waiting_ci"
 
+    github.suites = [{"status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}}]
     restarted = ReviewHandler(repo, worker_graph(repo, github, AsyncPostgresSaver(pool)))
     resumed = {"schema_version": "review.resumed/v1", "review_id": "rv_ckpt", "kind": "ci_completed",
                "ci": {"head_sha": HEAD, "conclusion": "success"}, "resumed_at": datetime.now(UTC).isoformat()}
@@ -216,6 +237,7 @@ async def test_api_to_kafka_to_worker(pool: Any) -> None:
             await drain_until(rid, "waiting_ci")
             assert (await client.get("/verify", params={"sha": HEAD})).json()["passed"] is True
 
+            github.suites = [{"status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}}]
             body = json.dumps({"action": "completed", "check_suite": {
                 "head_sha": HEAD, "conclusion": "success", "app": {"slug": "github-actions"}}}).encode()
             sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
