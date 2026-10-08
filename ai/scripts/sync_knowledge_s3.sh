@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # knowledge/ 를 S3 review-docs 버킷(terraform infra/storage, oneaction-review-docs-<계정ID>)에 올린다.
-# 버킷 경로 = knowledge/ 경로 (rules/{any,aws,gcp,local}/ · incidents/ · guides/).
+# 버킷 경로 = knowledge/ 경로 (rules/{any,aws,gcp,local}/ · incidents/ · guides/ · warnings/).
 #
 #   scripts/sync_knowledge_s3.sh <버킷>            # dry-run: 무엇이 바뀌는지만 보여 준다
 #   scripts/sync_knowledge_s3.sh <버킷> --apply    # 실제 업로드
@@ -37,3 +37,8 @@ if [[ "$mode" != "--apply" ]]; then
   echo "[dry-run] 실제로 올리려면 --apply"
 fi
 aws "${args[@]}"
+
+# 올린 뒤 버킷 내용이 로컬과 같은지 MD5(ETag)로 대조한다. Qdrant 대조는 check_knowledge_sync.py --qdrant-url 로.
+if [[ "$mode" == "--apply" ]]; then
+  "$ai_dir/.venv/bin/python" "$ai_dir/scripts/check_knowledge_sync.py" --bucket "$bucket"
+fi

@@ -85,7 +85,8 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
 - 지금 gitops 의 sample-app aws·gcp·local overlay 를 `kubectl kustomize` 결과 기준으로 그대로 재현한다(테스트). 차이는 의도한 한 가지 — `terminationGracePeriodSeconds` 명시.
 - 시크릿은 `secretKeyRef`(`<앱>-secrets`)로만 렌더링한다. 값은 넣지 않는다.
 - overlay 로 못 만드는 것(관리형 DB, 버킷, Secret 값 생성, 로컬·GCP 의 allowed_cidrs)은 `warnings` 로 돌려준다.
-- 경고는 `RenderWarning`(str)이고 `code`·`blocking` 이 있다 (`overlay/warnings.py`). 커밋 단계는 문장을 파싱하지 말고 `rendered.blocking` 만 본다.
+- 경고는 `RenderWarning`(str)이고 `code`·`blocking`·`doc_uri` 가 있다 (`overlay/warnings.py`). 커밋 단계는 문장을 파싱하지 말고 `rendered.blocking` 만 본다.
+  `to_dict()` = `{code, blocking, message, doc}` — `doc` 은 멈춘 이유·고치는 법 문서(`warnings/<code>.md`).
 
   | code | blocking | 뜻 |
   |---|---|---|
@@ -103,25 +104,32 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
 
 ## 근거 문서 (knowledge/)
 
-S3 `review-docs` 버킷과 같은 구조다: `rules/{any,aws,gcp,local}/<ruleId>.md`, `incidents/K-*.md`(oneaction 리허설 카드 13장), `guides/*.md`.
+S3 `review-docs` 버킷과 같은 구조다: `rules/{any,aws,gcp,local}/<ruleId>.md`, `incidents/K-*.md`(oneaction 리허설 카드 13장), `guides/*.md`, `warnings/<code>.md`(렌더러 경고 7개).
 문서의 `## ` 섹션 하나가 청크다. P0 규칙 12개(구현한 규칙 전부) 문서가 있고, 환경별 청크 수는 테스트로 30개 이상을 유지한다.
 
 - 규칙 문서는 ruleId 정확 매칭(점수 1.0)으로 찾고, 사례·가이드는 의미 검색(dense cosine, 0.5 미만 버림)으로 보탠다.
-- 임베딩은 로컬 `paraphrase-multilingual-MiniLM-L12-v2`(fastembed, 키 없음). 실측해 보니 무관한 사례가 0.34~0.43 으로 나와 판정은 ruleId 매칭에 기대고 의미 검색은 보조로만 쓴다.
+- 임베딩은 로컬 `paraphrase-multilingual-MiniLM-L12-v2`(fastembed, 키 없음). 무관한 질문은 0.15~0.48 로 나와 임계값 0.5 아래다(검색 평가셋 참고).
+- `warnings/` 는 렌더러 경고(`RenderWarning.code`)마다 멈춘 이유·환경별 차이·고치는 법이다. `rule_ids` 가 비어 있어 judge 프롬프트(규칙 정확 매칭·의미 검색)에는 들어가지 않는다.
+  커밋 단계·보고서는 `warning.to_dict()["doc"]`(= `warnings/<code>.md`, 버킷에서도 같은 경로)로 찾는다. 문서의 `blocking` 은 테스트로 렌더러와 맞춘다.
 
 ```bash
 docker compose up -d qdrant                                            # qdrant v1.19.1 (클라이언트와 같은 마이너)
 .venv/bin/python scripts/index_knowledge.py --qdrant-url http://localhost:6333
 ```
 
-다시 돌려도 같은 청크는 같은 point ID 라 중복되지 않는다(2026-10-08 실측: 103청크, 두 번 돌려도 103).
+다시 돌려도 같은 청크는 같은 point ID 라 중복되지 않고, knowledge/ 에 없는 point(지운 문서·줄어든 섹션)는 지운다(`--no-prune` 로 끔).
 
 문서 원본은 이 레포의 `knowledge/` 이고, S3 버킷은 그 사본이다. 문서를 고친 뒤:
 
 ```bash
 scripts/sync_knowledge_s3.sh oneaction-review-docs-<계정ID>            # dry-run
-scripts/sync_knowledge_s3.sh oneaction-review-docs-<계정ID> --apply    # 업로드 (*.md 만, 지운 문서는 버킷에서도 지움)
+scripts/sync_knowledge_s3.sh oneaction-review-docs-<계정ID> --apply    # 업로드 (*.md 만, 지운 문서는 버킷에서도 지움) + 버킷 대조
+.venv/bin/python scripts/index_knowledge.py --qdrant-url <주소>         # 색인 다시
+.venv/bin/python scripts/check_knowledge_sync.py --bucket oneaction-review-docs-<계정ID> --qdrant-url <주소>
 ```
+
+`check_knowledge_sync.py` 는 로컬 = S3 = Qdrant 를 개수만이 아니라 내용으로 대조한다 — 문서는 MD5 ↔ S3 ETag, 청크는 point ID ↔ 본문.
+어긋나면 없는·남은·다른 항목 이름과 고치는 명령을 보여 주고 종료 코드 1. 하나만 볼 때는 `--bucket`·`--qdrant-url` 중 하나만 준다.
 
 워커 쪽에서 버킷을 받아 색인할 때는 `aws s3 sync s3://<버킷>/ <dir>` 뒤 `index_knowledge.py --knowledge-dir <dir>`.
 
@@ -136,6 +144,27 @@ ANTHROPIC_API_KEY=... .venv/bin/python scripts/run_eval.py --llm claude --repeat
 ```
 
 지표: 기대 verdict 일치율 · 인용 유효율 · pass 기대 케이스 오탐 · LLM 호출 수·토큰·시간. 결과는 `eval/reports/`(git 제외).
+
+## 검색 평가셋 (eval/retrieval_cases.yaml)
+
+"질문 → 나와야 할 문서" 25개 — 증상 질문 16 · 워커가 만드는 finding 검색어("제목 — 근거") 5 · 관련 문서가 없는 질문 4.
+의미 검색(사례·가이드)만 잰다. 규칙 문서는 ruleId 정확 매칭이라 잴 필요가 없다.
+
+```bash
+.venv/bin/python scripts/eval_retrieval.py                              # 메모리 Qdrant 에 색인해서
+.venv/bin/python scripts/eval_retrieval.py --qdrant-url http://localhost:6333
+```
+
+| 지표 | 뜻 |
+|---|---|
+| `hit@1`·`hit@3` | 임계값 없이 상위 1·3개 청크 안에 정답 문서 |
+| `served@3` | 임계값(0.5)까지 적용해 워커가 실제로 받는 상위 3개 안에 정답 문서 |
+| `negative_false_hits` | 관련 문서가 없는 질문에 임계값을 넘는 결과가 나온 수 |
+| `misses_covered_by_rule` | 의미 검색은 놓쳤지만 정답 문서가 related_rules 정확 매칭으로 이미 들어가는 finding |
+
+2026-10-08 실측(MiniLM, 131청크): hit@1·hit@3·served@3 = 20/21(0.952) · MRR 0.96 · 무관 질문 오탐 0.
+놓친 1건은 SEC-001 finding(근거가 `***MASKED***` 라 뜻이 없음)인데, 정답 문서 둘 다 related_rules: [SEC-001] 로 정확 매칭돼 워커는 받는다.
+여유가 작은 곳: RUN-001 finding 의 정답 점수 0.50, readiness 증상 0.53 — 임계값을 올리면 먼저 빠진다.
 
 ## 개발
 

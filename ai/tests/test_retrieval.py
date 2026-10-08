@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 from collections import Counter
+from typing import get_args
 
 import pytest
+import yaml
 from qdrant_client import AsyncQdrantClient
 
 from review_ai.catalog import load_rules
+from review_ai.overlay.warnings import BLOCKING, WarningCode, warning_doc_uri
 from review_ai.retrieval import make_retrieve_evidence
 from review_ai.retrieval.embedding import HashEmbedder
 from review_ai.retrieval.file_retriever import FileRetriever
-from review_ai.retrieval.knowledge import load_chunks, parse_document
-from review_ai.retrieval.qdrant_retriever import QdrantRetriever, index_chunks
+from review_ai.retrieval.knowledge import FRONT_MATTER, KNOWLEDGE_DIR, load_chunks, parse_document
+from review_ai.retrieval.qdrant_retriever import (
+    QdrantRetriever,
+    index_chunks,
+    indexed_points,
+    point_id,
+    prune_points,
+)
+from review_ai.retrieval.sync_check import compare, expected_points, local_documents, s3_documents
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.static_check import run_static_check
 from review_ai.static_check.rules import CHECKS
@@ -101,3 +111,65 @@ async def test_qdrant_drops_weak_semantic_hits() -> None:
     strict = QdrantRetriever(client, HashEmbedder(), min_score=0.99)
     docs = await strict.search(findings_for("07-fix-public-bucket.yaml"), "aws")
     assert docs and all(d["match"] == "exact_rule" for d in docs)
+
+
+def test_every_render_warning_code_has_a_document() -> None:
+    by_code = {c.warning_code: c for c in load_chunks() if c.doc_type == "warning"}
+    assert set(by_code) == set(get_args(WarningCode))
+    for code, chunk in by_code.items():
+        assert chunk.source_uri == warning_doc_uri(code)
+        assert chunk.rule_ids == ()  # 규칙 정확 매칭에 섞여 judge 프롬프트로 들어가지 않게
+
+
+def test_warning_document_blocking_matches_renderer() -> None:
+    for path in sorted((KNOWLEDGE_DIR / "warnings").glob("*.md")):
+        meta = yaml.safe_load(FRONT_MATTER.match(path.read_text(encoding="utf-8")).group(1))
+        assert meta["blocking"] is BLOCKING[meta["warning_code"]], path.name  # 문서와 렌더러가 따로 놀지 않게
+
+
+async def test_retrievers_never_return_warning_documents(qdrant: QdrantRetriever) -> None:
+    findings = findings_for("10-human-mixed-aws.yaml") + findings_for("02-pass-local-sqlite.yaml")
+    for docs in (await FileRetriever().search(findings, "aws"), await qdrant.search(findings, "aws")):
+        assert docs and all(d["doc_type"] != "warning" for d in docs)
+
+
+async def test_prune_removes_points_for_deleted_sections(qdrant: QdrantRetriever) -> None:
+    client = qdrant._client
+    chunks = load_chunks()
+    kept = chunks[:-2]
+    stale = await prune_points(client, {point_id(c.chunk_id) for c in kept})
+    assert stale == sorted(point_id(c.chunk_id) for c in chunks[-2:])
+    assert set(await indexed_points(client)) == {point_id(c.chunk_id) for c in kept}
+    assert await prune_points(client, {point_id(c.chunk_id) for c in kept}) == []
+
+
+async def test_indexed_points_match_local_chunks(qdrant: QdrantRetriever) -> None:
+    diff = compare("qdrant", expected_points(load_chunks(), point_id), await indexed_points(qdrant._client))
+    assert diff.ok and diff.expected == diff.actual == len(load_chunks())
+
+
+async def test_indexed_points_is_empty_without_collection() -> None:
+    assert await indexed_points(AsyncQdrantClient(location=":memory:")) == {}
+
+
+async def test_rank_returns_scored_semantic_chunks_without_threshold(qdrant: QdrantRetriever) -> None:
+    docs = await qdrant.rank("SQLite 파일이 재시작하면 사라진다", "local", limit=5)
+    assert len(docs) == 5 and all(d["doc_type"] in ("incident", "guide") for d in docs)
+    assert [d["score"] for d in docs] == sorted((d["score"] for d in docs), reverse=True)
+
+
+def test_sync_compare_reports_missing_extra_and_changed() -> None:
+    diff = compare("s3", {"a.md": "1", "b.md": "2", "c.md": "3"}, {"a.md": "1", "b.md": "X", "d.md": "4"})
+    assert (diff.ok, diff.missing, diff.extra, diff.changed) == (False, ("c.md",), ("d.md",), ("b.md",))
+    assert diff.lines()[0].startswith("DIFF s3: 기준 3 · 대상 3")
+    assert compare("s3", {"a.md": "1"}, {"a.md": "1"}).ok
+
+
+def test_local_documents_hash_matches_s3_etag_format(tmp_path) -> None:
+    (tmp_path / "rules").mkdir()
+    (tmp_path / "rules" / "X.md").write_bytes(b"hello")
+    (tmp_path / "notes.txt").write_text("md 가 아니면 올리지 않는다")
+    assert local_documents(tmp_path) == {"rules/X.md": "5d41402abc4b2a76b9719d911017c592"}
+    objects = [{"Key": "rules/", "ETag": '"d41d8cd98f00b204e9800998ecf8427e"'},
+               {"Key": "rules/X.md", "ETag": '"5d41402abc4b2a76b9719d911017c592"'}]
+    assert compare("s3", local_documents(tmp_path), s3_documents(objects)).ok

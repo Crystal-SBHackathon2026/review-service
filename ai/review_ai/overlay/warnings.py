@@ -32,6 +32,10 @@ BLOCKING: dict[str, bool] = {
 }
 
 
+def warning_doc_uri(code: str) -> str:
+    return f"warnings/{code}.md"
+
+
 class RenderWarning(str):
     """문자열 = 사람이 읽는 설명. code·blocking 은 코드가 읽는 값."""
 
@@ -47,5 +51,10 @@ class RenderWarning(str):
     def __reduce__(self) -> tuple[type, tuple[str, str]]:
         return (RenderWarning, (self.code, str(self)))
 
+    @property
+    def doc_uri(self) -> str:
+        """이 경고의 근거 문서 — knowledge/ 와 S3 review-docs 버킷에서 같은 경로. 멈춘 이유와 고치는 법이 있다."""
+        return warning_doc_uri(self.code)
+
     def to_dict(self) -> dict[str, object]:
-        return {"code": self.code, "blocking": self.blocking, "message": str(self)}
+        return {"code": self.code, "blocking": self.blocking, "message": str(self), "doc": self.doc_uri}

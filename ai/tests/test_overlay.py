@@ -170,7 +170,8 @@ def test_render_warning_is_a_str_with_code_and_survives_pickle() -> None:
     assert (w, w.code, w.blocking) == ("설명", "DB_PROVISIONING_REQUIRED", True)
     copied = pickle.loads(pickle.dumps(w))
     assert (copied.code, copied.blocking, str(copied)) == (w.code, True, "설명")
-    assert w.to_dict() == {"code": "DB_PROVISIONING_REQUIRED", "blocking": True, "message": "설명"}
+    assert w.to_dict() == {"code": "DB_PROVISIONING_REQUIRED", "blocking": True, "message": "설명",
+                           "doc": "warnings/DB_PROVISIONING_REQUIRED.md"}
     assert set(BLOCKING) == set(get_args(WarningCode))
 
 
