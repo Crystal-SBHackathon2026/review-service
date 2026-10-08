@@ -65,8 +65,8 @@ docker compose --profile app up -d --build
 ## 상태 흐름 (`reviews.status`)
 
 ```
-received → reviewing ─┬─ needs_human ─┬─ (승인) → waiting_ci
-                      │               ├─ (승인 + edited_ops) → reviewing → …재검사
+received → reviewing ─┬─ needs_human ─┬─ (승인, 적용할 수정 없음) → waiting_ci
+                      │               ├─ (승인 + edited_ops 또는 권장값) → reviewing → …재검사
                       │               └─ (거절) → rejected
                       ├─ superseded   (고쳐서 통과 → PR 브랜치에 수정 커밋 → 그 커밋을 새 검토로, superseded_by)
                       └─ waiting_ci ─┬─ (CI success) → merging → committed | blocked
