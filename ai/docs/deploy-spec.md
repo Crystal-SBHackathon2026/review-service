@@ -26,7 +26,7 @@
 ```yaml
 api_version: crystal.review/v1alpha1
 kind: DeploySpec
-metadata: {name, repository, commit}          # 어떤 앱의 어떤 커밋인가
+metadata: {name, repository, commit?}         # commit 은 앱 레포 deploy.yaml 이면 비운다 — 검토한 커밋은 spec_ref.commit
 target:   {env: aws|gcp|local, region, namespace?}
 image:    {repository, tag?, digest?, platforms: [amd64|arm64]}   # tag·digest 는 참고용 — 배포 태그는 CI 가 gitops base 에 쓴다
 runtime:  {port, replicas, health{readiness,liveness}, resources, env{평문만}, termination_grace_seconds}
