@@ -305,7 +305,10 @@ async def test_unanswered_field_without_recommendation_is_422(env: Env) -> None:
     before = len(env.publisher.sent)
     body = {"decision": "approved", "approver": "tester",
             "edited_ops": [{"op": "add", "path": "/runtime/health/readiness"}]}
-    assert env.client.post(f"/reviews/{rid}/decision", json=body).status_code == 422
+    response = env.client.post(f"/reviews/{rid}/decision", json=body)
+    assert response.status_code == 422
+    errors = response.json()["detail"]["errors"]
+    assert "/runtime/health/readiness" in errors and "use_recommendations: false" in errors
     assert len(env.publisher.sent) == before
 
 

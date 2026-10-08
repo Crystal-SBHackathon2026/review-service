@@ -129,7 +129,8 @@ def resolve_human_decision(state: dict[str, Any], human: dict[str, Any]) -> dict
     recommended_spec = apply_ops(state["deploy_spec"], defaults) if unanswered else None
     for path in unanswered:
         if not any(_overlaps(path, op["path"]) for op in defaults):
-            raise PatchError(f"입력하지 않은 항목의 권장값이 없다: {path}")
+            raise PatchError(f"입력하지 않은 항목의 권장값이 없다: {path} — 값을 넣거나 이 항목을 빼고 보내라"
+                             " (작성한 명세 그대로 승인: edited_ops 없이 use_recommendations: false)")
         _check_recommended_path(recommended_spec, path)
     # 객체 전체를 명시한 경우도 사용자 선택으로 취급하며, 권장값으로 다시 덮지 않는다.
     defaults = [op for op in defaults if not any(path_under(op["path"], given["path"]) for given in supplied)]
