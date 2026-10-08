@@ -409,10 +409,12 @@ async def test_argocd_requires_token(env: Env) -> None:
 
 # --- POST /webhooks/github — pull_request 로 검토 시작 ----------------------------------------------
 
-def pr_event(action: str = "opened", sha: str = HEAD, number: int = 5, base: str = "main") -> dict[str, Any]:
+def pr_event(action: str = "opened", sha: str = HEAD, number: int = 5, base: str = "main",
+             head_repo: str = REPO) -> dict[str, Any]:
     return {"action": action, "number": number, "sender": {"login": "octo-dev"},
             "repository": {"full_name": REPO, "default_branch": "main"},
-            "pull_request": {"number": number, "head": {"sha": sha, "ref": "feature"}, "base": {"ref": base}}}
+            "pull_request": {"number": number, "base": {"ref": base},
+                             "head": {"sha": sha, "ref": "feature", "repo": {"full_name": head_repo}}}}
 
 
 def send_pr(env: Env, body: dict[str, Any]) -> Any:
@@ -431,13 +433,6 @@ def test_pr_opened_starts_review(env: Env) -> None:
     assert (row["status"], row["pr_head_sha"], row["pr_number"], row["requested_by"]) == ("received", HEAD, 5, "octo-dev")
     [(topic, _, value)] = env.publisher.sent
     assert topic == "review.requested" and ReviewRequested.model_validate_json(value).requested_by == "octo-dev"
-
-
-def test_pr_without_deploy_yaml_is_skipped(env: Env) -> None:
-    resp = send_pr(env, pr_event("opened"))
-
-    assert (resp.status_code, resp.json()) == (202, {"skipped": "no deploy.yaml"})
-    assert env.repo.reviews == {} and env.publisher.sent == []
 
 
 def test_same_sha_twice_makes_one_review(env: Env) -> None:

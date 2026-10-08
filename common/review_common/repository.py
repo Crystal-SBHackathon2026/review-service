@@ -1,4 +1,4 @@
-"""업무 DB 저장소 — reviews·baselines·deploy_events.
+"""업무 DB 저장소 — reviews·baselines·deploy_events·spec_intakes.
 
 ReviewRepository 프로토콜 하나에 Postgres 구현과 메모리 구현(테스트·DB 없는 로컬 실행)을 둔다.
 상태 전이는 claim() 의 조건부 UPDATE 로 한다 — Kafka 재전송·중복 웹훅이 와도 한 번만 진행된다.
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
 from psycopg.rows import dict_row
@@ -25,6 +25,11 @@ OPEN: tuple[str, ...] = ("received", "reviewing", "needs_human", "waiting_ci")  
 JSON_COLUMNS = frozenset({"spec_ref", "decision", "findings", "rounds", "human_decision", "deploy_result", "final_spec"})
 UPDATABLE = JSON_COLUMNS | {"status", "verdict", "reasons", "merge_sha", "gitops_commit_sha", "error", "superseded_by"}
 
+INTAKE_JSON_COLUMNS = frozenset({"errors", "details"})
+INTAKE_FIELDS = ("intake_id", "repository", "head_repository", "pr_number", "head_sha", "head_ref", "path", "kind",
+                 "errors", "requested_by")
+INTAKE_FINISH = frozenset({"status", "reason", "message", "details", "result_commit_sha"})
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -34,6 +39,28 @@ def _check_fields(fields: Iterable[str]) -> None:
     unknown = set(fields) - UPDATABLE
     if unknown:
         raise ValueError(f"reviews 에서 바꿀 수 없는 필드: {sorted(unknown)}")
+
+
+def _check_intake(intake: dict[str, Any], finish: dict[str, Any]) -> None:
+    if set(intake) != set(INTAKE_FIELDS):
+        raise ValueError(f"spec_intakes 필드가 맞지 않다: {sorted(set(intake) ^ set(INTAKE_FIELDS))}")
+    unknown = set(finish) - INTAKE_FINISH
+    if unknown or finish.get("status") == "processing":
+        raise ValueError(f"spec_intakes 를 끝낼 수 없는 필드·상태: {sorted(unknown) or finish['status']}")
+
+
+def baseline_for(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """업무 DB baselines 행 → deploy_spec['baseline'] (review_ai Baseline 모양)."""
+    if row is None:
+        return None
+    ref = row["merge_sha"] or (row.get("spec_ref") or {}).get("commit") or f"{row['app']}/{row['target_env']}"
+    observed = row.get("observed_at")
+    return {
+        "spec_ref": ref,
+        "spec": row["spec"],
+        "facts": {"database_has_data": row.get("database_has_data"),
+                  "observed_at": observed.isoformat() if observed else None},
+    }
 
 
 class ReviewRepository(Protocol):
@@ -58,8 +85,10 @@ class ReviewRepository(Protocol):
         """같은 레포(spec_ref.repository)·같은 head SHA 검토. 가장 최근 것."""
         ...
 
-    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str) -> list[str]:
-        """그 PR 의 끝나지 않은 검토를 superseded 로 넘긴다 (superseded_by 자신은 빼고). 넘긴 review_id 들."""
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None) -> list[str]:
+        """그 PR 의 끝나지 않은 검토를 superseded 로 넘긴다 (superseded_by 자신은 빼고). 넘긴 review_id 들.
+
+        superseded_by=None — 새 커밋에 검토할 명세가 없다 (intake 로 갔다)."""
         ...
 
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]: ...
@@ -75,6 +104,41 @@ class ReviewRepository(Protocol):
 
     async def add_deploy_event(self, *, review_id: str | None, app: str, target_env: str, kind: str,
                                image_tag: str | None, payload: dict[str, Any]) -> None: ...
+
+    async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
+        """그 레포(spec_ref.repository)의 가장 최근 baseline — 명세가 없을 때 앱·대상 환경을 거기서 찾는다."""
+        ...
+
+    # --- spec_intakes ---
+
+    async def insert_intake(self, **intake: Any) -> bool:
+        """processing 으로 넣는다. 같은 레포·head SHA 행이 이미 있으면 넣지 않고 False."""
+        ...
+
+    async def get_intake(self, intake_id: str) -> dict[str, Any] | None: ...
+
+    async def find_intake_by_head(self, repository: str, sha: str) -> dict[str, Any] | None: ...
+
+    async def latest_intake_by_head_sha(self, sha: str) -> dict[str, Any] | None: ...
+
+    async def find_intake_by_result_commit(self, repository: str, sha: str) -> dict[str, Any] | None:
+        """intake 가 만든 커밋이 sha 인 행 — 루프 방지·검토 연결용."""
+        ...
+
+    async def finish_intake(self, intake_id: str, **fields: Any) -> bool:
+        """processing 일 때만 끝낸다. 끝냈으면 True — 두 곳이 같은 행을 처리해도 결과는 하나만 남는다."""
+        ...
+
+    async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
+                          review_id: str | None = None) -> None:
+        """만든 커밋·그 커밋의 검토를 잇는다. None 인 값은 그대로 둔다."""
+        ...
+
+    async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
+        """older_than 보다 오래 processing 인 행(처리 중 파드가 죽은 것)을 가져가며 updated_at 을 새로 찍는다.
+
+        API 가 여러 개여도 한 행은 한 곳만 가져간다."""
+        ...
 
 
 def tag_matches(merge_sha: str | None, image_tag: str) -> bool:
@@ -144,10 +208,11 @@ class PostgresReviewRepository:
             "SELECT * FROM reviews WHERE spec_ref->>'repository' = %s AND pr_head_sha = %s"
             " ORDER BY created_at DESC LIMIT 1", (repository, sha))
 
-    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str) -> list[str]:
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None) -> list[str]:
         rows = await self._fetchall(
             "UPDATE reviews SET status = 'superseded', superseded_by = %s, updated_at = now()"
-            " WHERE spec_ref->>'repository' = %s AND pr_number = %s AND review_id <> %s AND status = ANY(%s)"
+            " WHERE spec_ref->>'repository' = %s AND pr_number = %s AND review_id IS DISTINCT FROM %s::text"
+            " AND status = ANY(%s)"
             " RETURNING review_id", (superseded_by, repository, pr_number, superseded_by, list(OPEN)))
         return [r["review_id"] for r in rows]
 
@@ -186,6 +251,57 @@ class PostgresReviewRepository:
             (review_id, app, target_env, kind, image_tag, Jsonb(payload)),
         )
 
+    async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT * FROM baselines WHERE spec_ref->>'repository' = %s ORDER BY observed_at DESC NULLS LAST LIMIT 1",
+            (repository,))
+
+    async def insert_intake(self, **intake: Any) -> bool:
+        _check_intake(intake, {})
+        columns = list(INTAKE_FIELDS)
+        values = [Jsonb(intake[c]) if c in INTAKE_JSON_COLUMNS else intake[c] for c in columns]
+        return await self._execute(
+            f"INSERT INTO spec_intakes ({', '.join(columns)}) VALUES ({', '.join(['%s'] * len(columns))})"
+            " ON CONFLICT (repository, head_sha) DO NOTHING", values) == 1
+
+    async def get_intake(self, intake_id: str) -> dict[str, Any] | None:
+        return await self._fetchone("SELECT * FROM spec_intakes WHERE intake_id = %s", (intake_id,))
+
+    async def find_intake_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT * FROM spec_intakes WHERE repository = %s AND head_sha = %s", (repository, sha))
+
+    async def latest_intake_by_head_sha(self, sha: str) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT * FROM spec_intakes WHERE head_sha = %s ORDER BY created_at DESC LIMIT 1", (sha,))
+
+    async def find_intake_by_result_commit(self, repository: str, sha: str) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT * FROM spec_intakes WHERE repository = %s AND result_commit_sha = %s"
+            " ORDER BY created_at DESC LIMIT 1", (repository, sha))
+
+    async def finish_intake(self, intake_id: str, **fields: Any) -> bool:
+        _check_intake(dict.fromkeys(INTAKE_FIELDS), fields)
+        columns = sorted(fields)
+        values = [Jsonb(fields[c]) if c in INTAKE_JSON_COLUMNS else fields[c] for c in columns]
+        assignments = ", ".join(f"{c} = %s" for c in columns)
+        return await self._execute(
+            f"UPDATE spec_intakes SET {assignments}, updated_at = now()"
+            " WHERE intake_id = %s AND status = 'processing'", (*values, intake_id)) == 1
+
+    async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
+                          review_id: str | None = None) -> None:
+        await self._execute(
+            "UPDATE spec_intakes SET result_commit_sha = COALESCE(%s, result_commit_sha),"
+            " review_id = COALESCE(%s, review_id), updated_at = now() WHERE intake_id = %s",
+            (result_commit_sha, review_id, intake_id))
+
+    async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
+        rows = await self._fetchall(
+            "UPDATE spec_intakes SET updated_at = now() WHERE status = 'processing' AND updated_at < now() - %s"
+            " RETURNING *", (older_than,))
+        return sorted(rows, key=lambda r: r["created_at"])
+
 
 class InMemoryReviewRepository:
     """테스트·DB 없는 로컬 실행용. Postgres 구현과 같은 규칙으로 동작한다."""
@@ -194,6 +310,7 @@ class InMemoryReviewRepository:
         self.reviews: dict[str, dict[str, Any]] = {}
         self.baselines: dict[tuple[str, str], dict[str, Any]] = {}
         self.deploy_events: list[dict[str, Any]] = []
+        self.intakes: dict[str, dict[str, Any]] = {}
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
@@ -245,7 +362,7 @@ class InMemoryReviewRepository:
         return self._latest(r for r in self.reviews.values()
                             if r["spec_ref"].get("repository") == repository and r["pr_head_sha"] == sha)
 
-    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str) -> list[str]:
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None) -> list[str]:
         done = []
         for r in sorted(self.reviews.values(), key=lambda r: r["created_at"]):
             if (r["spec_ref"].get("repository") == repository and r["pr_number"] == pr_number
@@ -280,6 +397,59 @@ class InMemoryReviewRepository:
             "id": len(self.deploy_events) + 1, "review_id": review_id, "app": app, "target_env": target_env,
             "kind": kind, "image_tag": image_tag, "payload": copy.deepcopy(payload), "received_at": _now(),
         })
+
+    async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
+        rows = [b for b in self.baselines.values() if b["spec_ref"].get("repository") == repository]
+        rows.sort(key=lambda b: b["observed_at"] or datetime.min.replace(tzinfo=UTC))
+        return copy.deepcopy(rows[-1]) if rows else None
+
+    async def insert_intake(self, **intake: Any) -> bool:
+        _check_intake(intake, {})
+        if await self.find_intake_by_head(intake["repository"], intake["head_sha"]) is not None:
+            return False
+        now = _now()
+        self.intakes[intake["intake_id"]] = {
+            **copy.deepcopy(intake), "status": "processing", "reason": None, "message": None, "details": [],
+            "result_commit_sha": None, "review_id": None, "created_at": now, "updated_at": now,
+        }
+        return True
+
+    async def get_intake(self, intake_id: str) -> dict[str, Any] | None:
+        row = self.intakes.get(intake_id)
+        return copy.deepcopy(row) if row else None
+
+    async def find_intake_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
+        return self._latest(r for r in self.intakes.values() if r["repository"] == repository and r["head_sha"] == sha)
+
+    async def latest_intake_by_head_sha(self, sha: str) -> dict[str, Any] | None:
+        return self._latest(r for r in self.intakes.values() if r["head_sha"] == sha)
+
+    async def find_intake_by_result_commit(self, repository: str, sha: str) -> dict[str, Any] | None:
+        return self._latest(r for r in self.intakes.values()
+                            if r["repository"] == repository and r["result_commit_sha"] == sha)
+
+    async def finish_intake(self, intake_id: str, **fields: Any) -> bool:
+        _check_intake(dict.fromkeys(INTAKE_FIELDS), fields)
+        row = self.intakes.get(intake_id)
+        if row is None or row["status"] != "processing":
+            return False
+        row.update(copy.deepcopy(fields), updated_at=_now())
+        return True
+
+    async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
+                          review_id: str | None = None) -> None:
+        row = self.intakes.get(intake_id)
+        if row is None:
+            return
+        links = {"result_commit_sha": result_commit_sha, "review_id": review_id}
+        row.update({k: v for k, v in links.items() if v is not None}, updated_at=_now())
+
+    async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
+        now = _now()
+        rows = [r for r in self.intakes.values() if r["status"] == "processing" and r["updated_at"] < now - older_than]
+        for r in rows:
+            r["updated_at"] = now
+        return copy.deepcopy(sorted(rows, key=lambda r: r["created_at"]))
 
 
 def make_pool(conninfo: str, *, min_size: int = 1, max_size: int = 5) -> AsyncConnectionPool:

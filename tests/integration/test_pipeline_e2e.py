@@ -13,7 +13,7 @@ import json
 import os
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -104,7 +104,8 @@ def worker_graph(repo: PostgresReviewRepository, github: FakeGitHub, checkpointe
 
 
 async def test_migrate_is_idempotent(conninfo: str) -> None:
-    assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql", "0003_pr_number.sql"]
+    assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql", "0003_pr_number.sql",
+                                       "0004_spec_intakes.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -160,7 +161,43 @@ async def test_repository_on_postgres(pool: Any) -> None:
     assert (await repo.get_review("rv_a"))["superseded_by"] == "rv_2"
     assert (await repo.get_review("rv_b"))["status"] == "committed"
     assert (await repo.get_review("rv_c"))["status"] == "waiting_ci"
+    assert await repo.supersede_open(repository=REPO, pr_number=10, superseded_by=None) == ["rv_c"]  # intake 로 간 커밋
+    assert (await repo.get_review("rv_c"))["superseded_by"] is None
 
+
+async def test_spec_intakes_on_postgres(pool: Any) -> None:
+    """명세 없음·빈 명세 기록 — 같은 head 한 번, processing 에서만 끝내기, 커밋·검토 잇기, 오래된 행 찾기."""
+    repo = PostgresReviewRepository(pool)
+    intake = {"intake_id": "in_1", "repository": REPO, "head_repository": REPO, "pr_number": 7, "head_sha": HEAD,
+              "head_ref": "feature", "path": "deploy.yaml", "kind": "missing", "errors": [], "requested_by": "it"}
+    assert await repo.insert_intake(**intake)
+    assert not await repo.insert_intake(**{**intake, "intake_id": "in_dup"})
+    assert (await repo.find_intake_by_head(REPO, HEAD))["intake_id"] == "in_1"
+    assert (await repo.latest_intake_by_head_sha(HEAD))["status"] == "processing"
+    assert not await repo.claim_stale_intakes(timedelta(minutes=5))
+    assert [r["intake_id"] for r in await repo.claim_stale_intakes(timedelta(0))] == ["in_1"]
+    assert not await repo.claim_stale_intakes(timedelta(seconds=30))  # 방금 가져간 행은 다른 곳이 못 가져간다
+
+    await repo.link_intake("in_1", result_commit_sha="b" * 40)
+    assert (await repo.find_intake_by_result_commit(REPO, "b" * 40))["intake_id"] == "in_1"
+    assert await repo.finish_intake("in_1", status="generated", reason="GENERATED", message="m",
+                                    details=[{"path": "/runtime"}], result_commit_sha="b" * 40)
+    assert not await repo.finish_intake("in_1", status="failed", reason="ERROR", message="late")
+    await repo.insert_review(review_id="rv_g", app="sample-app", target_env="aws", repo_id=REPO,
+                             spec_ref={"repository": REPO, "commit": "b" * 40, "path": "deploy.yaml"},
+                             pr_head_sha="b" * 40, requested_by="it", pr_number=7)
+    await repo.link_intake("in_1", review_id="rv_g")
+    row = await repo.get_intake("in_1")
+    assert (row["status"], row["details"], row["review_id"], row["result_commit_sha"]) == (
+        "generated", [{"path": "/runtime"}], "rv_g", "b" * 40)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        await repo.insert_intake(**{**intake, "intake_id": "in_bad", "head_sha": "c" * 40, "kind": "nope"})
+
+    await repo.upsert_baseline(app="sample-app", target_env="aws", spec={"v": 1},
+                               spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
+                               merge_sha="x", observed_at=datetime.now(UTC))
+    assert (await repo.latest_baseline_for_repository(REPO))["spec"] == {"v": 1}
+    assert await repo.latest_baseline_for_repository("other/repo") is None
 
 async def test_checkpoint_survives_worker_restart(pool: Any) -> None:
     """waiting_ci 에서 멈춘 검토를 새 워커(새 그래프·같은 DB 체크포인트)가 CI 결과로 이어 간다."""
