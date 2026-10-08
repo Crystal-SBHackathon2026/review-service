@@ -1,6 +1,5 @@
-# CI: 테스트(api·worker) → 이미지 빌드(api·worker) → 취약점 검사 → (main만) GHCR 푸시
+# CI: 테스트(api·worker) → 이미지 빌드(api·worker) → 취약점 검사 → (main만) GHCR 푸시 → gitops 이미지 태그 갱신
 # ai/ 테스트·정합성 검사는 ai-ci.yml 이 따로 돈다.
-# 배포 매니페스트는 gitops 레포 apps/review-service/ 에 있다. 이미지 태그 갱신은 지금은 사람이 PR 로 한다.
 name: ci
 
 on:
@@ -114,3 +113,25 @@ jobs:
           docker tag "$IMAGE:${{ github.sha }}" "$IMAGE:latest"
           docker push "$IMAGE:${{ github.sha }}"
           docker push "$IMAGE:latest"
+
+  update-gitops:
+    # gitops apps/review-service 의 이미지 태그(api·worker 공통)를 이 커밋 SHA 로 갱신 → Argo CD 가 변화를 감지한다
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+    steps:
+      - name: GitOps 레포 이미지 태그 갱신
+        if: env.GITOPS_TOKEN != ''
+        run: |
+          git clone "https://x-access-token:${GITOPS_TOKEN}@github.com/Crystal-SBHackathon2026/gitops.git"
+          cd gitops
+          sed -i "s/newTag: .*/newTag: ${{ github.sha }}/" apps/review-service/kustomization.yaml
+          git config user.name "crystal-ci"
+          git config user.email "crystal-ci@users.noreply.github.com"
+          git commit -am "chore: review-service 이미지 태그 갱신 (${GITHUB_SHA::7})" || echo "변경 없음"
+          git push
+      - name: 토큰 없음 안내
+        if: env.GITOPS_TOKEN == ''
+        run: echo "GITOPS_TOKEN 시크릿이 없어 GitOps 갱신을 건너뜁니다."
