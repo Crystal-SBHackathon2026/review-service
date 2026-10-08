@@ -39,28 +39,33 @@ class FakeGitHub:
         self.pulls: dict[str, list[dict[str, Any]]] = {}
         self.suites: dict[str, list[dict[str, Any]]] = {}
         self.suite_error: GitHubError | None = None
-        self.put_error: GitHubError | None = None
+        self.branch_error: GitHubError | None = None
         self.merged: list[tuple[str, int, str]] = []
-        self.commits: list[dict[str, Any]] = []
+        self.commits: list[dict[str, Any]] = []  # 브랜치에 실제로 올라간 커밋
+        self.prepared: dict[str, dict[str, Any]] = {}  # 만들었지만 브랜치를 아직 안 옮긴 커밋
 
     def open_pr(self, repository: str, head_sha: str, number: int = 7, *, fork: bool = False) -> None:
         head_repo = "someone/fork" if fork else repository
         self.pulls[head_sha] = [{"number": number, "state": "open",
                                  "head": {"sha": head_sha, "ref": "feature", "repo": {"full_name": head_repo}}}]
 
-    async def get_file_blob(self, repository: str, path: str, ref: str) -> tuple[str, str]:
-        return self.files[ref], f"blob-{ref[:7]}"
+    async def get_file(self, repository: str, path: str, ref: str) -> str:
+        return self.files[ref]
 
-    async def put_file(self, repository: str, path: str, *, branch: str, content: str, blob_sha: str,
-                       message: str) -> str:
-        if self.put_error:
-            raise self.put_error
-        self.commits.append({"branch": branch, "content": content, "blob_sha": blob_sha, "message": message})
-        self.files[FIX_SHA] = content
-        for pull in self.pulls.pop(next(iter(self.pulls)), []):  # 브랜치 head 가 새 커밋으로 움직인다
-            pull["head"]["sha"] = FIX_SHA
-            self.pulls[FIX_SHA] = [pull]
+    async def prepare_file_commit(self, repository: str, *, parent: str, path: str, content: str,
+                                  message: str) -> str:
+        self.prepared[FIX_SHA] = {"parent": parent, "path": path, "content": content, "message": message}
         return FIX_SHA
+
+    async def update_branch(self, repository: str, branch: str, sha: str) -> None:
+        if self.branch_error:
+            raise self.branch_error
+        commit = self.prepared.pop(sha)
+        self.commits.append({"branch": branch, **commit})
+        self.files[sha] = commit["content"]
+        for pull in self.pulls.pop(commit["parent"], []):  # 브랜치 head 가 새 커밋으로 움직인다
+            pull["head"]["sha"] = sha
+            self.pulls[sha] = [pull]
 
     async def check_suites(self, repository: str, sha: str) -> list[dict[str, Any]]:
         if self.suite_error:

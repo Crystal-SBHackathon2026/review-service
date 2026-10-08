@@ -130,8 +130,15 @@ jobs:
           sed -i "s/newTag: .*/newTag: ${{ github.sha }}/" apps/review-service/kustomization.yaml
           git config user.name "crystal-ci"
           git config user.email "crystal-ci@users.noreply.github.com"
-          git commit -am "chore: review-service 이미지 태그 갱신 (${GITHUB_SHA::7})" || echo "변경 없음"
-          git push
+          if ! git commit -am "chore: review-service 이미지 태그 갱신 (${GITHUB_SHA::7})"; then
+            echo "변경 없음"; exit 0
+          fi
+          # gitops 에 커밋하는 곳이 셋(sample-app CI, review-service CI, commit_overlay)이라 push 가 겹칠 수 있다
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            sleep $((i * 2))
+          done
+          exit 1
       - name: 토큰 없음 안내
         if: env.GITOPS_TOKEN == ''
         run: echo "GITOPS_TOKEN 시크릿이 없어 GitOps 갱신을 건너뜁니다."

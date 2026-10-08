@@ -390,3 +390,100 @@ async def test_argocd_requires_token(env: Env) -> None:
     await _merged_review(env)
     resp = env.client.post("/webhooks/argocd", json=argo("Healthy", MERGE[:7]))
     assert resp.status_code == 401
+
+
+# --- POST /webhooks/github — pull_request 로 검토 시작 ----------------------------------------------
+
+def pr_event(action: str = "opened", sha: str = HEAD, number: int = 5, base: str = "main") -> dict[str, Any]:
+    return {"action": action, "number": number, "sender": {"login": "octo-dev"},
+            "repository": {"full_name": REPO, "default_branch": "main"},
+            "pull_request": {"number": number, "head": {"sha": sha, "ref": "feature"}, "base": {"ref": base}}}
+
+
+def send_pr(env: Env, body: dict[str, Any]) -> Any:
+    raw, sig = signed(body)
+    return env.client.post("/webhooks/github", content=raw,
+                           headers={"X-GitHub-Event": "pull_request", "X-Hub-Signature-256": sig})
+
+
+def test_pr_opened_starts_review(env: Env) -> None:
+    env.put_spec(sample_text())
+    resp = send_pr(env, pr_event("opened"))
+
+    assert resp.status_code == 202
+    rid = resp.json()["review_id"]
+    row = env.repo.reviews[rid]
+    assert (row["status"], row["pr_head_sha"], row["pr_number"], row["requested_by"]) == ("received", HEAD, 5, "octo-dev")
+    [(topic, _, value)] = env.publisher.sent
+    assert topic == "review.requested" and ReviewRequested.model_validate_json(value).requested_by == "octo-dev"
+
+
+def test_pr_without_deploy_yaml_is_skipped(env: Env) -> None:
+    resp = send_pr(env, pr_event("opened"))
+
+    assert (resp.status_code, resp.json()) == (202, {"skipped": "no deploy.yaml"})
+    assert env.repo.reviews == {} and env.publisher.sent == []
+
+
+def test_same_sha_twice_makes_one_review(env: Env) -> None:
+    """워커 commit_fix 의 커밋에 synchronize 가 와도, 워커가 먼저 넣어 둔 검토가 있으면 새로 만들지 않는다."""
+    env.put_spec(sample_text())
+    first = send_pr(env, pr_event("opened")).json()["review_id"]
+    second = send_pr(env, pr_event("synchronize")).json()
+
+    assert second == {"skipped": "already reviewed", "review_id": first}
+    assert len(env.repo.reviews) == 1 and len(env.publisher.sent) == 1
+
+
+async def test_synchronize_supersedes_open_reviews_of_same_pr(env: Env) -> None:
+    new_sha = "b" * 40
+    env.put_spec(sample_text())
+    env.put_spec(sample_text(), sha=new_sha)
+    old = send_pr(env, pr_event("opened")).json()["review_id"]
+    await env.set_status(old, status="needs_human")
+    await env.repo.insert_review(review_id="rv_done", app="sample-app", target_env="aws", repo_id=REPO,
+                                 spec_ref={"repository": REPO, "commit": "c" * 40, "path": "deploy.yaml"},
+                                 pr_head_sha="c" * 40, requested_by="x", pr_number=5)
+    await env.set_status("rv_done", status="committed")
+    await env.repo.insert_review(review_id="rv_other_pr", app="sample-app", target_env="aws", repo_id=REPO,
+                                 spec_ref={"repository": REPO, "commit": "d" * 40, "path": "deploy.yaml"},
+                                 pr_head_sha="d" * 40, requested_by="x", pr_number=6)
+
+    body = send_pr(env, pr_event("synchronize", sha=new_sha)).json()
+
+    new = body["review_id"]
+    assert body["superseded"] == [old]
+    assert (env.repo.reviews[old]["status"], env.repo.reviews[old]["superseded_by"]) == ("superseded", new)
+    assert env.repo.reviews["rv_done"]["status"] == "committed"  # 끝난 검토는 그대로
+    assert env.repo.reviews["rv_other_pr"]["status"] == "received"  # 다른 PR 은 그대로
+    assert env.repo.reviews[new]["status"] == "received"
+
+
+async def test_superseded_status_is_not_overwritten_by_worker(env: Env) -> None:
+    """워커가 돌던 검토가 새 커밋에 밀려 superseded 가 된 뒤, 워커의 상태 기록이 그걸 덮어쓰지 않는다."""
+    env.put_spec(sample_text())
+    rid = send_pr(env, pr_event("opened")).json()["review_id"]
+    await env.repo.supersede_open(repository=REPO, pr_number=5, superseded_by="rv_newer")
+    await env.repo.update_review(rid, status="waiting_ci", verdict="pass")
+
+    assert (env.repo.reviews[rid]["status"], env.repo.reviews[rid]["verdict"]) == ("superseded", "pass")
+
+
+@pytest.mark.parametrize("body", [
+    pr_event("closed"),
+    pr_event("edited"),
+    pr_event("opened", base="release"),  # 기본 브랜치가 아닌 PR
+])
+def test_pr_events_ignored(env: Env, body: dict[str, Any]) -> None:
+    env.put_spec(sample_text())
+    resp = send_pr(env, body)
+
+    assert resp.status_code == 202 and "ignored" in resp.json()
+    assert env.repo.reviews == {}
+
+
+def test_pr_webhook_bad_signature_is_401(env: Env) -> None:
+    raw, _ = signed(pr_event())
+    resp = env.client.post("/webhooks/github", content=raw,
+                           headers={"X-GitHub-Event": "pull_request", "X-Hub-Signature-256": "sha256=00"})
+    assert resp.status_code == 401

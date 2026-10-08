@@ -47,11 +47,20 @@ docker compose --profile app up -d --build
 | `DB_HOST` `DB_PORT` `DB_NAME` `DB_USERNAME` `DB_PASSWORD` | API·워커 | 업무 DB. 클러스터에서는 계정을 `review-db-credentials` Secret 에서 |
 | `DB_SSLMODE` | API·워커 | 기본 `prefer`. RDS 는 `require` |
 | `KAFKA_BOOTSTRAP` | API·워커 | MSK PLAINTEXT bootstrap (Terraform `infra/msk` output `bootstrap_brokers`) |
-| `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기. 워커는 CI 상태 조회·AI 수정 커밋·PR 병합이라 앱 레포 Contents·Pull requests **쓰기** 권한이 필요하다 |
+| `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기. 워커는 CI 상태 조회·AI 수정 커밋·PR 병합·gitops overlay 커밋이라 앱 레포·gitops Contents·Pull requests **쓰기** 권한이 필요하다 (`oneaction/gitops-token`) |
+| `GITOPS_REPO` | 워커 | overlay 를 커밋할 gitops 레포. 기본 `Crystal-SBHackathon2026/gitops` |
 | `GITHUB_WEBHOOK_SECRET` | API | `/webhooks/github` HMAC 검증. 없으면 웹훅을 503 으로 거절 |
 | `GITHUB_CI_APP_SLUG` | API·워커 | 이 GitHub App 의 `check_suite` 만 CI 결과로 본다. 기본 `github-actions`, 빈 값이면 전부 |
 | `ARGOCD_WEBHOOK_TOKEN` | API | 있으면 `/webhooks/argocd` 가 `Authorization: Bearer <토큰>` 을 확인한다 |
 | `ANTHROPIC_API_KEY` `REVIEW_LLM_MODEL` | 워커 | judge LLM. 키가 없으면 판단이 필요한 검토는 `LLM_UNAVAILABLE` 로 사람에게 간다 |
+
+## 검토가 시작되는 곳
+
+- **GitHub 조직 웹훅** → `POST /webhooks/github` (이벤트: `pull_request`, `check_suite`)
+  - `pull_request` `opened`·`synchronize`·`reopened`, base 가 기본 브랜치인 PR 만 → head SHA 의 `deploy.yaml` 검토
+  - `deploy.yaml` 이 없으면 `{"skipped": "no deploy.yaml"}`, 같은 레포·head SHA 검토가 있으면 `{"skipped": "already reviewed"}`
+  - 새 검토를 만들면 그 PR 의 끝나지 않은 검토(`received`·`reviewing`·`needs_human`·`waiting_ci`)는 `superseded`
+- `POST /reviews` — 직접 요청 (PR 번호를 모르므로 superseded 대상이 아니다)
 
 ## 상태 흐름 (`reviews.status`)
 
@@ -72,4 +81,4 @@ received → reviewing ─┬─ needs_human ─┬─ (승인) → waiting_ci
 - 그래프 오류·PR head 불일치·병합 실패도 `failed` 이고 원인은 `error` 열에 남는다.
 - 사람 승인 시 입력하지 않은 항목은 `decision.recommendations`의 검증된 권장값을 적용하고 재검사한다.
   입력한 값이 우선이며, 기존 명세 그대로 승인하려면 `use_recommendations: false`를 명시한다. [응답 기본값 안내](ai/docs/human-recommendations.md).
-- `commit_overlay` 는 아직 스텁이라 병합 뒤 `blocked`(`COMMIT_OVERLAY_NOT_IMPLEMENTED`)로 끝난다.
+- `commit_overlay`(성진님, `worker/review_worker/commit_overlay.py`)가 원본 명세 + `applied_ops` → overlay 를 gitops main 에 커밋한다. 렌더러 blocking 경고면 커밋하지 않고 `blocked`. gitops ref 충돌은 main 을 다시 읽어 최대 5회.

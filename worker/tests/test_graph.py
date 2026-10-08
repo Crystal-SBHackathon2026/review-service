@@ -11,7 +11,7 @@ from review_ai.errors import TransientError
 from review_ai.judge.llm import LlmResponse
 from review_ai.messages import ReviewRequested
 from review_ai.verdict import applied_ops
-from review_common.github import GitHubError
+from review_common.github import GitHubError, RefConflict
 from tests.conftest import FIX_SHA, HEAD, MERGE_SHA, Harness, load_sample, suite
 
 RID = "rv_20261008_test"
@@ -142,15 +142,16 @@ async def test_pr_head_moved_after_review_is_not_merged(harness: Harness) -> Non
 async def test_commit_overlay_receives_state_and_merge_sha() -> None:
     seen: dict[str, Any] = {}
 
-    async def commit_overlay(state: dict[str, Any], merge_sha: str) -> dict[str, Any]:
-        seen.update(merge_sha=merge_sha, ops=applied_ops(state))
-        return {"status": "committed", "commit_sha": "d" * 40, "reason": None}
+    async def commit_overlay(state: dict[str, Any]) -> dict[str, Any]:
+        seen.update(ref=state["spec_ref"]["commit"], ops=applied_ops(state))
+        return {"deploy_result": {"status": "committed", "commit_sha": "d" * 40, "reason": None}}
 
     h = Harness(commit_overlay=commit_overlay)
     await h.request(load_sample(SAMPLE_01))
     await _finish_ci(h)
 
-    assert seen == {"merge_sha": MERGE_SHA, "ops": []}
+    assert seen == {"ref": HEAD, "ops": []}
+    assert h.row()["merge_sha"] == MERGE_SHA  # 병합 SHA 는 merge_pr 이 DB 에
     assert (h.row()["status"], h.row()["gitops_commit_sha"]) == ("committed", "d" * 40)
 
 
@@ -164,7 +165,7 @@ async def test_05_fix_commits_to_pr_branch_and_rereviews(harness: Harness) -> No
     assert [r["verdict"] for r in row["rounds"]] == ["fix"]
     assert row["rounds"][0]["items"]  # 무엇을 왜 고쳤는지는 rounds 에 남는다
     [commit] = harness.github.commits
-    assert (commit["branch"], commit["blob_sha"]) == ("feature", f"blob-{HEAD[:7]}")
+    assert (commit["branch"], commit["parent"]) == ("feature", HEAD)
     committed = yaml.safe_load(commit["content"])
     assert committed["database"]["engine"] == "postgres"
     assert committed["secrets"] == load_sample(SAMPLE_05)["secrets"]  # 원본 값 그대로 (가린 값이 아님)
@@ -176,6 +177,8 @@ async def test_05_fix_commits_to_pr_branch_and_rereviews(harness: Harness) -> No
     assert row["superseded_by"] == msg.review_id
     new = harness.row(msg.review_id)
     assert (new["status"], new["pr_head_sha"], new["requested_by"]) == ("received", FIX_SHA, f"autofix:{RID}")
+    assert new["pr_number"] == 7  # 같은 PR 의 다음 커밋이 오면 이 검토도 superseded 대상
+    assert harness.github.prepared == {}  # 커밋을 만들고 → DB 에 넣고 → 브랜치를 옮겼다
 
     await harness.deliver_published()  # 수정 커밋을 다시 검토 — 이번엔 고칠 것이 없다
     assert (harness.row(msg.review_id)["status"], harness.row(msg.review_id)["verdict"]) == ("waiting_ci", "pass")
@@ -209,13 +212,16 @@ async def test_fork_pr_cannot_be_autofixed(harness: Harness) -> None:
     assert harness.github.commits == [] and harness.publisher.sent == []
 
 
-async def test_commit_conflict_fails(harness: Harness) -> None:
-    harness.github.put_error = GitHubError("deploy.yaml 커밋 실패 409", 409)
+async def test_branch_moved_before_fix_commit_fails(harness: Harness) -> None:
+    """수정 커밋을 만든 사이 사람이 푸시했다 — 브랜치를 못 옮기면 수정을 버리고 새 검토도 failed."""
+    harness.github.branch_error = RefConflict("feature 가 그사이 움직였다", 422)
     await harness.request(load_sample(SAMPLE_05))
 
-    assert harness.row()["status"] == "failed"
-    assert "409" in harness.row()["error"]
-    assert harness.publisher.sent == []
+    row = harness.row()
+    assert row["status"] == "failed" and "움직였다" in row["error"]
+    [new] = [r for r in harness.repo.reviews.values() if r["review_id"] != RID]
+    assert (new["status"], new["pr_head_sha"]) == ("failed", FIX_SHA)
+    assert harness.publisher.sent == [] and harness.github.commits == []
 
 
 # --- 샘플 04: baseline 이 있으면 needs_human, 사람 결정으로 재개 ----------------------------------
@@ -405,7 +411,7 @@ async def test_judge_transient_retries_then_llm_unavailable() -> None:
 
 
 async def test_graph_exception_marks_failed() -> None:
-    async def boom(state: dict[str, Any], merge_sha: str) -> dict[str, Any]:
+    async def boom(state: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("gitops push 실패")
 
     h = Harness(commit_overlay=boom)
@@ -414,3 +420,93 @@ async def test_graph_exception_marks_failed() -> None:
 
     assert h.row()["status"] == "failed"
     assert "gitops push 실패" in h.row()["error"]
+
+
+# --- commit_overlay 연결 (성진님 make_commit_overlay + GitClient) ------------------------------------
+
+class FakeGitClient:
+    """GitClient — 앱 레포는 FakeGitHub 파일, gitops 커밋은 메모리. 처음 fail_times 번은 TransientError."""
+
+    def __init__(self, github: Any, fail_times: int = 0) -> None:
+        self.github, self.fail_times = github, fail_times
+        self.commits: list[tuple[str, dict[str, str], str]] = []
+
+    async def read_file(self, repository: str, path: str, ref: str) -> str:
+        return self.github.files[ref]
+
+    async def commit_files(self, directory: str, files: Any, message: str) -> str:
+        if self.fail_times:
+            self.fail_times -= 1
+            raise TransientError("gitops ref 충돌")
+        self.commits.append((directory, dict(files), message))
+        return "e" * 40
+
+
+def _with_git(fail_times: int = 0) -> tuple[Harness, FakeGitClient]:
+    from review_worker.commit_overlay import make_commit_overlay
+
+    h = Harness()
+    git = FakeGitClient(h.github, fail_times)
+    h.deps.commit_overlay = make_commit_overlay(git)
+    return h, git
+
+
+async def test_merge_then_commit_overlay_committed() -> None:
+    h, git = _with_git()
+    await h.request(load_sample(SAMPLE_01))
+    await _finish_ci(h)
+
+    row = h.row()
+    assert (row["status"], row["gitops_commit_sha"], row["merge_sha"]) == ("committed", "e" * 40, MERGE_SHA)
+    [(directory, files, message)] = git.commits
+    assert directory == "apps/sample-app/overlays/aws"
+    assert set(files) == {"ingress.yaml", "kustomization.yaml"}
+    assert message.startswith("chore: sample-app aws overlay 갱신")
+
+
+async def test_commit_overlay_blocking_warning_is_blocked() -> None:
+    """검토는 통과(baseline 없는 04)했지만 overlay 로 관리형 DB 를 못 만든다 → 커밋하지 않고 blocked."""
+    h, git = _with_git()
+    await h.request(load_sample(SAMPLE_04))
+    await _finish_ci(h)
+
+    row = h.row()
+    assert (row["status"], row["gitops_commit_sha"]) == ("blocked", None)
+    assert "DB_PROVISIONING_REQUIRED" in row["deploy_result"]["reason"]
+    assert git.commits == []
+
+
+async def test_commit_overlay_retries_transient_error() -> None:
+    h, git = _with_git(fail_times=1)
+    await h.request(load_sample(SAMPLE_01))
+    await _finish_ci(h)
+
+    assert h.row()["status"] == "committed"
+    assert len(git.commits) == 1
+
+
+async def test_approval_after_ai_patch_round_commits_fix(harness: Harness) -> None:
+    """AI 가 한 번 고친 뒤 needs_human 이 됐는데 사람이 그대로 승인 — applied_ops 가 있으니 앱 레포에도 커밋한다."""
+    spec = load_sample(SAMPLE_05)
+    await harness.request(spec)  # 05: fix → 수정 커밋 → superseded. 같은 스레드를 needs_human 에 멈춘 상태로 다시 만든다
+    config = {"configurable": {"thread_id": "rv_paused"}}
+    rounds = (await _state(harness))["rounds"]
+    ref = {"repository": spec["metadata"]["repository"], "commit": HEAD, "path": "deploy.yaml"}
+    await harness.repo.insert_review(review_id="rv_paused", app="orders", target_env="local",
+                                     repo_id=ref["repository"], spec_ref=ref, pr_head_sha=HEAD, requested_by="t")
+    await harness.repo.update_review("rv_paused", status="needs_human")
+    harness.github.open_pr(ref["repository"], HEAD)
+    harness.github.commits.clear()
+    harness.publisher.sent.clear()
+    await harness.graph.aupdate_state(config, {
+        "review_id": "rv_paused", "target_env": "local", "spec_ref": ref, "deploy_spec": spec, "rounds": rounds,
+        "findings": [], "retrieved_docs": [], "patch": None, "retry_count": 1,
+        "decision": {"verdict": "needs_human", "reasons": ["LLM_UNAVAILABLE"], "items": [], "extra_opinions": [],
+                     "validation": {}, "llm": None},
+    }, as_node="await_human")
+    await harness.graph.ainvoke(None, config)  # wait_human 에서 멈춘다
+    await harness.human("rv_paused", "approved")
+
+    assert harness.row("rv_paused")["status"] == "superseded"
+    assert yaml.safe_load(harness.github.commits[0]["content"])["database"]["engine"] == "postgres"
+    assert ReviewRequested.model_validate_json(harness.publisher.sent[0][2]).autofix_commit
