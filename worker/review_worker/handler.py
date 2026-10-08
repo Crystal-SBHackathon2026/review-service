@@ -15,26 +15,12 @@ from pydantic import ValidationError
 from review_ai.graph import initial_state
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import ReviewRequested
-from review_common.repository import ReviewRepository
+from review_common.repository import ReviewRepository, baseline_for
 from review_common.resumed import TOPIC as RESUMED_TOPIC
 from review_common.resumed import CiCompletedResumed, parse_review_resumed
 from review_worker.graph import RECURSION_LIMIT
 
 log = logging.getLogger(__name__)
-
-
-def baseline_for(row: dict[str, Any] | None) -> dict[str, Any] | None:
-    """업무 DB baselines 행 → deploy_spec['baseline'] (review_ai Baseline 모양)."""
-    if row is None:
-        return None
-    ref = row["merge_sha"] or (row.get("spec_ref") or {}).get("commit") or f"{row['app']}/{row['target_env']}"
-    observed = row.get("observed_at")
-    return {
-        "spec_ref": ref,
-        "spec": row["spec"],
-        "facts": {"database_has_data": row.get("database_has_data"),
-                  "observed_at": observed.isoformat() if observed else None},
-    }
 
 
 class ReviewHandler:

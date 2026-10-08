@@ -47,10 +47,12 @@ docker compose --profile app up -d --build
 | `DB_HOST` `DB_PORT` `DB_NAME` `DB_USERNAME` `DB_PASSWORD` | API·워커 | 업무 DB. 클러스터에서는 계정을 `review-db-credentials` Secret 에서 |
 | `DB_SSLMODE` | API·워커 | 기본 `prefer`. RDS 는 `require` |
 | `KAFKA_BOOTSTRAP` | API·워커 | MSK PLAINTEXT bootstrap (Terraform `infra/msk` output `bootstrap_brokers`) |
-| `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기. 워커는 CI 상태 조회·AI 수정 커밋·PR 병합·gitops overlay 커밋이라 앱 레포·gitops Contents·Pull requests **쓰기** 권한이 필요하다 (`oneaction/gitops-token`) |
+| `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기와 명세 생성 커밋(PR 브랜치 Contents 쓰기)·PR 커밋 상태(**Commit statuses 쓰기**, 없으면 표시만 빠진다). 워커는 CI 상태 조회·AI 수정 커밋·PR 병합·gitops overlay 커밋이라 앱 레포·gitops Contents·Pull requests **쓰기** 권한이 필요하다 (`oneaction/gitops-token`) |
 | `GITOPS_REPO` | 워커 | overlay 를 커밋할 gitops 레포. 기본 `Crystal-SBHackathon2026/gitops` |
 | `GITHUB_WEBHOOK_SECRET` | API | `/webhooks/github` HMAC 검증. 없으면 웹훅을 503 으로 거절 |
 | `GITHUB_CI_APP_SLUG` | API·워커 | 이 GitHub App 의 `check_suite` 만 CI 결과로 본다. 기본 `github-actions`, 빈 값이면 전부 |
+| `DEFAULT_TARGET` | API | baseline 이 없는 레포에 명세를 만들 대상 `env/region` (예 `aws/ap-northeast-2`). 없으면 그런 레포는 `NO_TARGET` |
+| `REVIEW_API_PUBLIC_URL` | API | PR 커밋 상태의 링크(`/intakes/{id}`) 앞부분. 없으면 링크 없이 표시 |
 | `ARGOCD_WEBHOOK_TOKEN` | API | 있으면 `/webhooks/argocd` 가 `Authorization: Bearer <토큰>` 을 확인한다 |
 | `ANTHROPIC_API_KEY` `REVIEW_LLM_MODEL` | 워커 | judge LLM. 키가 없으면 판단이 필요한 검토는 `LLM_UNAVAILABLE` 로 사람에게 간다 |
 
@@ -58,9 +60,23 @@ docker compose --profile app up -d --build
 
 - **GitHub 조직 웹훅** → `POST /webhooks/github` (이벤트: `pull_request`, `check_suite`)
   - `pull_request` `opened`·`synchronize`·`reopened`, base 가 기본 브랜치인 PR 만 → head SHA 의 `deploy.yaml` 검토
-  - `deploy.yaml` 이 없으면 `{"skipped": "no deploy.yaml"}`, 같은 레포·head SHA 검토가 있으면 `{"skipped": "already reviewed"}`
+  - `deploy.yaml` 이 없거나 비었거나 형식이 깨졌으면 검토 대신 **intake**(아래), 같은 레포·head SHA 검토가 있으면 `{"skipped": "already reviewed"}`
   - 새 검토를 만들면 그 PR 의 끝나지 않은 검토(`received`·`reviewing`·`needs_human`·`waiting_ci`)는 `superseded`
-- `POST /reviews` — 직접 요청 (PR 번호를 모르므로 superseded 대상이 아니다)
+- `POST /reviews` — 직접 요청 (PR 번호를 모르므로 superseded 대상이 아니다). 파일 없음 404, 빈 파일·형식 오류 422 — intake 를 만들지 않는다
+
+### 명세 없음·빈 명세·형식 오류 (`spec_intakes`, `api/review_api/intake.py`)
+
+웹훅은 `spec_intakes` 에 `processing` 행만 넣고 202 를 돌려준다(GitHub 웹훅 10초 제한). 처리는 응답 뒤에 한다.
+
+| 종류(`kind`) | 처리 | 결과(`status`·`reason`) |
+|---|---|---|
+| `missing`·`empty` | 그 레포의 최근 baseline(없으면 `DEFAULT_TARGET`)으로 `review_ai.intake.prepare_intake` → PR 브랜치에 `deploy.yaml` 커밋 → synchronize 웹훅이 그 커밋을 **일반 검토**로 시작(`autofix_commit` 아님), `review_id` 로 연결 | `generated`·`GENERATED` |
+| `missing`·`empty` (새 앱, 확인 안 된 값 남음) | 추정값은 자동 병합·배포로 이어질 수 있어 커밋하지 않는다. 레포 분석이 붙으면 줄어든다 | `rejected`·`UNVERIFIED` |
+| `yaml_error`·`schema_error` | 기본값으로 덮지 않는다. 자동 복구(LLM)는 아직 없다. 오류는 줄·칸·경로만 남긴다(원문 조각 없음) | `rejected`·`REPAIR_UNAVAILABLE` |
+
+- 그 밖의 거절: 포크 PR(`FORK_PR`), 대상 환경 모름(`NO_TARGET`), 처리 중 새 커밋(`BRANCH_MOVED`), 생성 커밋이 다시 intake 대상(`LOOP_GUARD` — 웹훅·커밋 무한 반복 방지), GitHub 오류(`failed`·`ERROR`)
+- PR 표시: 커밋 상태 `review-service/intake` (pending → success·failure·error). 링크는 `GET /intakes/{id}`. `GET /verify?sha=` 는 검토가 없으면 `intake_failed`·`intake_processing`·`intake_generated` 를 돌려준다(`passed: false`)
+- 처리 중 파드가 죽으면 2분 넘은 `processing` 행을 API 가 1분마다 다시 처리한다. 커밋 SHA 는 브랜치를 옮기기 전에 행에 남겨 같은 커밋으로 마저 끝낸다
 
 ## 상태 흐름 (`reviews.status`)
 

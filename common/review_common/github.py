@@ -1,4 +1,4 @@
-"""GitHub REST — Review API 는 deploy.yaml 을 읽고, 워커는 CI 상태 확인·AI 수정 커밋·PR 병합·gitops 커밋을 한다.
+"""GitHub REST — Review API 는 deploy.yaml 을 읽고 명세 생성 커밋·PR 커밋 상태를 쓰고, 워커는 CI 상태 확인·AI 수정 커밋·PR 병합·gitops 커밋을 한다.
 
 GITHUB_TOKEN 이 없으면 미인증(시간당 60회). 워커는 앱 레포·gitops 레포 Contents·Pull requests 쓰기 권한이 있는
 토큰(oneaction/gitops-token)을 쓴다.
@@ -106,6 +106,17 @@ class GitHubClient:
                 "application/json") else ""
             raise GitHubError(f"PR #{number} 병합 실패 {resp.status_code} {message}".strip(), resp.status_code)
         return resp.json()["sha"]
+
+    async def create_commit_status(self, repository: str, sha: str, *, state: str, context: str, description: str,
+                                   target_url: str | None = None) -> None:
+        """POST /repos/{owner}/{repo}/statuses/{sha} — PR 의 검사 목록에 한 줄. 토큰에 Commit statuses 쓰기 권한 필요.
+
+        state: pending·success·failure·error. description 은 GitHub 이 140자에서 자른다.
+        """
+        body: dict[str, Any] = {"state": state, "context": context, "description": description[:140]}
+        if target_url:
+            body["target_url"] = target_url
+        await self._json("POST", f"/repos/{repository}/statuses/{sha}", "커밋 상태 기록", ok=(201,), json=body)
 
     # --- Git Data API ------------------------------------------------------------------------------
 

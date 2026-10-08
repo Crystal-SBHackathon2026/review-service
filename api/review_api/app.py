@@ -2,9 +2,11 @@
 
     POST /reviews                       deploy.yaml 검토 요청 → 202 {review_id}
     GET  /reviews/{review_id}           상태·verdict·사유·rounds·deploy_result
-    GET  /verify?sha=<PR head SHA>      그 SHA 의 검토가 통과했는지 (CI 용)
+    GET  /verify?sha=<PR head SHA>      그 SHA 의 검토가 통과했는지 (CI 용). 명세가 없거나 깨진 SHA 는 intake 상태
+    GET  /intakes/{intake_id}           명세 없음·빈 명세·형식 오류 처리 기록 (PR 커밋 상태의 링크)
     POST /reviews/{review_id}/decision  needs_human 검토에 사람 결정 → review.resumed(human_decision)
     POST /webhooks/github               pull_request opened·synchronize·reopened → 검토 시작
+                                        (deploy.yaml 없음·빈 파일·형식 오류 → spec_intakes, review_api.intake)
                                         check_suite completed → review.resumed(ci_completed)
     POST /webhooks/argocd               배포 Healthy·Degraded 기록, Healthy 면 baselines 갱신
     GET  /healthz
@@ -12,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -22,16 +25,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-import yaml
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
 
 from review_ai.graph import check_edited_ops
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.recommendations import resolve_human_decision
-from review_ai.spec.deploy_spec import REPOSITORY, DeploySpec
+from review_ai.spec.deploy_spec import REPOSITORY
 from review_api.argocd import ArgoCdEvent
+from review_api.intake import IntakeGitHub, SpecProblem, load_spec, open_intake, process_intake, sweep_stale_intakes
 from review_common.github import GitHubError, SpecNotFound
 from review_common.ids import new_review_id
 from review_common.repository import ReviewRepository
@@ -41,6 +44,7 @@ from review_common.resumed import CiCompletedResumed, CiResult, HumanDecisionMod
 log = logging.getLogger(__name__)
 
 PASSED_STATUSES = frozenset({"waiting_ci", "merging", "committed"})  # 검토를 통과(사람 승인 포함)한 뒤의 상태
+INTAKE_FAILED = frozenset({"rejected", "failed"})
 
 
 class SpecSource(Protocol):
@@ -59,6 +63,9 @@ class ApiDeps:
     github_webhook_secret: str | None = None
     argocd_webhook_token: str | None = None
     ci_app_slug: str | None = "github-actions"  # 이 GitHub App 의 check_suite 만 CI 결과로 본다. None 이면 전부
+    github: IntakeGitHub | None = None  # 명세 생성 커밋·PR 커밋 상태. None 이면 intake 는 기록만 하고 거절
+    default_target: str | None = None   # "aws/ap-northeast-2" — baseline 없는 레포의 명세를 만들 대상
+    public_url: str | None = None       # PR 커밋 상태 링크(/intakes/{id})의 앞부분
 
 
 class SpecRefIn(BaseModel):
@@ -74,10 +81,6 @@ class ReviewIn(BaseModel):
 
     spec_ref: SpecRefIn
     requested_by: str = Field(min_length=1)
-
-
-def _errors(exc: ValidationError) -> list[dict[str, Any]]:
-    return json.loads(exc.json(include_url=False, include_input=False))
 
 
 def create_app(deps: ApiDeps | None = None) -> FastAPI:
@@ -115,9 +118,23 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
     async def verify(request: Request, sha: str = Query(min_length=7)) -> dict[str, Any]:
         row = await d(request).repo.latest_by_head_sha(sha)
         if row is None:
-            raise HTTPException(404, f"{sha} 에 대한 검토가 없다")
+            intake = await d(request).repo.latest_intake_by_head_sha(sha)
+            if intake is None:
+                raise HTTPException(404, f"{sha} 에 대한 검토가 없다")
+            status = "intake_failed" if intake["status"] in INTAKE_FAILED else f"intake_{intake['status']}"
+            return {"sha": sha, "intake_id": intake["intake_id"], "passed": False, "status": status,
+                    "verdict": None, "reasons": [intake["reason"]] if intake["reason"] else []}
         return {"sha": sha, "review_id": row["review_id"], "passed": row["status"] in PASSED_STATUSES,
                 "status": row["status"], "verdict": row["verdict"], "reasons": row["reasons"] or []}
+
+    @app.get("/intakes/{intake_id}")
+    async def get_intake(intake_id: str, request: Request) -> dict[str, Any]:
+        row = await d(request).repo.get_intake(intake_id)
+        if row is None:
+            raise HTTPException(404, "intake 가 없다")
+        keys = ("intake_id", "repository", "pr_number", "head_sha", "path", "kind", "errors", "status", "reason",
+                "message", "details", "result_commit_sha", "review_id", "requested_by", "created_at", "updated_at")
+        return {k: row.get(k) for k in keys}
 
     @app.post("/reviews/{review_id}/decision", status_code=202)
     async def decide(review_id: str, body: HumanDecisionModel, request: Request) -> dict[str, str]:
@@ -144,6 +161,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
     @app.post("/webhooks/github", status_code=202)
     async def github_webhook(
         request: Request,
+        background: BackgroundTasks,
         x_github_event: str = Header(default=""),
         x_hub_signature_256: str = Header(default=""),
     ) -> dict[str, Any]:
@@ -156,7 +174,10 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             raise HTTPException(401, "서명이 맞지 않다")
         payload = json.loads(body)
         if x_github_event == "pull_request":
-            return await on_pull_request(deps_, payload)
+            result = await on_pull_request(deps_, payload)
+            if "kind" in result:  # 새 intake — 생성·커밋은 응답 뒤에 (웹훅 10초 제한)
+                background.add_task(process_intake, deps_, result["intake_id"])
+            return result
         if x_github_event != "check_suite":
             return {"ignored": f"event {x_github_event}"}
         if payload.get("action") != "completed":
@@ -199,28 +220,30 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
     return app
 
 
-async def start_review(deps: ApiDeps, spec_ref: dict[str, str], requested_by: str, *,
-                       pr_number: int | None = None) -> str:
-    """deploy.yaml 읽기 → 형식 검사(422) → review_id 발급 → DB received → review.requested 발행. review_id 반환.
-
-    파일이 없으면 SpecNotFound 를 그대로 올린다 (POST /reviews 는 404, pull_request 웹훅은 skip).
-    """
-    repository, path, commit = spec_ref["repository"], spec_ref["path"], spec_ref["commit"]
+async def fetch_spec(deps: ApiDeps, spec_ref: dict[str, str]) -> dict[str, Any]:
+    """그 커밋의 deploy.yaml → 형식 검사를 통과한 명세. 없으면 SpecNotFound, 비었거나 깨졌으면 SpecProblem."""
     try:
-        raw = await deps.specs.get_file(repository, path, commit)
+        raw = await deps.specs.get_file(spec_ref["repository"], spec_ref["path"], spec_ref["commit"])
     except SpecNotFound:
         raise
     except GitHubError as exc:
         raise HTTPException(502, str(exc)) from exc
-    try:
-        loaded = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
-        raise HTTPException(422, {"message": f"{path} YAML 파싱 실패", "errors": str(exc)}) from exc
-    try:
-        DeploySpec.model_validate(loaded)
-    except ValidationError as exc:
-        raise HTTPException(422, {"message": "deploy_spec 형식 오류", "errors": _errors(exc)}) from exc
+    return load_spec(raw, spec_ref["path"])
 
+
+async def start_review(deps: ApiDeps, spec_ref: dict[str, str], requested_by: str) -> str:
+    """POST /reviews — 파일이 없으면 SpecNotFound(404), 비었거나 깨졌으면 422."""
+    try:
+        loaded = await fetch_spec(deps, spec_ref)
+    except SpecProblem as exc:
+        raise HTTPException(422, {"message": exc.message, "errors": exc.errors}) from exc
+    return await submit_review(deps, loaded, spec_ref, requested_by)
+
+
+async def submit_review(deps: ApiDeps, loaded: dict[str, Any], spec_ref: dict[str, str], requested_by: str, *,
+                        pr_number: int | None = None) -> str:
+    """review_id 발급 → DB received → review.requested 발행. review_id 반환."""
+    commit = spec_ref["commit"]
     review_id = new_review_id()
     message = build_review_requested(loaded, review_id=review_id, spec_ref=spec_ref, requested_by=requested_by,
                                      requested_at=datetime.now(UTC))
@@ -245,6 +268,8 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
     - 같은 레포·같은 head SHA 검토가 이미 있으면 새로 만들지 않는다. 워커 commit_fix 가 PR 브랜치에 커밋하면
       synchronize 가 다시 오는데, 워커가 브랜치를 옮기기 전에 autofix_commit 검토를 DB 에 넣어 둔다
     - 새 검토를 만들면 그 PR 의 끝나지 않은 이전 검토는 superseded 로 넘긴다
+    - deploy.yaml 이 없거나 비었거나 깨졌으면 검토 대신 intake 를 연다 (review_api.intake). 처리는 응답 뒤
+    - intake 가 만든 생성 커밋에 온 웹훅이면 새 검토를 그 intake 에 잇는다
     """
     action = payload.get("action")
     if action not in PR_ACTIONS:
@@ -256,13 +281,24 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
     existing = await deps.repo.find_by_head(repository, head_sha)
     if existing is not None:
         return {"skipped": "already reviewed", "review_id": existing["review_id"]}
+    taken = await deps.repo.find_intake_by_head(repository, head_sha)
+    if taken is not None:
+        return {"skipped": "already taken", "intake_id": taken["intake_id"]}
     spec_ref = {"repository": repository, "commit": head_sha, "path": "deploy.yaml"}
     try:
-        review_id = await start_review(deps, spec_ref, payload["sender"]["login"], pr_number=number)
+        loaded = await fetch_spec(deps, spec_ref)
     except SpecNotFound:
-        return {"skipped": "no deploy.yaml"}
+        return await open_intake(deps, payload, SpecProblem("missing", "deploy.yaml 이 없다"), spec_ref["path"])
+    except SpecProblem as problem:
+        return await open_intake(deps, payload, problem, spec_ref["path"])
+    review_id = await submit_review(deps, loaded, spec_ref, payload["sender"]["login"], pr_number=number)
     superseded = await deps.repo.supersede_open(repository=repository, pr_number=number, superseded_by=review_id)
-    return {"review_id": review_id, "superseded": superseded}
+    result: dict[str, Any] = {"review_id": review_id, "superseded": superseded}
+    source = await deps.repo.find_intake_by_result_commit(repository, head_sha)
+    if source is not None:
+        await deps.repo.link_intake(source["intake_id"], review_id=review_id)
+        result["from_intake"] = source["intake_id"]
+    return result
 
 
 @asynccontextmanager
@@ -295,10 +331,15 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
         github_webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET"),
         argocd_webhook_token=os.environ.get("ARGOCD_WEBHOOK_TOKEN") or None,
         ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None,
+        github=github,
+        default_target=os.environ.get("DEFAULT_TARGET") or None,
+        public_url=os.environ.get("REVIEW_API_PUBLIC_URL") or None,
     )
+    sweep = asyncio.create_task(sweep_stale_intakes(app.state.deps))
     try:
         yield
     finally:
+        sweep.cancel()
         await producer.stop()
         await github.aclose()
         await pool.close()
