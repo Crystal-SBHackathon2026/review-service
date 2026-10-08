@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 
-CATALOG_DIR = Path(__file__).resolve().parent.parent / "catalog"
+from review_ai.resources import data_dir
+
+CATALOG_DIR = data_dir("catalog")
 
 
 @dataclass(frozen=True)

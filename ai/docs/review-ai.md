@@ -8,6 +8,18 @@ static_check → retrieve_evidence → judge ─┬─ pass / needs_human → �
      ▲                                     └─ fix → apply_patch ─┘ (최대 2회)
 ```
 
+## 설치
+
+워커·Review API 는 `review_ai` 를 패키지로 설치해 import 한다. State 는 `review_ai.state.ReviewState` 하나만 쓴다.
+
+```bash
+pip install -e ./ai               # 개발 — 소스의 catalog/·knowledge/ 를 그대로 읽는다
+pip install "./ai[qdrant]"        # 이미지 빌드 — catalog/·knowledge/ 를 패키지 안(review_ai/_data/)에 복사한다
+```
+
+- Python 3.13 이상. 기본 의존성은 pydantic·pyyaml·langgraph·anthropic 이고, `QdrantRetriever` 를 쓸 때만 `[qdrant]`(qdrant-client·fastembed)가 필요하다.
+- 연결 흐름 전체(메시지 → Kafka 왕복 → 그래프 → `applied_ops` → 렌더링)는 `tests/test_pipeline_flow.py` 가 샘플 10개로 고정한다. 워커를 붙일 때 이 테스트를 본보기로 쓰면 된다.
+
 ## 연결 지점
 
 | 쓰는 곳 | 가져다 쓸 것 | 비고 |
@@ -109,7 +121,7 @@ ANTHROPIC_API_KEY=... .venv/bin/python scripts/run_eval.py --llm claude --repeat
 ## 개발
 
 ```bash
-cd ai && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cd ai && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # = pip install -e .[dev]
 .venv/bin/pytest -q --cov=review_ai
 .venv/bin/python scripts/validate_samples.py
 ```
