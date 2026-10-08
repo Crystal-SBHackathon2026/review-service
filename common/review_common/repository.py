@@ -134,8 +134,10 @@ class ReviewRepository(Protocol):
         """만든 커밋·그 커밋의 검토를 잇는다. None 인 값은 그대로 둔다."""
         ...
 
-    async def stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
-        """older_than 보다 오래 processing 인 행 — 처리 중 파드가 죽은 것."""
+    async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
+        """older_than 보다 오래 processing 인 행(처리 중 파드가 죽은 것)을 가져가며 updated_at 을 새로 찍는다.
+
+        API 가 여러 개여도 한 행은 한 곳만 가져간다."""
         ...
 
 
@@ -294,10 +296,11 @@ class PostgresReviewRepository:
             " review_id = COALESCE(%s, review_id), updated_at = now() WHERE intake_id = %s",
             (result_commit_sha, review_id, intake_id))
 
-    async def stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
-        return await self._fetchall(
-            "SELECT * FROM spec_intakes WHERE status = 'processing' AND updated_at < now() - %s"
-            " ORDER BY created_at", (older_than,))
+    async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
+        rows = await self._fetchall(
+            "UPDATE spec_intakes SET updated_at = now() WHERE status = 'processing' AND updated_at < now() - %s"
+            " RETURNING *", (older_than,))
+        return sorted(rows, key=lambda r: r["created_at"])
 
 
 class InMemoryReviewRepository:
@@ -441,9 +444,11 @@ class InMemoryReviewRepository:
         links = {"result_commit_sha": result_commit_sha, "review_id": review_id}
         row.update({k: v for k, v in links.items() if v is not None}, updated_at=_now())
 
-    async def stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
-        cutoff = _now() - older_than
-        rows = [r for r in self.intakes.values() if r["status"] == "processing" and r["updated_at"] < cutoff]
+    async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
+        now = _now()
+        rows = [r for r in self.intakes.values() if r["status"] == "processing" and r["updated_at"] < now - older_than]
+        for r in rows:
+            r["updated_at"] = now
         return copy.deepcopy(sorted(rows, key=lambda r: r["created_at"]))
 
 

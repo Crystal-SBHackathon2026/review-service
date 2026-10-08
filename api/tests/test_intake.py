@@ -53,7 +53,8 @@ class FakeGitHub:
 
 
 class IntakeEnv:
-    def __init__(self, *, default_target: str | None = "aws/ap-northeast-2") -> None:
+    def __init__(self, *, default_target: str | None = "aws/ap-northeast-2",
+                 intake_repositories: frozenset[str] = frozenset({REPO})) -> None:
         from review_common.repository import InMemoryReviewRepository
 
         self.repo = InMemoryReviewRepository()
@@ -62,7 +63,8 @@ class IntakeEnv:
         self.github = FakeGitHub()
         self.client = TestClient(create_app(ApiDeps(
             repo=self.repo, specs=self.specs, publisher=self.publisher, github_webhook_secret=SECRET,
-            github=self.github, default_target=default_target, public_url="https://review.example/")))
+            github=self.github, default_target=default_target, public_url="https://review.example/",
+            intake_repositories=intake_repositories)))
 
     def put(self, text: str, sha: str = HEAD) -> None:
         self.specs.files[(REPO, "deploy.yaml", sha)] = text
@@ -125,6 +127,34 @@ async def test_generated_commit_is_reviewed_and_linked(ienv: IntakeEnv) -> None:
     assert ienv.repo.reviews[body["review_id"]]["pr_head_sha"] == commit
     [(topic, _, _)] = ienv.publisher.sent
     assert topic == "review.requested"
+
+
+# --- 배포 대상이 아닌 레포 ---------------------------------------------------------------------------
+
+def test_missing_spec_in_unknown_repo_is_skipped_quietly() -> None:
+    """조직 웹훅이라 gitops·인프라 레포 PR 도 온다 — baseline 도 목록도 없는 레포는 예전처럼 skip, 상태 표시도 없다."""
+    env = IntakeEnv(intake_repositories=frozenset())
+    resp = send_pr(env, pr_event("opened"))
+
+    assert (resp.status_code, resp.json()) == (202, {"skipped": "no deploy.yaml"})
+    assert env.repo.intakes == {} and env.github.statuses == [] and env.publisher.sent == []
+
+
+async def test_missing_spec_in_deployed_repo_opens_intake_without_list() -> None:
+    env = IntakeEnv(intake_repositories=frozenset())
+    await env.approve_baseline()
+    send_pr(env, pr_event("opened"))
+
+    assert env.only_intake()["status"] == "generated"
+
+
+def test_broken_spec_in_unknown_repo_still_opens_intake() -> None:
+    """파일이 있으면 배포하려는 레포다 — 비었거나 깨진 것은 알려 준다."""
+    env = IntakeEnv(intake_repositories=frozenset())
+    env.put("a: [unclosed")
+    send_pr(env, pr_event("opened"))
+
+    assert (env.only_intake()["kind"], env.only_intake()["status"]) == ("yaml_error", "rejected")
 
 
 # --- 거절 -----------------------------------------------------------------------------------------

@@ -1,5 +1,8 @@
 """deploy.yaml 이 없거나 비었거나 형식이 깨진 PR — spec_intakes 에 남기고, 생성 커밋을 올리거나 PR 에 실패를 표시한다.
 
+    웹훅은 GitHub 조직 단위라 gitops·인프라 레포 PR 도 온다 → deploy.yaml 이 '없는' PR 은 배포 대상 레포
+    (baseline 이 있거나 INTAKE_REPOSITORIES 에 있는 레포)만 intake 로 연다. 나머지는 예전처럼 skip.
+    파일은 있는데 비었거나 깨졌으면 배포하려는 레포로 보고 연다.
     pull_request 웹훅 → open_intake: processing 행만 만들고 202. 처리는 process_intake (BackgroundTasks).
         GitHub 웹훅은 10초 안에 응답해야 한다 — 복구(LLM)가 붙으면 넘을 수 있어 웹훅 안에서 하지 않는다.
     process_intake
@@ -86,6 +89,13 @@ def load_spec(raw: str, path: str) -> dict[str, Any]:
     return loaded
 
 
+async def expects_spec(deps: ApiDeps, repository: str) -> bool:
+    """deploy.yaml 이 있어야 하는 레포인가 — 배포된 적이 있거나(baseline) 명시한 레포."""
+    if repository in deps.intake_repositories:
+        return True
+    return await deps.repo.latest_baseline_for_repository(repository) is not None
+
+
 async def open_intake(deps: ApiDeps, payload: dict[str, Any], problem: SpecProblem, path: str) -> dict[str, Any]:
     pr, repo = payload["pull_request"], payload["repository"]
     repository, head_sha = repo["full_name"], pr["head"]["sha"]
@@ -140,7 +150,9 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
     try:
         await deps.github.update_branch(repository, row["head_ref"], commit)
     except RefConflict:
-        return _done("rejected", "BRANCH_MOVED", "그사이 PR 에 새 커밋이 올라왔다 — 새 커밋에서 다시 판단한다")
+        # GitHub 은 브랜치 보호로 막혀도 422 를 준다 — 둘 다 이 커밋에서는 더 할 게 없다
+        return _done("rejected", "BRANCH_MOVED",
+                     "PR 브랜치를 옮기지 못했다(그사이 새 커밋 또는 브랜치 보호) — 새 커밋이 오면 다시 판단한다")
     return _done("generated", outcome.reason, outcome.message, outcome.details, result_commit_sha=commit)
 
 
@@ -175,7 +187,7 @@ async def _post_status(deps: ApiDeps, row: dict[str, Any], state: str, descripti
 
 async def resume_stale_intakes(deps: ApiDeps) -> list[str]:
     """처리 중 파드가 죽어 STALE_AFTER 넘게 processing 으로 남은 행을 다시 처리한다. 다시 처리한 intake_id 들."""
-    rows = await deps.repo.stale_intakes(STALE_AFTER)
+    rows = await deps.repo.claim_stale_intakes(STALE_AFTER)
     for row in rows:
         await process_intake(deps, row["intake_id"])
     return [row["intake_id"] for row in rows]

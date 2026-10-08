@@ -34,7 +34,8 @@ from review_ai.messages import build_review_requested
 from review_ai.recommendations import resolve_human_decision
 from review_ai.spec.deploy_spec import REPOSITORY
 from review_api.argocd import ArgoCdEvent
-from review_api.intake import IntakeGitHub, SpecProblem, load_spec, open_intake, process_intake, sweep_stale_intakes
+from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spec, open_intake, process_intake,
+                               sweep_stale_intakes)
 from review_common.github import GitHubError, SpecNotFound
 from review_common.ids import new_review_id
 from review_common.repository import ReviewRepository
@@ -66,6 +67,7 @@ class ApiDeps:
     github: IntakeGitHub | None = None  # 명세 생성 커밋·PR 커밋 상태. None 이면 intake 는 기록만 하고 거절
     default_target: str | None = None   # "aws/ap-northeast-2" — baseline 없는 레포의 명세를 만들 대상
     public_url: str | None = None       # PR 커밋 상태 링크(/intakes/{id})의 앞부분
+    intake_repositories: frozenset[str] = frozenset()  # baseline 이 없어도 deploy.yaml 없음을 intake 로 볼 레포
 
 
 class SpecRefIn(BaseModel):
@@ -288,6 +290,8 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
     try:
         loaded = await fetch_spec(deps, spec_ref)
     except SpecNotFound:
+        if not await expects_spec(deps, repository):  # 조직 웹훅 — 배포 대상이 아닌 레포의 PR
+            return {"skipped": "no deploy.yaml"}
         return await open_intake(deps, payload, SpecProblem("missing", "deploy.yaml 이 없다"), spec_ref["path"])
     except SpecProblem as problem:
         return await open_intake(deps, payload, problem, spec_ref["path"])
@@ -334,6 +338,8 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
         github=github,
         default_target=os.environ.get("DEFAULT_TARGET") or None,
         public_url=os.environ.get("REVIEW_API_PUBLIC_URL") or None,
+        intake_repositories=frozenset(r.strip() for r in os.environ.get("INTAKE_REPOSITORIES", "").split(",")
+                                      if r.strip()),
     )
     sweep = asyncio.create_task(sweep_stale_intakes(app.state.deps))
     try:

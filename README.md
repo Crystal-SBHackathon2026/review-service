@@ -52,6 +52,7 @@ docker compose --profile app up -d --build
 | `GITHUB_WEBHOOK_SECRET` | API | `/webhooks/github` HMAC 검증. 없으면 웹훅을 503 으로 거절 |
 | `GITHUB_CI_APP_SLUG` | API·워커 | 이 GitHub App 의 `check_suite` 만 CI 결과로 본다. 기본 `github-actions`, 빈 값이면 전부 |
 | `DEFAULT_TARGET` | API | baseline 이 없는 레포에 명세를 만들 대상 `env/region` (예 `aws/ap-northeast-2`). 없으면 그런 레포는 `NO_TARGET` |
+| `INTAKE_REPOSITORIES` | API | `owner/repo,…` — baseline 이 없어도 `deploy.yaml` 없음을 intake 로 볼 레포(새 앱). 웹훅이 조직 단위라 목록·baseline 에 없는 레포는 예전처럼 skip |
 | `REVIEW_API_PUBLIC_URL` | API | PR 커밋 상태의 링크(`/intakes/{id}`) 앞부분. 없으면 링크 없이 표시 |
 | `ARGOCD_WEBHOOK_TOKEN` | API | 있으면 `/webhooks/argocd` 가 `Authorization: Bearer <토큰>` 을 확인한다 |
 | `ANTHROPIC_API_KEY` `REVIEW_LLM_MODEL` | 워커 | judge LLM. 키가 없으면 판단이 필요한 검토는 `LLM_UNAVAILABLE` 로 사람에게 간다 |
@@ -67,6 +68,7 @@ docker compose --profile app up -d --build
 ### 명세 없음·빈 명세·형식 오류 (`spec_intakes`, `api/review_api/intake.py`)
 
 웹훅은 `spec_intakes` 에 `processing` 행만 넣고 202 를 돌려준다(GitHub 웹훅 10초 제한). 처리는 응답 뒤에 한다.
+조직 웹훅이라 gitops·인프라 레포 PR 도 오므로, **파일이 없는** PR 은 배포된 적 있는 레포(baseline)나 `INTAKE_REPOSITORIES` 에 있는 레포만 intake 로 연다. 파일이 있는데 비었거나 깨졌으면 레포와 무관하게 연다.
 
 | 종류(`kind`) | 처리 | 결과(`status`·`reason`) |
 |---|---|---|

@@ -174,7 +174,9 @@ async def test_spec_intakes_on_postgres(pool: Any) -> None:
     assert not await repo.insert_intake(**{**intake, "intake_id": "in_dup"})
     assert (await repo.find_intake_by_head(REPO, HEAD))["intake_id"] == "in_1"
     assert (await repo.latest_intake_by_head_sha(HEAD))["status"] == "processing"
-    assert await repo.stale_intakes(timedelta(0)) and not await repo.stale_intakes(timedelta(minutes=5))
+    assert not await repo.claim_stale_intakes(timedelta(minutes=5))
+    assert [r["intake_id"] for r in await repo.claim_stale_intakes(timedelta(0))] == ["in_1"]
+    assert not await repo.claim_stale_intakes(timedelta(seconds=30))  # 방금 가져간 행은 다른 곳이 못 가져간다
 
     await repo.link_intake("in_1", result_commit_sha="b" * 40)
     assert (await repo.find_intake_by_result_commit(REPO, "b" * 40))["intake_id"] == "in_1"
