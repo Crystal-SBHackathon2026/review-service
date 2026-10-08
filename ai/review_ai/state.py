@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import operator
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 Category = Literal["database", "secret", "network", "storage", "runtime"]
 Severity = Literal["high", "medium", "low"]
@@ -64,6 +64,7 @@ class Decision(TypedDict):
     extra_opinions: list[str]  # findings 밖 LLM 의견. verdict 에 영향 없음
     validation: dict[str, bool]  # {schema_ok, citations_ok, patch_scope_ok}
     llm: dict[str, Any] | None  # {model, prompt_version, usage, input_hash}
+    recommendations: NotRequired[list[dict[str, Any]]]  # {finding_ids, source, why, ops}; 미입력 보충용
 
 
 class PatchOp(TypedDict, total=False):
@@ -93,8 +94,10 @@ class HumanDecision(TypedDict):
     decision: Literal["approved", "rejected"]
     approver: str
     # 사람이 고친 ops. 원본이 아니라 State 의 현재 deploy_spec(AI 가 이미 고친 회차가 반영된 명세) 기준이다.
-    # 비어 있으면 고친 것 없이 승인
+    # 미입력은 decision.recommendations로 보충. 기존 명세 그대로 승인하려면 use_recommendations=False
     edited_ops: list[PatchOp]
+    use_recommendations: NotRequired[bool]  # 기본 True. False = 기존 명세 그대로 승인
+    defaulted_ops: NotRequired[list[PatchOp]]  # 서버가 실제 보충한 권장값, 회차 기록용
 
 
 class ReviewState(TypedDict, total=False):

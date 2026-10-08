@@ -4,8 +4,9 @@
            └─ apply_human_edits ──▶ ▲                                        └─ fix → apply_patch ─┘(재검사)
               (승인 + edited_ops)
 
-needs_human 뒤 재개는 멈춘 State 에 human_decision 을 넣어 다시 돌린다. 승인 + edited_ops 일 때만 이 그래프를 다시 타고,
-승인만이면 commit_overlay, 거절이면 status=rejected — 둘 다 파이프라인 몫이라 여기엔 없다.
+needs_human 뒤 재개는 멈춘 State 에 human_decision 을 넣어 다시 돌린다. 승인 뒤 사용자 입력과 미입력 권장값을 합쳐 재검사한다.
+use_recommendations=False 이거나 입력·권장값이 둘 다 없으면 그대로 승인(승인만 처리)이고,
+거절이면 status=rejected — 둘 다 파이프라인 몫이라 여기엔 없다.
 
 노드 모양(async, 바뀐 필드만 반환, 클라이언트는 팩토리로 주입)은 제안서 4절과 같다. 파이프라인 그래프로 바꿀 때
 make_* 팩토리를 그대로 add_node 하면 된다. apply_patch·라우터는 파이프라인 소유이고 여기 것은 참고 구현이다.
@@ -24,6 +25,7 @@ from review_ai.judge.llm import LlmClient
 from review_ai.judge.node import make_judge
 from review_ai.judge.validate import overlay_files
 from review_ai.patching import PatchError, apply_ops, parse_pointer
+from review_ai.recommendations import resolve_human_decision
 from review_ai.retrieval import Retriever, make_retrieve_evidence
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.state import Patch, ReviewState
@@ -44,15 +46,18 @@ async def apply_patch(state: dict[str, Any]) -> dict[str, Any]:
 
 
 async def apply_human_edits(state: dict[str, Any]) -> dict[str, Any]:
-    """사람이 고친 ops 를 현재 명세에 적용하고, AI 가 멈춘 이유와 승인자를 rounds 에 남긴다 → static_check 로 재검사.
+    """사용자 입력과 미입력 권장값을 현재 명세에 적용하고 사유·승인자·보충값을 기록한 뒤 재검사한다.
 
     rounds 에 넣으므로 verdict.applied_ops(state) 에 사람 ops 가 AI 회차 뒤에 순서대로 들어간다 (커밋 노드는 그대로 쓰면 된다).
     재검사가 findings·decision 을 덮어쓰기 때문에 needs_human 사유·설명은 이 회차 기록에만 남는다.
     ops 가 명세를 깨면 ValueError — 승인 API 가 재개 전에 같은 검사(check_edited_ops)로 422 를 돌려주는 게 좋다.
     """
     human = state.get("human_decision")
-    if not human or human["decision"] != "approved" or not human["edited_ops"]:
-        raise ValueError("apply_human_edits 는 승인 + edited_ops 일 때만 — 승인만이면 commit_overlay, 거절이면 rejected")
+    if not human or human["decision"] != "approved":
+        raise ValueError("apply_human_edits는 승인 응답의 수정값·권장값을 적용할 때만 실행한다")
+    human = resolve_human_decision(state, human)
+    if not human["edited_ops"]:
+        raise ValueError("적용할 수정값이 없다")
     edited = check_edited_ops(state["deploy_spec"], human["edited_ops"])
     before, after = DeploySpec.model_validate(state["deploy_spec"]), DeploySpec.model_validate(edited)
     patch = Patch(kind="config", ops=[dict(op) for op in human["edited_ops"]],  # type: ignore[misc]
@@ -60,12 +65,15 @@ async def apply_human_edits(state: dict[str, Any]) -> dict[str, Any]:
                   files=overlay_files(before, after))
     snapshot = {**round_snapshot(state), "patch": patch,
                 "human": {"decision": human["decision"], "approver": human["approver"]}}
+    if human["defaulted_ops"]:
+        snapshot["defaulted_ops"] = human["defaulted_ops"]
     return {
         "rounds": [snapshot],
         "deploy_spec": edited,
         "retry_count": state.get("retry_count", 0) + 1,
         "patch": None,
         "status": "running",
+        "human_decision": human,
     }
 
 
@@ -86,7 +94,10 @@ def check_edited_ops(deploy_spec: dict[str, Any], ops: list[Any]) -> dict[str, A
 
 def route_start(state: dict[str, Any]) -> str:
     human = state.get("human_decision")
-    if human and human["decision"] == "approved" and human["edited_ops"]:
+    if not human or human["decision"] != "approved":
+        return "static_check"
+    has_recommendations = bool((state.get("decision") or {}).get("recommendations"))
+    if human["edited_ops"] or (human.get("use_recommendations", True) and has_recommendations):
         return "apply_human_edits"
     return "static_check"
 

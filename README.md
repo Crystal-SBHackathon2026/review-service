@@ -65,8 +65,8 @@ docker compose --profile app up -d --build
 ## 상태 흐름 (`reviews.status`)
 
 ```
-received → reviewing ─┬─ needs_human ─┬─ (승인) → waiting_ci
-                      │               ├─ (승인 + edited_ops) → reviewing → …재검사
+received → reviewing ─┬─ needs_human ─┬─ (승인, 적용할 수정 없음) → waiting_ci
+                      │               ├─ (승인 + edited_ops 또는 권장값) → reviewing → …재검사
                       │               └─ (거절) → rejected
                       ├─ superseded   (고쳐서 통과 → PR 브랜치에 수정 커밋 → 그 커밋을 새 검토로, superseded_by)
                       └─ waiting_ci ─┬─ (CI success) → merging → committed | blocked
@@ -79,4 +79,6 @@ received → reviewing ─┬─ needs_human ─┬─ (승인) → waiting_ci
   새 커밋은 `autofix_commit=True` 로 다시 검토하고, 거기서 또 fix 면 needs_human(LOOP_EXHAUSTED) 이다.
   포크 PR 은 커밋할 수 없어 failed. 커밋한 deploy.yaml 은 YAML 을 다시 쓰므로 원래 주석은 사라진다.
 - 그래프 오류·PR head 불일치·병합 실패도 `failed` 이고 원인은 `error` 열에 남는다.
+- 사람 승인 시 입력하지 않은 항목은 `decision.recommendations`의 검증된 권장값을 적용하고 재검사한다.
+  입력한 값이 우선이며, 기존 명세 그대로 승인하려면 `use_recommendations: false`를 명시한다. 권장값이 없으면 값 없는 승인은 그대로 승인이다. [응답 기본값 안내](ai/docs/human-recommendations.md).
 - `commit_overlay`(성진님, `worker/review_worker/commit_overlay.py`)가 원본 명세 + `applied_ops` → overlay 를 gitops main 에 커밋한다. 렌더러 blocking 경고면 커밋하지 않고 `blocked`. gitops ref 충돌은 main 을 다시 읽어 최대 5회.

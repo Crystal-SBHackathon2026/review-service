@@ -261,7 +261,7 @@ async def test_04_approved_without_edits_waits_for_ci(harness: Harness) -> None:
     sample = load_sample(SAMPLE_04)
     await _seed_baseline(harness, sample)
     await harness.request(sample)
-    await harness.human(RID, "approved")
+    await harness.human(RID, "approved", use_recommendations=False)
 
     assert harness.row()["status"] == "waiting_ci"
     assert harness.row()["verdict"] == "needs_human"  # AI 판정은 그대로, 사람이 승인
@@ -285,6 +285,49 @@ async def test_04_approved_with_edits_rechecks_and_commits(harness: Harness) -> 
     assert yaml.safe_load(harness.github.commits[0]["content"])["database"]["engine"] == "postgres"
 
 
+async def test_04_approved_without_values_commits_recommendations(harness: Harness) -> None:
+    sample = load_sample(SAMPLE_04)
+    await _seed_baseline(harness, sample)
+    await harness.request(sample)
+    recommendations = harness.row()["decision"]["recommendations"]
+    assert recommendations and harness.github.commits == []
+
+    await harness.human(RID, "approved")
+
+    assert harness.row()["status"] == "superseded"
+    fixed = yaml.safe_load(harness.github.commits[0]["content"])
+    assert (fixed["database"]["engine"], fixed["database"]["version"]) == ("postgres", "16")
+    assert harness.row()["rounds"][-1]["defaulted_ops"]
+    # 새 커밋 재검토에서 같은 권장값으로 다시 수정하는 루프에 들어가지 않는다.
+    await harness.deliver_published()
+    assert len(harness.github.commits) == 1
+
+
+async def test_04_partial_answer_survives_kafka_and_defaults_missing_value(harness: Harness) -> None:
+    sample = load_sample(SAMPLE_04)
+    await _seed_baseline(harness, sample)
+    await harness.request(sample)
+    await harness.human(RID, "approved", [{"op": "replace", "path": "/database/engine", "value": "postgres"},
+                                          {"op": "replace", "path": "/database/version"}])
+    fixed = yaml.safe_load(harness.github.commits[0]["content"])
+    assert fixed["database"]["version"] == "16"
+    assert harness.row()["human_decision"]["defaulted_ops"] == [{"op": "add", "path": "/database/version", "value": "16"}]
+
+
+async def test_approval_without_known_recommendation_is_plain_approval(harness: Harness) -> None:
+    """권장값이 없으면 값 없는 승인 = 그대로 승인 (기존 계약). 고친 것이 없으니 커밋 없이 CI 대기."""
+    await harness.request(load_sample("06-human-plaintext-secret.yaml"))
+    assert not harness.row()["decision"]["recommendations"]
+
+    await harness.human(RID, "approved")
+
+    assert harness.row()["status"] == "waiting_ci"
+    assert harness.row()["error"] is None
+    assert harness.row()["human_decision"]["edited_ops"] == []
+    assert not harness.github.commits
+    assert (await _state(harness))["_next"] == ("wait_ci",)
+
+
 async def test_invalid_edits_go_back_to_human(harness: Harness) -> None:
     sample = load_sample(SAMPLE_04)
     await _seed_baseline(harness, sample)
@@ -293,8 +336,32 @@ async def test_invalid_edits_go_back_to_human(harness: Harness) -> None:
 
     row = harness.row()
     assert row["status"] == "needs_human"
-    assert "edited_ops 적용 실패" in row["error"]
+    assert "사람 응답 적용 실패" in row["error"]
     assert (await _state(harness))["_next"] == ("wait_human",)
+
+
+async def test_invalid_unanswered_path_waits_and_next_answer_resumes(harness: Harness) -> None:
+    sample = load_sample(SAMPLE_04)
+    await _seed_baseline(harness, sample)
+    await harness.request(sample)
+    before = (await _state(harness))["deploy_spec"]
+    await harness.human(RID, "approved", [{"op": "replace", "path": "/database/engine/typo"}])
+
+    state = await _state(harness)
+    assert harness.row()["status"] == "needs_human"
+    assert "사람 응답 적용 실패" in harness.row()["error"]
+    assert state["_next"] == ("wait_human",)
+    assert state["deploy_spec"] == before
+    assert not applied_ops(state)
+    assert not harness.github.commits and not harness.github.merged
+    assert not harness.publisher.sent
+
+    await harness.human(RID, "approved", [{"op": "replace", "path": "/database/version"}])
+    assert harness.row()["status"] == "superseded"
+    assert harness.row()["error"] is None
+    assert len(harness.github.commits) == 1
+    fixed = yaml.safe_load(harness.github.commits[0]["content"])
+    assert (fixed["database"]["engine"], fixed["database"]["version"]) == ("postgres", "16")
 
 
 # --- 중복·오류 ------------------------------------------------------------------------------------

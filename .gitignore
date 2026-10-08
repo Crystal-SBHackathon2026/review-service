@@ -5,3 +5,5 @@ __pycache__/
 ai/eval/reports/
 .pytest_cache/
 .coverage
+# Qdrant 로컬 모드(location=":memory:")가 테스트·평가셋 실행 때 만드는 파일
+ai/:memory:*

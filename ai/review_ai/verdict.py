@@ -127,7 +127,7 @@ def round_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     무엇을 왜 고쳤는지(finding·AI 설명·근거 문서 ID)는 이 기록에만 남는다. 결과 화면·업무 DB 가 여기서 읽는다.
     """
     decision = state["decision"]
-    return {
+    snapshot = {
         "round": state.get("retry_count", 0),
         "finding_ids": [f["finding_id"] for f in state["findings"]],
         "findings": copy.deepcopy(state["findings"]),
@@ -137,6 +137,9 @@ def round_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         "doc_ids": [d["chunk_id"] for d in state.get("retrieved_docs") or []],
         "patch": state.get("patch"),
     }
+    if decision.get("recommendations"):
+        snapshot["recommendations"] = copy.deepcopy(decision["recommendations"])
+    return snapshot
 
 
 def applied_ops(state: Mapping[str, Any]) -> list[PatchOp]:
