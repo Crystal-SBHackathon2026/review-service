@@ -12,7 +12,7 @@ from review_ai.errors import TransientError
 from review_ai.judge.prompt import JudgeRequest
 from review_ai.judge.schema import LlmReview
 
-DEFAULT_MODEL = os.environ.get("REVIEW_LLM_MODEL", "claude-opus-5-5")
+DEFAULT_MODEL = os.environ.get("REVIEW_LLM_MODEL", "claude-sonnet-5-5")
 MAX_TOKENS = 8000
 
 
