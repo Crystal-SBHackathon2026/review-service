@@ -73,10 +73,10 @@ class FakeGitHub:
     async def check_suites(self, repository: str, sha: str) -> list[dict[str, Any]]:
         return self.suites
 
-    async def get_file_blob(self, repository: str, path: str, ref: str) -> tuple[str, str]:
-        return await self.get_file(repository, path, ref), "blob"
+    async def prepare_file_commit(self, repository: str, **_: Any) -> str:
+        raise AssertionError("수정 없는 샘플은 커밋하지 않는다")
 
-    async def put_file(self, repository: str, path: str, **_: Any) -> str:
+    async def update_branch(self, repository: str, branch: str, sha: str) -> None:
         raise AssertionError("수정 없는 샘플은 커밋하지 않는다")
 
     async def get_file(self, repository: str, path: str, ref: str) -> str:

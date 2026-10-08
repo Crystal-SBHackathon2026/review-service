@@ -47,7 +47,8 @@ docker compose --profile app up -d --build
 | `DB_HOST` `DB_PORT` `DB_NAME` `DB_USERNAME` `DB_PASSWORD` | API·워커 | 업무 DB. 클러스터에서는 계정을 `review-db-credentials` Secret 에서 |
 | `DB_SSLMODE` | API·워커 | 기본 `prefer`. RDS 는 `require` |
 | `KAFKA_BOOTSTRAP` | API·워커 | MSK PLAINTEXT bootstrap (Terraform `infra/msk` output `bootstrap_brokers`) |
-| `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기. 워커는 CI 상태 조회·AI 수정 커밋·PR 병합이라 앱 레포 Contents·Pull requests **쓰기** 권한이 필요하다 |
+| `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기. 워커는 CI 상태 조회·AI 수정 커밋·PR 병합·gitops overlay 커밋이라 앱 레포·gitops Contents·Pull requests **쓰기** 권한이 필요하다 (`oneaction/gitops-token`) |
+| `GITOPS_REPO` | 워커 | overlay 를 커밋할 gitops 레포. 기본 `Crystal-SBHackathon2026/gitops` |
 | `GITHUB_WEBHOOK_SECRET` | API | `/webhooks/github` HMAC 검증. 없으면 웹훅을 503 으로 거절 |
 | `GITHUB_CI_APP_SLUG` | API·워커 | 이 GitHub App 의 `check_suite` 만 CI 결과로 본다. 기본 `github-actions`, 빈 값이면 전부 |
 | `ARGOCD_WEBHOOK_TOKEN` | API | 있으면 `/webhooks/argocd` 가 `Authorization: Bearer <토큰>` 을 확인한다 |
@@ -70,4 +71,4 @@ received → reviewing ─┬─ needs_human ─┬─ (승인) → waiting_ci
   새 커밋은 `autofix_commit=True` 로 다시 검토하고, 거기서 또 fix 면 needs_human(LOOP_EXHAUSTED) 이다.
   포크 PR 은 커밋할 수 없어 failed. 커밋한 deploy.yaml 은 YAML 을 다시 쓰므로 원래 주석은 사라진다.
 - 그래프 오류·PR head 불일치·병합 실패도 `failed` 이고 원인은 `error` 열에 남는다.
-- `commit_overlay` 는 아직 스텁이라 병합 뒤 `blocked`(`COMMIT_OVERLAY_NOT_IMPLEMENTED`)로 끝난다.
+- `commit_overlay`(성진님, `worker/review_worker/commit_overlay.py`)가 원본 명세 + `applied_ops` → overlay 를 gitops main 에 커밋한다. 렌더러 blocking 경고면 커밋하지 않고 `blocked`. gitops ref 충돌은 main 을 다시 읽어 최대 5회.

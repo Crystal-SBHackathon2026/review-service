@@ -5,10 +5,10 @@
     fix               → apply_patch ─────────────────────────────────▶ static_check (최대 MAX_PATCH_ROUNDS)
     needs_human       → await_human → wait_human ⏸
                           승인 + edited_ops → apply_human_edits ──────▶ static_check
-                          승인              → await_ci
+                          승인              → await_ci (AI 가 고친 회차가 있으면 commit_fix)
                           거절              → END (rejected)
     pass + 수정 있음  → commit_fix → END (superseded — 수정 커밋을 autofix_commit 새 검토로)
-    pass + 수정 없음  → await_ci → check_ci ─ CI 끝남 → merge_pr → commit_overlay → END
+    pass + 수정 없음  → await_ci → check_ci ─ CI 끝남 → merge_pr → commit_overlay(gitops 커밋) → END
                                            └ 아직    → wait_ci ⏸ → (재개) 다시 확인, 다른 suite 가 남았으면 await_ci
 
 ⏸ 는 LangGraph interrupt. review.resumed 가 오면 같은 thread_id(review_id) 로 Command(resume=...) 재개한다.
@@ -60,14 +60,19 @@ GITHUB_MAX_ATTEMPTS = 3
 RECURSION_LIMIT = 100
 CI_OK = frozenset({"success", "neutral", "skipped"})
 
-CommitOverlay = Callable[[dict[str, Any], str], Awaitable[DeployResult]]
+COMMIT_OVERLAY_MAX_ATTEMPTS = 3  # commit_overlay 의 TransientError(네트워크·gitops 충돌) 재시도
+
+# review_worker.commit_overlay.make_commit_overlay(git) 가 돌려주는 노드 모양. 바뀐 필드 {"deploy_result": ...} 만 돌려준다
+CommitOverlay = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 class GitHubPort(Protocol):
-    async def get_file_blob(self, repository: str, path: str, ref: str) -> tuple[str, str]: ...
+    async def get_file(self, repository: str, path: str, ref: str) -> str: ...
 
-    async def put_file(self, repository: str, path: str, *, branch: str, content: str, blob_sha: str,
-                       message: str) -> str: ...
+    async def prepare_file_commit(self, repository: str, *, parent: str, path: str, content: str,
+                                  message: str) -> str: ...
+
+    async def update_branch(self, repository: str, branch: str, sha: str) -> None: ...
 
     async def check_suites(self, repository: str, sha: str) -> list[dict[str, Any]]: ...
 
@@ -80,14 +85,9 @@ class Publisher(Protocol):
     async def send(self, topic: str, key: str, value: bytes) -> None: ...
 
 
-async def commit_overlay_stub(state: dict[str, Any], merge_sha: str) -> DeployResult:
-    """commit_overlay 자리 — 성진님 구현으로 바꾼다.
-
-    입력: 최종 State(spec_ref·applied_ops 는 verdict.applied_ops(state) 로) 와 업무 DB 의 병합 SHA.
-    출력: DeployResult. committed 면 commit_sha 에 gitops 커밋 SHA.
-    """
-    log.warning("review %s: commit_overlay 미구현 — blocked 로 끝낸다 (merge_sha=%s)", state.get("review_id"), merge_sha)
-    return DeployResult(status="blocked", commit_sha=None, reason="COMMIT_OVERLAY_NOT_IMPLEMENTED")
+async def commit_overlay_stub(state: dict[str, Any]) -> dict[str, Any]:
+    """테스트용 — gitops 에 커밋하지 않고 blocked 로 끝낸다. 실제 워커는 make_commit_overlay(GitHubGitClient) 를 쓴다."""
+    return {"deploy_result": DeployResult(status="blocked", commit_sha=None, reason="COMMIT_OVERLAY_NOT_IMPLEMENTED")}
 
 
 @dataclass
@@ -195,7 +195,12 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             await repo.update_review(rid, status="rejected", human_decision=decision)
             return Command(goto=END, update={"human_decision": decision, "status": "rejected"})
         await repo.update_review(rid, human_decision=decision, error=None)
-        goto = "apply_human_edits" if decision["edited_ops"] else "await_ci"
+        if decision["edited_ops"]:
+            goto = "apply_human_edits"
+        elif applied_ops(state):  # 사람 확인 전에 AI 가 고친 회차가 있다 — 앱 레포에도 커밋해야 gitops 와 어긋나지 않는다
+            goto = "commit_fix"
+        else:
+            goto = "await_ci"
         return Command(goto=goto, update={"human_decision": decision})
 
     async def apply_human_edits(state: dict[str, Any]) -> Command:
@@ -211,21 +216,26 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     # --- AI 수정 커밋 -----------------------------------------------------------------------------
 
     async def commit_fix(state: dict[str, Any]) -> Command:
-        """원본 deploy.yaml 에 applied_ops 를 적용해 PR 브랜치에 커밋하고, 그 커밋을 autofix_commit 새 검토로 넘긴다."""
+        """원본 deploy.yaml 에 applied_ops 를 적용해 PR 브랜치에 커밋하고, 그 커밋을 autofix_commit 새 검토로 넘긴다.
+
+        커밋 객체를 먼저 만들어 SHA 를 알아낸 뒤 → 새 검토를 DB 에 넣고 → 브랜치를 옮긴다. 브랜치가 움직이면
+        GitHub 이 pull_request synchronize 웹훅을 보내는데, 그때 Review API 가 같은 SHA 검토를 이미 찾을 수 있어야
+        (autofix_commit 이 빠진) 중복 검토를 만들지 않는다.
+        """
         rid, ref = state["review_id"], state["spec_ref"]
-        repository, path = ref["repository"], ref["path"]
+        repository, path, parent = ref["repository"], ref["path"], ref["commit"]
         ops = applied_ops(state)
         try:
             pull = await _open_pull(ref)
             if (pull["head"].get("repo") or {}).get("full_name", repository) != repository:
                 raise GitHubError(f"PR #{pull['number']} 은 포크 브랜치라 자동 커밋할 수 없다")
-            raw, blob_sha = await _retry("deploy.yaml 읽기", lambda: github.get_file_blob(repository, path, ref["commit"]))
+            raw = await _retry("deploy.yaml 읽기", lambda: github.get_file(repository, path, parent))
             fixed = apply_ops(yaml.safe_load(raw), ops)  # 원본(가리지 않은 값)에 적용. ops 는 env·시크릿을 건드리지 못한다
             DeploySpec.model_validate(fixed)
             content = (f"# AI 검토 {rid} 가 고친 명세입니다. 무엇을 왜 고쳤는지는 검토 결과(rounds)에 있습니다.\n"
                        + yaml.safe_dump(fixed, sort_keys=False, allow_unicode=True))
-            new_sha = await github.put_file(repository, path, branch=pull["head"]["ref"], content=content,
-                                            blob_sha=blob_sha, message=f"fix(deploy): AI 검토 자동 수정 ({rid})")
+            new_sha = await github.prepare_file_commit(repository, parent=parent, path=path, content=content,
+                                                       message=f"fix(deploy): AI 검토 자동 수정 ({rid})")
         except (GitHubError, ValueError) as exc:
             return await _fail(rid, f"commit_fix: {exc}")
 
@@ -236,6 +246,11 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         await repo.insert_review(review_id=new_rid, app=message.app, target_env=message.target_env,
                                  repo_id=message.repo_id, spec_ref=new_ref, pr_head_sha=new_sha,
                                  requested_by=message.requested_by)
+        try:
+            await github.update_branch(repository, pull["head"]["ref"], new_sha)
+        except GitHubError as exc:  # 그사이 사람이 푸시했다 — 이 수정은 버린다
+            await repo.update_review(new_rid, status="failed", error=f"브랜치 갱신 실패: {exc}"[:2000])
+            return await _fail(rid, f"commit_fix: {exc}")
         await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.model_dump_json().encode())
         await repo.update_review(rid, status="superseded", superseded_by=new_rid)
         log.info("review %s: 수정 %d건을 %s 로 커밋 → 재검토 %s", rid, len(ops), new_sha, new_rid)
@@ -294,10 +309,18 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         return Command(goto="commit_overlay")
 
     async def commit_overlay(state: dict[str, Any]) -> dict[str, Any]:
-        row = await repo.get_review(state["review_id"])
-        result = await deps.commit_overlay(state, row["merge_sha"])
+        """review_worker.commit_overlay 노드 — 원본 명세 + applied_ops → overlay → gitops 커밋. 병합 SHA 는 merge_pr 이 DB 에 남겼다."""
+        for attempt in range(1, COMMIT_OVERLAY_MAX_ATTEMPTS + 1):
+            try:
+                result = (await deps.commit_overlay(state))["deploy_result"]
+                break
+            except TransientError as exc:
+                if attempt == COMMIT_OVERLAY_MAX_ATTEMPTS:
+                    raise
+                log.warning("review %s: commit_overlay 일시 오류 %d — %s", state["review_id"], attempt, exc)
+                await asyncio.sleep(deps.retry_backoff_seconds * 2**attempt)
         await repo.update_review(state["review_id"], status=result["status"], deploy_result=result,
-                                 gitops_commit_sha=result.get("commit_sha"))
+                                 gitops_commit_sha=result["commit_sha"] if result["status"] == "committed" else None)
         return {"deploy_result": result}
 
     graph = StateGraph(ReviewState)
@@ -307,7 +330,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     graph.add_node("record_result", record_result)
     graph.add_node("apply_patch", apply_patch)
     graph.add_node("await_human", await_human)
-    graph.add_node("wait_human", wait_human, destinations=("apply_human_edits", "await_ci", END))
+    graph.add_node("wait_human", wait_human, destinations=("apply_human_edits", "commit_fix", "await_ci", END))
     graph.add_node("apply_human_edits", apply_human_edits, destinations=("static_check", "await_human"))
     graph.add_node("commit_fix", commit_fix, destinations=(END,))
     graph.add_node("await_ci", await_ci)
