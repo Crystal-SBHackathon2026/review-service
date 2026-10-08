@@ -13,7 +13,6 @@ WarningCode = Literal[
     "DB_PROVISIONING_REQUIRED",
     "BUCKET_PROVISIONING_REQUIRED",
     "VOLUME_UNSUPPORTED",
-    "IMAGE_DIGEST_MISSING",
     "INGRESS_CIDRS_NOT_ENFORCED",
     "TLS_HOST_MISSING",
     "TLS_SECRET_REQUIRED",
@@ -25,7 +24,6 @@ BLOCKING: dict[str, bool] = {
     "DB_PROVISIONING_REQUIRED": True,  # 없는 DB 를 바라보면 앱이 뜨지 않는다
     "BUCKET_PROVISIONING_REQUIRED": True,
     "VOLUME_UNSUPPORTED": True,  # PVC 가 Pending 에 머문다
-    "IMAGE_DIGEST_MISSING": False,
     # 명세가 막으라고 한 대역이 강제되지 않는다(local·gcp 만. aws 는 ALB inbound-cidrs 로 강제된다).
     # 샘플 02(local 비공개 Ingress)처럼 데모 경로에 있어 일단 진행으로 둔다 — 중단으로 올릴지는 배포 담당과 정한다.
     "INGRESS_CIDRS_NOT_ENFORCED": False,

@@ -66,7 +66,7 @@ def check_rejects() -> int:
     broken = {
         "engine 에 placement 없음": {**base, "database": {"engine": "postgres"}},
         "모르는 필드": {**base, "replica": 3},
-        "tag·digest 둘 다 없음": {**base, "image": {"repository": "x", "platforms": ["amd64"]}},
+        "platforms 없음": {**base, "image": {"repository": "x"}},
         "시크릿 key 없음": {**base, "secrets": [{"name": "API_KEY", "source": "k8s-secret"}]},
         "소문자 env 이름": {**base, "runtime": {**base["runtime"], "env": {"deploy_env": "aws"}}},
     }

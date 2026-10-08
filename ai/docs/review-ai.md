@@ -33,6 +33,7 @@ pip install "./ai[qdrant]"        # 이미지 빌드 — catalog/·knowledge/ �
 | apply_patch | `verdict.round_snapshot(state)` · `patching.apply_ops(spec, patch["ops"])` | 참고 구현: `graph.apply_patch` |
 | 커밋 단계 | `verdict.applied_ops(final)` · `patching.apply_ops(원본, ops)` · `overlay.render_overlay(spec)` → `files`·`warnings`·`blocking` | **spec_ref 로 앱 레포에서 읽은 원본**에 `applied_ops(final)` 를 적용해 렌더링한다. ⚠️ `patch["ops"]` 가 아니다 — apply_patch 가 patch 를 rounds 로 옮기고 비우므로 고쳐서 통과한 최종 State 는 `patch=None` 이고, ops 는 `rounds[*].patch.ops` 에 회차 순서대로 있다. `applied_ops == []` 면 수정 없이 통과(원본 그대로). Kafka 사본은 가려져 있어 렌더러가 거절한다. 회차별 diff 는 `rounds[i].patch.files` 에 있다. `rendered.blocking` 이 비어 있지 않으면 커밋하지 말고 `blocked` 로 돌려준다 |
 | 커밋 노드 (`commit_overlay`, 배포 담당) | `state.DeployResult` → State 의 `deploy_result` | `{status: committed \| blocked, commit_sha, reason}`. verdict 가 pass 일 때만 쓴다. `status`(verdict 값)와 섞지 않는다. push 실패처럼 재시도할 오류는 `errors.TransientError`, DB·버킷이 없어 멈추는 건 `blocked` 로 정상 반환 |
+| 사람 확인 재개 (승인 API·워커) | `state.HumanDecision` → State 의 `human_decision`, `status` 에 `rejected` | `{decision: approved \| rejected, approver, edited_ops}`. 승인 + `edited_ops` 없음 → `commit_overlay`, 승인 + 있음 → `static_check` 부터 재검사, 거절 → `status=rejected` 로 종료 |
 | 결과 저장 (업무 DB·결과 화면) | 최종 State 의 `status`·`decision`·`findings`·`rounds` | 고쳐서 통과하면 최종 `findings`·`decision.items`·`retrieved_docs` 는 재검사 결과라 비어 있다. **무엇을 왜 고쳤는지는 `rounds[i]`** 에 있다 — `{round, finding_ids, findings, verdict, reasons, items(why·cited_rule_ids), doc_ids, patch(ops·files)}` |
 | 단독 실행·평가 | `graph.run_graph(initial_state(spec, review_id=), llm=, retriever=)` | 최종 State 에 `status`·`applied_ops`·`patched`(고친 적 있음) 를 더해 돌려준다. 고쳐서 통과 = `status == "pass" and patched`. `scripts/run_eval.py` 가 이걸 쓴다 |
 
@@ -75,8 +76,10 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
 ## overlay 렌더러 (결정 #7: 검토 서비스 코드가 만든다)
 
 - 입력 `deploy_spec` → 출력 `apps/<앱>/overlays/<환경>/{kustomization,ingress,pvc-*}.yaml`. 디스크에 쓰지 않고 dict 로 준다.
-- base 의 Rollout 컨테이너 0번을 **통째로** 바꾸고(replicas·env·probe·resources·volumeMounts), Service targetPort, 이미지 태그 **+ digest** 를 overlay 별로 고정한다.
-- 지금 gitops 의 sample-app aws·gcp·local overlay 를 `kubectl kustomize` 결과 기준으로 그대로 재현한다(테스트). 차이는 의도한 두 가지 — 이미지 digest 고정, `terminationGracePeriodSeconds` 명시.
+- base 의 Rollout 컨테이너 0번을 **통째로** 바꾸고(replicas·env·probe·resources·volumeMounts), Service targetPort 를 맞춘다.
+- **이미지는 건드리지 않는다.** 태그는 CI 가 base kustomization 의 `newTag` 로 갱신하고, overlay 에 `images` 를 두면 그 갱신을 덮어 무시하게 된다.
+  컨테이너를 바꿀 때도 base 의 `image`(CI 태그가 붙은 값)를 JSON Patch `copy` 로 옮긴다 — 안 그러면 태그 없는 이미지(`:latest`)가 된다.
+- 지금 gitops 의 sample-app aws·gcp·local overlay 를 `kubectl kustomize` 결과 기준으로 그대로 재현한다(테스트). 차이는 의도한 한 가지 — `terminationGracePeriodSeconds` 명시.
 - 시크릿은 `secretKeyRef`(`<앱>-secrets`)로만 렌더링한다. 값은 넣지 않는다.
 - overlay 로 못 만드는 것(관리형 DB, 버킷, Secret 값 생성, 로컬·GCP 의 allowed_cidrs)은 `warnings` 로 돌려준다.
 - 경고는 `RenderWarning`(str)이고 `code`·`blocking` 이 있다 (`overlay/warnings.py`). 커밋 단계는 문장을 파싱하지 말고 `rendered.blocking` 만 본다.
@@ -90,7 +93,6 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
   | `SECRET_KEYS_REQUIRED` | — | `<앱>-secrets` 에 키가 미리 있어야 한다. 없으면 Rollout 이 멈추고 자동 롤백 |
   | `TLS_SECRET_REQUIRED` | — | `<앱>-tls` 인증서 Secret 이 미리 있어야 한다 |
   | `INGRESS_CIDRS_NOT_ENFORCED` | — | local·gcp 에서 allowed_cidrs 를 강제하지 못한다 (중단으로 올릴지 배포 담당과 정할 것) |
-  | `IMAGE_DIGEST_MISSING` | — | 태그로만 고정된다 |
 
 ```bash
 .venv/bin/python scripts/render_overlay.py samples/01-pass-sample-app-aws.yaml   # blocking 경고가 있으면 종료 코드 3

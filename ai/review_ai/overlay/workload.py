@@ -47,8 +47,7 @@ def _resources(spec: AppSpec) -> dict[str, Any]:
 def container(spec: AppSpec) -> dict[str, Any]:
     rt = spec.runtime
     c: dict[str, Any] = {
-        "name": spec.metadata.name,
-        "image": spec.image.repository,  # 태그·digest 는 kustomization images 가 붙인다
+        "name": spec.metadata.name,  # image 는 넣지 않는다 — rollout_ops 가 base 값(CI 가 태그를 쓴 값)을 복사한다
         "ports": [{"containerPort": rt.port}],
     }
     env = _env(spec)
@@ -83,10 +82,20 @@ def pvc(spec: AppSpec, volume_name: str) -> dict[str, Any]:
     }
 
 
+CONTAINERS = "/spec/template/spec/containers"
+
+
 def rollout_ops(spec: AppSpec) -> list[dict[str, Any]]:
+    """컨테이너 0번을 통째로 바꾸되 image 는 base 것을 그대로 쓴다.
+
+    이미지 태그는 CI 가 base kustomization 의 newTag 로 갱신한다. 그 값은 base 빌드 때 이미 붙어 있으므로
+    새 컨테이너를 1번에 넣고 → 0번의 image 를 복사한 뒤 → 옛 0번을 지운다 (base 컨테이너는 하나라는 전제).
+    """
     ops: list[dict[str, Any]] = [
         {"op": "replace", "path": "/spec/replicas", "value": spec.runtime.replicas},
-        {"op": "replace", "path": "/spec/template/spec/containers/0", "value": container(spec)},
+        {"op": "add", "path": f"{CONTAINERS}/-", "value": container(spec)},
+        {"op": "copy", "from": f"{CONTAINERS}/0/image", "path": f"{CONTAINERS}/1/image"},
+        {"op": "remove", "path": f"{CONTAINERS}/0"},
         {"op": "add", "path": "/spec/template/spec/terminationGracePeriodSeconds",
          "value": spec.runtime.termination_grace_seconds},
     ]

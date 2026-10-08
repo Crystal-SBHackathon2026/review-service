@@ -39,15 +39,6 @@ class RenderedOverlay:
         return tuple(w for w in self.warnings if w.blocking)
 
 
-def _images(spec: AppSpec) -> list[dict[str, str]]:
-    image: dict[str, str] = {"name": spec.image.repository}
-    if spec.image.tag:
-        image["newTag"] = spec.image.tag
-    if spec.image.digest:
-        image["digest"] = spec.image.digest
-    return [image]
-
-
 def _warnings(spec: AppSpec, caps: TargetCaps) -> list[RenderWarning]:
     out = []
     if spec.secrets:
@@ -73,11 +64,6 @@ def _warnings(spec: AppSpec, caps: TargetCaps) -> list[RenderWarning]:
                 "VOLUME_UNSUPPORTED",
                 f"{caps.env}: 볼륨 {v.name} ({v.access_mode}) 를 만들 수 없다 — 지원 접근 모드: {supported} (STO-001)",
             ))
-    if not spec.image.digest:
-        out.append(RenderWarning(
-            "IMAGE_DIGEST_MISSING",
-            "image.digest 가 없어 태그로만 고정된다 — 같은 태그 재푸시 시 다른 이미지가 배포된다",
-        ))
     return out
 
 
@@ -105,7 +91,6 @@ def render_overlay(spec: AppSpec, *, apps_root: str = "apps") -> RenderedOverlay
         "kind": "Kustomization",
         "namespace": spec.target.namespace or name,
         "resources": resources,
-        "images": _images(spec),
         "patches": [
             {"target": {"kind": "Rollout", "name": name}, "patch": dump(rollout_ops(spec)).rstrip("\n")},
             {"target": {"kind": "Service", "name": name}, "patch": dump(service_ops(spec)).rstrip("\n")},
