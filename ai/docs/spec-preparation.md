@@ -8,8 +8,23 @@
 |---|---|
 | 빈 입력 판별, 권장 프리셋·대상 능력표 적용 | 특정 커밋의 앱 레포에서 파일 조회 |
 | 이전 승인 명세 보존, 확인된 설정 우선 적용 | 업무 DB에서 baseline·앱 설정 조회 |
-| 기존 정적 검사·RAG·LLM 교정 재사용 | 레포 분석·이미지 빌드 관측값을 context에 전달 |
+| 기존 정적 검사·RAG·LLM 교정 재사용, 레포 분석(`intake.analyze`) | 분석할 파일을 GitHub 에서 읽어 전달 |
 | 최종 명세·YAML·추천 이유·검토 결과·확인 항목 반환 | 생성 명세 저장·커밋, 새 SHA로 검토 요청·CI·배포 진행 |
+
+레포 분석은 `review_ai.intake.analyze`(LLM 없음, 네트워크 없음)가 한다. 근거가 분명한 값만 채우고 애매하면 비워 확인 항목으로 남긴다.
+'없다'(DB·시크릿·저장소 없음)는 의존성 파일과 소스(최대 40개)를 다 읽었을 때만 결론 낸다. 분석하지 않는 언어(Java·Ruby·셸 …),
+하위 디렉터리·다른 형식의 의존성 파일(`server/package.json`·Pipfile·pom.xml …), 이름 없이 환경변수를 읽는 설정 라이브러리(decouple·convict·viper …)가 있으면 내지 않는다.
+
+| 항목 | 근거 | 채우지 않는 경우 |
+|---|---|---|
+| image | CI 워크플로의 `ghcr.io/…` 경로 하나, `platforms`·`--platform` (없으면 ubuntu 러너 = amd64) | 워크플로 없음, 경로가 여럿·변수, arm·self-hosted 러너인데 플랫폼 미지정 |
+| runtime | Dockerfile 최종 스테이지 `EXPOSE` 하나, `HEALTHCHECK` 의 `http://localhost:<그 포트>/경로` → readiness·liveness | Dockerfile 없음, 포트 0개·여럿·`$PORT` |
+| database | `dependencies`(npm)·requirements·pyproject·go.mod 에 DB 드라이버·ORM 없음 → `none` | 드라이버(배치·버전 모름)·ORM·Mongo/Redis, `node:sqlite`·`sqlite3`·`database/sql` |
+| secrets | 소스가 읽는 환경변수 이름(+ Dockerfile ENV·ARG)에 비밀 이름 없음 → `[]` | 비밀 이름(어디서 읽을지 모름), `process.env` 통째로·변수 키·`BaseSettings` |
+| storage | `VOLUME`·파일 쓰기 호출·업로드/오브젝트 스토리지 의존성 없음 → 비움 | 그 중 하나라도 있음 |
+| requirements | database·storage 가 모두 '없음'일 때 `persistence: false` | 그 외 |
+
+sample-app(14411fd)은 전 항목이 채워져 aws·gcp 모두 정적 검사 pass·`ready_to_commit` 이다.
 
 `POST /reviews`는 파일 없음 404, 빈 파일 422를 유지한다. PR 웹훅은 `review_ai.intake.prepare_intake`(이 모듈의 `prepare_spec` 사용)로 연결됐다 — 확인 항목이 없을 때만 생성 커밋을 올리고, 남으면 `UNVERIFIED`로 거절한다. 흐름·상태는 README 의 "명세 없음·빈 명세·형식 오류" 절.
 

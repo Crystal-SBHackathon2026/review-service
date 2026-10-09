@@ -9,6 +9,8 @@
         - 루프 방지: head 가 intake 가 만든 커밋이면 다시 만들지 않는다 (LOOP_GUARD)
         - 포크 PR 은 브랜치에 쓸 수 없다 (FORK_PR)
         - 앱·대상: 그 레포의 가장 최근 baseline, 없으면 DEFAULT_TARGET(예 aws/ap-northeast-2). 둘 다 없으면 NO_TARGET
+        - baseline 이 없는 새 앱은 PR head 의 Dockerfile·의존성·CI·소스를 읽어 확인된 값만 채운다
+          (review_ai.intake.analyze). 하나라도 애매하면 UNVERIFIED 로 커밋하지 않는다
         - review_ai.intake.prepare_intake 가 생성하면 PR 브랜치에 커밋 → synchronize 웹훅이 그 SHA 를 일반 검토로
           시작한다 (autofix_commit 아님). 커밋 SHA 는 브랜치를 옮기기 전에 행에 남긴다 — 웹훅이 먼저 와도 연결된다
     PR 표시: 커밋 상태 review-service/intake. 토큰에 권한이 없으면 로그만 남기고 기록은 그대로 둔다.
@@ -27,6 +29,7 @@ import yaml
 from pydantic import ValidationError
 
 from review_ai.intake import KIND_LABELS, commit_message, prepare_intake
+from review_ai.intake.analyze import Finding, analyze_repository, files_to_read
 from review_ai.preparation import GenerationContext
 from review_ai.spec.deploy_spec import Baseline, DeploySpec, Target
 from review_common.github import GitHubError, RefConflict
@@ -41,9 +44,14 @@ log = logging.getLogger(__name__)
 STATUS_CONTEXT = "review-service/intake"
 STALE_AFTER = timedelta(minutes=2)
 SWEEP_EVERY_SECONDS = 60.0
+READ_CONCURRENCY = 8  # 레포 분석 파일 읽기 — GitHub 은 동시 요청이 많으면 secondary rate limit 을 건다
 
 
 class IntakeGitHub(Protocol):
+    async def list_files(self, repository: str, ref: str) -> list[str]: ...
+
+    async def get_file(self, repository: str, path: str, ref: str) -> str: ...
+
     async def prepare_file_commit(self, repository: str, *, parent: str, path: str, content: str,
                                   message: str) -> str: ...
 
@@ -117,15 +125,29 @@ def _done(status: str, reason: str, message: str, details: Any = (), **extra: An
     return {"status": status, "reason": reason, "message": message, "details": list(details), **extra}
 
 
-async def _context(deps: ApiDeps, repository: str) -> tuple[GenerationContext, Baseline | None] | None:
+Context = tuple[GenerationContext, Baseline | None, tuple[Finding, ...]]
+
+
+async def _context(deps: ApiDeps, github: IntakeGitHub, repository: str, head_sha: str) -> Context | None:
     row = await deps.repo.latest_baseline_for_repository(repository)
     if row is not None:
         baseline = Baseline.model_validate(baseline_for(row))
-        return GenerationContext(repository=repository, target=baseline.spec.target), baseline
+        return GenerationContext(repository=repository, target=baseline.spec.target), baseline, ()
     if not deps.default_target:
         return None
     env, _, region = deps.default_target.partition("/")
-    return GenerationContext(repository=repository, target=Target(env=env, region=region)), None
+    base = GenerationContext(repository=repository, target=Target(env=env, region=region))
+    tree = await github.list_files(repository, head_sha)
+    paths = files_to_read(tree)
+    limit = asyncio.Semaphore(READ_CONCURRENCY)
+
+    async def read(path: str) -> str:
+        async with limit:
+            return await github.get_file(repository, path, head_sha)
+
+    texts = await asyncio.gather(*map(read, paths))
+    analysis = analyze_repository(base, tree, dict(zip(paths, texts, strict=True)))
+    return analysis.context, None, analysis.findings
 
 
 async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
@@ -136,11 +158,11 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
         return _done("rejected", "FORK_PR", "포크 PR 브랜치에는 커밋할 수 없다 — deploy.yaml 을 직접 추가해라")
     if deps.github is None:
         return _done("rejected", "COMMIT_UNAVAILABLE", "GitHub 쓰기 클라이언트가 없어 생성 커밋을 올릴 수 없다")
-    found = await _context(deps, repository)
+    found = await _context(deps, deps.github, repository, head_sha)
     if found is None:
         return _done("rejected", "NO_TARGET", "배포 대상 환경을 모른다 — 이전 배포(baseline)도 DEFAULT_TARGET 도 없다")
-    context, baseline = found
-    outcome = prepare_intake(row["kind"], context=context, baseline=baseline)
+    context, baseline, findings = found
+    outcome = prepare_intake(row["kind"], context=context, baseline=baseline, findings=findings)
     if outcome.action == "rejected":
         return _done("rejected", outcome.reason, outcome.message, outcome.details)
     # 다시 처리하는 행이면 이미 만든 커밋을 쓴다 — 같은 커밋으로 ref 를 옮기는 건 몇 번 해도 같다
