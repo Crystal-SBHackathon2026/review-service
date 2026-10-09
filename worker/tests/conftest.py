@@ -116,18 +116,18 @@ class Harness:
         self.graph = build_graph(self.deps, InMemorySaver())
         self.handler = ReviewHandler(self.repo, self.graph)
 
-    async def request(self, spec: dict[str, Any], review_id: str = "rv_20261008_test") -> bytes:
+    async def request(self, spec: dict[str, Any], review_id: str = "rv_20261008_test", head: str = HEAD) -> bytes:
         repository = spec["metadata"]["repository"]
-        spec_ref = {"repository": repository, "commit": HEAD, "path": "deploy.yaml"}
+        spec_ref = {"repository": repository, "commit": head, "path": "deploy.yaml"}
         msg = build_review_requested(spec, review_id=review_id, spec_ref=spec_ref, requested_by="tester",
                                      requested_at=datetime.now(UTC))
         await self.repo.insert_review(review_id=review_id, app=msg.app, target_env=msg.target_env,
-                                      repo_id=msg.repo_id, spec_ref=spec_ref, pr_head_sha=HEAD,
+                                      repo_id=msg.repo_id, spec_ref=spec_ref, pr_head_sha=head,
                                       requested_by="tester")
-        self.github.files.setdefault(HEAD, yaml.safe_dump(spec, sort_keys=False))
-        if HEAD not in self.github.pulls:
-            self.github.open_pr(repository, HEAD)
-        raw = msg.model_dump_json().encode()
+        self.github.files.setdefault(head, yaml.safe_dump(spec, sort_keys=False))
+        if head not in self.github.pulls:
+            self.github.open_pr(repository, head)
+        raw = self.last_requested = msg.model_dump_json().encode()  # 처리 중 예외가 나도 다시 넣을 수 있게
         await self.handler.handle("review.requested", raw)
         return raw
 

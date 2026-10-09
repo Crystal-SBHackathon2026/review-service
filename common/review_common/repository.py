@@ -21,6 +21,10 @@ ReviewDbStatus = Literal[
 ]
 FINISHED: frozenset[str] = frozenset({"committed", "blocked", "rejected", "failed", "superseded"})
 OPEN: tuple[str, ...] = ("received", "reviewing", "needs_human", "waiting_ci")  # 새 커밋이 오면 superseded 로 넘길 상태
+# 0008 부분 unique 인덱스에서 빠지는 상태 — 같은 레포·head SHA 라도 새 검토를 넣을 수 있다
+HEAD_REUSABLE: tuple[str, ...] = ("failed", "superseded")
+# review sweep 이 회수하는 상태 — 워커가 처리 중이어야 하는 상태. needs_human·waiting_ci 는 사람·CI 를 기다린다
+RECOVERABLE: tuple[str, ...] = ("received", "reviewing", "merging")
 
 JSON_COLUMNS = frozenset({"spec_ref", "decision", "findings", "rounds", "human_decision", "deploy_result", "final_spec"})
 UPDATABLE = JSON_COLUMNS | {"status", "verdict", "reasons", "merge_sha", "gitops_commit_sha", "error", "superseded_by"}
@@ -77,7 +81,10 @@ def baseline_for(row: dict[str, Any] | None) -> dict[str, Any] | None:
 class ReviewRepository(Protocol):
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
-                            pr_number: int | None = None) -> None: ...
+                            pr_number: int | None = None) -> str:
+        """received 로 넣고 review_id 를 돌려준다. 같은 repo_id·pr_head_sha 의 검토(failed·superseded 빼고)가
+        이미 있으면 넣지 않고 그 review_id 를 돌려준다 — 같은 웹훅이 동시에 와도 검토는 하나."""
+        ...
 
     async def get_review(self, review_id: str) -> dict[str, Any] | None: ...
 
@@ -97,16 +104,27 @@ class ReviewRepository(Protocol):
         ...
 
     async def find_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
-        """같은 레포(spec_ref.repository)·같은 head SHA 검토. 가장 최근 것."""
+        """같은 레포(spec_ref.repository)·같은 head SHA 검토. 가장 최근 것.
+
+        failed 는 뺀다 — 발행 실패 등으로 끝난 검토가 있어도 같은 SHA 가 다시 오면 새로 검토한다."""
         ...
 
-    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None) -> list[str]:
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None,
+                             error: str | None = None) -> list[str]:
         """그 PR 의 끝나지 않은 검토를 superseded 로 넘긴다 (superseded_by 자신은 빼고). 넘긴 review_id 들.
 
-        superseded_by=None — 새 커밋에 검토할 명세가 없다 (intake 로 갔다)."""
+        superseded_by=None — 새 커밋에 검토할 명세가 없다 (intake 로 갔다) 또는 PR 이 병합 없이 닫혔다(error="PR closed")."""
         ...
 
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]: ...
+
+    async def claim_stale_review(self, older_than: timedelta, statuses: Sequence[str]) -> dict[str, Any] | None:
+        """status 가 statuses 중 하나이고 updated_at 이 older_than 보다 오래된 검토 하나를 가져간다.
+
+        recover_count 를 1 올리고 updated_at 을 새로 찍은 행을 돌려준다. 없으면 None.
+        API 파드 여럿이 동시에 sweep 해도 한 행은 한 곳만 가져간다 (조건부 UPDATE·SKIP LOCKED).
+        """
+        ...
 
     async def find_by_merge_sha(self, *, app: str, target_env: str, image_tag: str) -> dict[str, Any] | None:
         """이미지 태그가 merge_sha 와 같은(짧은 SHA 면 앞부분이 같은) 검토. 가장 최근 것."""
@@ -222,12 +240,21 @@ class PostgresReviewRepository:
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
-                            pr_number: int | None = None) -> None:
-        await self._execute(
-            "INSERT INTO reviews (review_id, app, target_env, repo_id, spec_ref, pr_head_sha, requested_by,"
-            " pr_number, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'received')",
-            (review_id, app, target_env, repo_id, Jsonb(spec_ref), pr_head_sha, requested_by, pr_number),
-        )
+                            pr_number: int | None = None) -> str:
+        for _ in range(3):  # 겹친 행이 그사이 failed·superseded 가 되면 다시 넣는다
+            row = await self._fetchone(
+                "INSERT INTO reviews (review_id, app, target_env, repo_id, spec_ref, pr_head_sha, requested_by,"
+                " pr_number, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'received')"
+                " ON CONFLICT (repo_id, pr_head_sha) WHERE status NOT IN ('failed', 'superseded') DO NOTHING"
+                " RETURNING review_id",
+                (review_id, app, target_env, repo_id, Jsonb(spec_ref), pr_head_sha, requested_by, pr_number))
+            if row is None:
+                row = await self._fetchone(
+                    "SELECT review_id FROM reviews WHERE repo_id = %s AND pr_head_sha = %s AND NOT status = ANY(%s)",
+                    (repo_id, pr_head_sha, list(HEAD_REUSABLE)))
+            if row is not None:
+                return row["review_id"]
+        raise RuntimeError(f"검토를 넣지 못했다: {repo_id}@{pr_head_sha}")
 
     async def get_review(self, review_id: str) -> dict[str, Any] | None:
         return await self._fetchone("SELECT * FROM reviews WHERE review_id = %s", (review_id,))
@@ -266,20 +293,30 @@ class PostgresReviewRepository:
 
     async def find_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
         return await self._fetchone(
-            "SELECT * FROM reviews WHERE spec_ref->>'repository' = %s AND pr_head_sha = %s"
+            "SELECT * FROM reviews WHERE spec_ref->>'repository' = %s AND pr_head_sha = %s AND status <> 'failed'"
             " ORDER BY created_at DESC LIMIT 1", (repository, sha))
 
-    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None) -> list[str]:
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None,
+                             error: str | None = None) -> list[str]:
         rows = await self._fetchall(
-            "UPDATE reviews SET status = 'superseded', superseded_by = %s, updated_at = now()"
+            "UPDATE reviews SET status = 'superseded', superseded_by = %s, error = COALESCE(%s, error),"
+            " updated_at = now()"
             " WHERE spec_ref->>'repository' = %s AND pr_number = %s AND review_id IS DISTINCT FROM %s::text"
             " AND status = ANY(%s)"
-            " RETURNING review_id", (superseded_by, repository, pr_number, superseded_by, list(OPEN)))
+            " RETURNING review_id", (superseded_by, error, repository, pr_number, superseded_by, list(OPEN)))
         return [r["review_id"] for r in rows]
 
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]:
         return await self._fetchall(
             "SELECT * FROM reviews WHERE pr_head_sha = %s AND status = 'waiting_ci' ORDER BY created_at", (sha,))
+
+    async def claim_stale_review(self, older_than: timedelta, statuses: Sequence[str]) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "UPDATE reviews SET recover_count = recover_count + 1, updated_at = now() WHERE review_id = ("
+            " SELECT review_id FROM reviews WHERE status = ANY(%s) AND updated_at < now() - %s"
+            " ORDER BY updated_at LIMIT 1 FOR UPDATE SKIP LOCKED)"
+            " AND status = ANY(%s) AND updated_at < now() - %s RETURNING *",
+            (list(statuses), older_than, list(statuses), older_than))
 
     async def find_by_merge_sha(self, *, app: str, target_env: str, image_tag: str) -> dict[str, Any] | None:
         if len(image_tag) < 7:
@@ -418,9 +455,12 @@ class InMemoryReviewRepository:
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
-                            pr_number: int | None = None) -> None:
+                            pr_number: int | None = None) -> str:
         if review_id in self.reviews:
             raise ValueError(f"review_id 중복: {review_id}")
+        for r in self.reviews.values():
+            if r["repo_id"] == repo_id and r["pr_head_sha"] == pr_head_sha and r["status"] not in HEAD_REUSABLE:
+                return r["review_id"]
         now = _now()
         self.reviews[review_id] = {
             "review_id": review_id, "app": app, "target_env": target_env, "repo_id": repo_id,
@@ -428,8 +468,9 @@ class InMemoryReviewRepository:
             "status": "received", "verdict": None, "reasons": [], "decision": None, "findings": None,
             "rounds": None, "human_decision": None, "deploy_result": None, "gitops_commit_sha": None,
             "final_spec": None, "error": None, "superseded_by": None, "requested_by": requested_by,
-            "pr_number": pr_number, "created_at": now, "updated_at": now,
+            "pr_number": pr_number, "recover_count": 0, "created_at": now, "updated_at": now,
         }
+        return review_id
 
     async def get_review(self, review_id: str) -> dict[str, Any] | None:
         row = self.reviews.get(review_id)
@@ -468,21 +509,31 @@ class InMemoryReviewRepository:
         return [copy.deepcopy({k: r[k] for k in LIST_FIELDS}) for r in rows[:limit]]
 
     async def find_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
-        return self._latest(r for r in self.reviews.values()
-                            if r["spec_ref"].get("repository") == repository and r["pr_head_sha"] == sha)
+        return self._latest(r for r in self.reviews.values() if r["spec_ref"].get("repository") == repository
+                            and r["pr_head_sha"] == sha and r["status"] != "failed")
 
-    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None) -> list[str]:
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None,
+                             error: str | None = None) -> list[str]:
         done = []
         for r in sorted(self.reviews.values(), key=lambda r: r["created_at"]):
             if (r["spec_ref"].get("repository") == repository and r["pr_number"] == pr_number
                     and r["review_id"] != superseded_by and r["status"] in OPEN):
-                r.update(status="superseded", superseded_by=superseded_by, updated_at=_now())
+                r.update(status="superseded", superseded_by=superseded_by, error=error or r["error"], updated_at=_now())
                 done.append(r["review_id"])
         return done
 
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]:
         rows = [r for r in self.reviews.values() if r["pr_head_sha"] == sha and r["status"] == "waiting_ci"]
         return copy.deepcopy(sorted(rows, key=lambda r: r["created_at"]))
+
+    async def claim_stale_review(self, older_than: timedelta, statuses: Sequence[str]) -> dict[str, Any] | None:
+        now = _now()
+        rows = [r for r in self.reviews.values() if r["status"] in statuses and r["updated_at"] < now - older_than]
+        if not rows:
+            return None
+        row = min(rows, key=lambda r: r["updated_at"])
+        row.update(recover_count=row["recover_count"] + 1, updated_at=now)
+        return copy.deepcopy(row)
 
     async def find_by_merge_sha(self, *, app: str, target_env: str, image_tag: str) -> dict[str, Any] | None:
         return self._latest(r for r in self.reviews.values()

@@ -91,13 +91,59 @@ async def test_other_apps_suites_are_ignored(harness: Harness) -> None:
     assert harness.github.merged
 
 
-async def test_check_suites_error_falls_back_to_webhook(harness: Harness) -> None:
+async def test_ci_lookup_failure_merges_on_webhook_conclusion(harness: Harness) -> None:
+    """P1-5 — check-suites 조회가 실패하면 웹훅 한 건의 conclusion 으로 병합하지 않고 waiting_ci 로 기다린다."""
     harness.github.suite_error = GitHubError("boom", 502)
     await harness.request(load_sample(SAMPLE_01))
     assert harness.row()["status"] == "waiting_ci"
 
-    await harness.ci(RID, "success")  # 조회가 여전히 실패하면 웹훅 결론을 쓴다
+    await harness.ci(RID, "success")  # 다른 suite 가 아직 돌 수도 있다 — 조회가 안 되면 모른다
+    assert harness.github.merged == []
+    assert harness.row()["status"] == "waiting_ci"
+    assert (await _state(harness))["_next"] == ("wait_ci",)
+
+    harness.github.suite_error = None  # 조회가 돌아오면 다음 웹훅에 전체 suite 를 보고 병합한다
+    await _finish_ci(harness)
     assert harness.github.merged
+
+
+class FlakySuites:
+    """check-suites 응답을 호출마다 차례로 준다 — 마지막 것은 계속."""
+
+    def __init__(self, harness: Harness, *answers: list[dict[str, Any]] | GitHubError) -> None:
+        self.answers = list(answers)
+        self.calls = 0
+        harness.github.check_suites = self  # type: ignore[method-assign]
+
+    async def __call__(self, repository: str, sha: str) -> list[dict[str, Any]]:
+        answer = self.answers[min(self.calls, len(self.answers) - 1)]
+        self.calls += 1
+        if isinstance(answer, GitHubError):
+            raise answer
+        return answer
+
+
+async def test_merge_rechecks_all_suites_right_before_merge(harness: Harness) -> None:
+    """check_ci 가 끝난 걸 본 뒤 병합 직전 다시 읽었더니 suite 2개 중 1개만 끝났다 — 병합하지 않고 waiting_ci."""
+    suites = FlakySuites(harness, [suite(conclusion="success")],
+                         [suite(conclusion="success"), suite(status="in_progress", conclusion=None)])
+    await harness.request(load_sample(SAMPLE_01))
+
+    assert harness.github.merged == []
+    assert harness.row()["status"] == "waiting_ci"
+    assert (await _state(harness))["_next"] == ("wait_ci",)
+
+    suites.answers = [[suite(conclusion="success"), suite(conclusion="success")]]  # 두 번째 suite 도 끝났다
+    await harness.ci(RID, "success")
+    assert harness.github.merged
+
+
+async def test_merge_recheck_lookup_failure_does_not_merge(harness: Harness) -> None:
+    FlakySuites(harness, [suite(conclusion="success")], GitHubError("boom", 502))
+    await harness.request(load_sample(SAMPLE_01))
+
+    assert harness.github.merged == []
+    assert harness.row()["status"] == "waiting_ci"
 
 
 async def test_01_ci_success_merges_then_commit_stub(harness: Harness) -> None:
@@ -461,6 +507,20 @@ async def test_judge_transient_retries_then_llm_unavailable() -> None:
 
 
 async def test_graph_exception_marks_failed() -> None:
+    async def boom(state: dict[str, Any]) -> str | None:
+        raise RuntimeError("gitops 읽기 실패")
+
+    h = Harness(overlay_guard=boom)
+    await h.request(load_sample(SAMPLE_01))
+    await _finish_ci(h)
+
+    assert h.row()["status"] == "failed"
+    assert "gitops 읽기 실패" in h.row()["error"]
+    assert h.github.merged == []
+
+
+async def test_overlay_exception_after_merge_stays_merging() -> None:
+    """병합 뒤 gitops 커밋 예외 — failed 로 끝내지 않는다. review sweep 이 retry_overlay 로 commit_overlay 만 다시 한다."""
     async def boom(state: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("gitops push 실패")
 
@@ -468,8 +528,9 @@ async def test_graph_exception_marks_failed() -> None:
     await h.request(load_sample(SAMPLE_01))
     await _finish_ci(h)
 
-    assert h.row()["status"] == "failed"
-    assert "gitops push 실패" in h.row()["error"]
+    row = h.row()
+    assert (row["status"], row["merge_sha"], row["gitops_commit_sha"]) == ("merging", MERGE_SHA, None)
+    assert "gitops push 실패" in row["error"]
 
 
 # --- commit_overlay 연결 (성진님 make_commit_overlay + GitClient) ------------------------------------
@@ -686,7 +747,7 @@ async def test_next_review_of_same_rule_gets_case_as_evidence() -> None:
     await h.request(load_sample(SAMPLE_06), review_id="rv_first")
     await h.human("rv_first", "rejected")
 
-    await h.request(load_sample(SAMPLE_06), review_id="rv_second")
+    await h.request(load_sample(SAMPLE_06), review_id="rv_second", head="e" * 40)  # 같은 레포의 다음 커밋
 
     docs = (await _state(h, "rv_second"))["retrieved_docs"]
     case_docs = [d for d in docs if d["doc_type"] == "case"]

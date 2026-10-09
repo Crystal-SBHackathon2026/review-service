@@ -111,7 +111,8 @@ def worker_graph(repo: PostgresReviewRepository, github: FakeGitHub, checkpointe
 async def test_migrate_is_idempotent(conninfo: str) -> None:
     assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql", "0003_pr_number.sql",
                                        "0004_spec_intakes.sql", "0005_review_cases.sql",
-                                       "0006_generated_spec_unverified.sql"]
+                                       "0006_generated_spec_unverified.sql", "0007_review_recovery.sql",
+                                       "0008_review_head_unique.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -172,8 +173,10 @@ async def test_repository_on_postgres(pool: Any) -> None:
     assert (await repo.get_review("rv_a"))["superseded_by"] == "rv_2"
     assert (await repo.get_review("rv_b"))["status"] == "committed"
     assert (await repo.get_review("rv_c"))["status"] == "waiting_ci"
-    assert await repo.supersede_open(repository=REPO, pr_number=10, superseded_by=None) == ["rv_c"]  # intake 로 간 커밋
-    assert (await repo.get_review("rv_c"))["superseded_by"] is None
+    assert await repo.supersede_open(repository=REPO, pr_number=10, superseded_by=None,
+                                     error="PR closed") == ["rv_c"]  # 병합 없이 닫힌 PR
+    assert ((await repo.get_review("rv_c"))["superseded_by"], (await repo.get_review("rv_c"))["error"]) == (
+        None, "PR closed")
 
     # 승인 화면 목록: 상태 필터, 최신순, limit, 목록 필드만
     listed = await repo.list_reviews(["committed", "received"], 10)
@@ -181,6 +184,10 @@ async def test_repository_on_postgres(pool: Any) -> None:
     assert set(listed[0]) == set(LIST_FIELDS) and listed[0]["pr_number"] == 9
     assert [r["review_id"] for r in await repo.list_reviews(["committed", "received"], 1)] == ["rv_b"]
     assert [r["review_id"] for r in await repo.list_reviews([], 2)] == ["rv_c", "rv_b"]
+
+    # failed 는 같은 SHA 가 다시 오면 새로 검토한다 — find_by_head 가 찾지 않는다
+    await repo.update_review("rv_b", status="failed")
+    assert await repo.find_by_head(REPO, "2" * 40) is None
 
 
 async def test_spec_intakes_on_postgres(pool: Any) -> None:
@@ -243,9 +250,10 @@ async def test_review_cases_on_postgres(pool: Any) -> None:
     """판단 사례 — case_id 로 한 번만, rule_id 배열 매칭, 같은 앱·레포·허용한 종료 방식만, 같은 대상 환경 먼저·그 안에서 최근 순."""
     repo = PostgresReviewRepository(pool)
     for rid, repository in (("rv_1", REPO), ("rv_2", REPO), ("rv_3", REPO), ("rv_4", REPO), ("rv_5", "other/repo")):
+        sha = rid[-1] * 40  # 같은 레포·SHA 검토는 하나뿐이다 (0008)
         await repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=repository,
-                                 spec_ref={"repository": repository, "commit": HEAD, "path": "deploy.yaml"},
-                                 pr_head_sha=HEAD, requested_by="it")
+                                 spec_ref={"repository": repository, "commit": sha, "path": "deploy.yaml"},
+                                 pr_head_sha=sha, requested_by="it")
 
     def case(rid: str, env: str, rules: list[str], *, app: str = "sample-app", outcome: str = "rejected"
              ) -> dict[str, Any]:

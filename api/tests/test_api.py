@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from review_ai.errors import TransientError
 from review_ai.messages import ReviewRequested
 from review_api.app import ApiDeps, create_app
 from review_common.ids import new_review_id
 from review_common.github import SpecNotFound
+from review_common.kafka import DEFAULT_SEND_TIMEOUT, KafkaPublisher
 from review_common.repository import InMemoryReviewRepository
 from review_common.resumed import parse_review_resumed
 
@@ -87,6 +92,46 @@ def test_healthz(env: Env) -> None:
     assert env.client.get("/healthz").status_code == 200
 
 
+async def _ok() -> None:
+    return None
+
+
+def test_readyz_ok_when_db_and_kafka_answer(env: Env) -> None:
+    env.app.state.deps.readiness = {"db": _ok, "kafka": _ok}
+
+    resp = TestClient(env.app).get("/readyz")  # probe 는 토큰 없이
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "checks": {"db": "ok", "kafka": "ok"}}
+
+
+def test_readyz_503_when_db_down_but_healthz_200(env: Env) -> None:
+    """P2 — DB 가 죽으면 /readyz 503 (트래픽을 빼고), /healthz 는 200 그대로 (ALB·liveness 가 파드를 죽이지 않게)."""
+    async def db_down() -> None:
+        raise ConnectionError("connection refused")
+
+    env.app.state.deps.readiness = {"db": db_down, "kafka": _ok}
+
+    resp = env.client.get("/readyz")
+    assert resp.status_code == 503
+    assert resp.json()["checks"] == {"db": "ConnectionError: connection refused", "kafka": "ok"}
+    assert env.client.get("/healthz").status_code == 200
+
+
+def test_readyz_503_when_a_check_hangs(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    import review_api.app as app_module
+
+    async def hang() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(app_module, "READY_TIMEOUT_SECONDS", 0.05)
+    env.app.state.deps.readiness = {"db": _ok, "kafka": hang}
+
+    resp = env.client.get("/readyz")
+    assert resp.status_code == 503
+    assert resp.json()["checks"] == {"db": "ok", "kafka": "TimeoutError"}
+
+
 def test_sample_01_accepted_and_published(env: Env) -> None:
     env.put_spec(sample_text())
     resp = env.request_review()
@@ -129,6 +174,16 @@ def test_bad_request_shape_is_422(env: Env) -> None:
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize("commit", [HEAD[:7], HEAD[:39], HEAD + "a", HEAD.upper()])
+def test_short_sha_accepted_by_api(env: Env, commit: str) -> None:
+    """P1-7 — 짧은 SHA 를 접수하면 병합 단계(merge_pull 의 sha)에서야 실패했다. 이제 접수할 때 422."""
+    env.put_spec(sample_text(), sha=commit)
+    resp = env.request_review(sha=commit)
+
+    assert resp.status_code == 422
+    assert env.repo.reviews == {} and env.publisher.sent == []
+
+
 def test_publish_failure_marks_failed(env: Env) -> None:
     async def boom(*_: Any) -> None:
         raise RuntimeError("kafka down")
@@ -140,6 +195,53 @@ def test_publish_failure_marks_failed(env: Env) -> None:
     assert resp.status_code == 503
     [row] = env.repo.reviews.values()
     assert row["status"] == "failed"
+
+
+class StuckProducer:
+    """MSK 가 응답하지 않는다 — send_and_wait 가 끝나지 않는다."""
+
+    async def send_and_wait(self, topic: str, value: bytes | None = None, key: bytes | None = None) -> None:
+        await asyncio.Event().wait()
+
+
+def test_kafka_send_timeout_default_fits_github_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KAFKA_SEND_TIMEOUT", raising=False)
+    assert KafkaPublisher(StuckProducer()).timeout == DEFAULT_SEND_TIMEOUT <= 5  # GitHub 웹훅은 10초 안에 응답해야 한다
+    monkeypatch.setenv("KAFKA_SEND_TIMEOUT", "2.5")
+    assert KafkaPublisher(StuckProducer()).timeout == 2.5
+
+
+async def test_stuck_kafka_send_raises_transient_error() -> None:
+    with pytest.raises(TransientError, match="review.requested"):
+        await KafkaPublisher(StuckProducer(), timeout=0.05).send("review.requested", "k", b"v")
+
+
+@pytest.mark.parametrize("route", ["review", "decision", "check_suite"])
+async def test_stuck_kafka_returns_503_within_timeout(env: Env, route: str) -> None:
+    """발행이 멈추면 웹훅·API 가 KAFKA_SEND_TIMEOUT 안에 503 을 준다 (P1-6)."""
+    env.publisher = KafkaPublisher(StuckProducer(), timeout=0.2)  # type: ignore[assignment]
+    env.app.state.deps.publisher = env.publisher
+    env.put_spec(sample_text())
+    rid = new_review_id()
+    if route != "review":
+        await env.repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=REPO,
+                                     spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
+                                     pr_head_sha=HEAD, requested_by="t")
+        await env.set_status(rid, status="needs_human" if route == "decision" else "waiting_ci")
+
+    started = time.monotonic()
+    if route == "review":
+        resp = env.request_review()
+    elif route == "decision":
+        resp = env.client.post(f"/reviews/{rid}/decision", json={"decision": "rejected", "approver": "h"})
+    else:
+        raw, sig = signed({"action": "completed", "check_suite": {
+            "head_sha": HEAD, "conclusion": "success", "app": {"slug": "github-actions"}}})
+        resp = env.client.post("/webhooks/github", content=raw,
+                               headers={"X-GitHub-Event": "check_suite", "X-Hub-Signature-256": sig})
+
+    assert resp.status_code == 503
+    assert time.monotonic() - started < 5
 
 
 def test_review_id_format() -> None:
@@ -172,10 +274,10 @@ async def _listed(env: Env, statuses: list[str]) -> list[str]:
     """statuses 순서대로 검토를 만든다. created_at 은 한 시간씩 뒤 — 마지막이 가장 최근."""
     ids = []
     for i, status in enumerate(statuses):
-        rid = f"rv_20261009_{i:08x}"
+        rid, sha = f"rv_20261009_{i:08x}", f"{i:x}" * 40  # 같은 SHA 검토는 하나뿐이다 (0008)
         await env.repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=REPO,
-                                     spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
-                                     pr_head_sha=HEAD, requested_by="hyeyeon", pr_number=5)
+                                     spec_ref={"repository": REPO, "commit": sha, "path": "deploy.yaml"},
+                                     pr_head_sha=sha, requested_by="hyeyeon", pr_number=5)
         env.repo.reviews[rid]["created_at"] = datetime(2026, 10, 9, i, tzinfo=UTC)
         await env.set_status(rid, status=status)
         ids.append(rid)
@@ -555,6 +657,38 @@ def test_same_sha_twice_makes_one_review(env: Env) -> None:
     assert len(env.repo.reviews) == 1 and len(env.publisher.sent) == 1
 
 
+async def test_same_webhook_twice_at_once_makes_one_review(env: Env) -> None:
+    """P2 — 같은 웹훅 두 개가 동시에 와서 둘 다 find_by_head 를 지나도 검토는 하나, 발행도 한 번."""
+    env.put_spec(sample_text())
+    both_fetching = asyncio.Barrier(2)
+    get_file = env.specs.get_file
+
+    async def slow_get_file(repository: str, path: str, ref: str) -> str:
+        await both_fetching.wait()  # 둘 다 find_by_head 를 지난 뒤에 넣는다
+        return await get_file(repository, path, ref)
+
+    env.specs.get_file = slow_get_file  # type: ignore[method-assign]
+    raw, sig = signed(pr_event("opened"))
+    headers = {"X-GitHub-Event": "pull_request", "X-Hub-Signature-256": sig}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=env.app), base_url="http://api") as client:
+        a, b = await asyncio.gather(client.post("/webhooks/github", content=raw, headers=headers),
+                                    client.post("/webhooks/github", content=raw, headers=headers))
+
+    assert a.status_code == b.status_code == 202
+    assert a.json()["review_id"] == b.json()["review_id"]
+    assert len(env.repo.reviews) == 1 and len(env.publisher.sent) == 1
+
+
+async def test_same_sha_after_failed_review_is_reviewed_again(env: Env) -> None:
+    env.put_spec(sample_text())
+    first = env.request_review().json()["review_id"]
+    await env.set_status(first, status="failed")
+
+    second = env.request_review().json()["review_id"]
+
+    assert second != first and len(env.publisher.sent) == 2
+
+
 async def test_synchronize_supersedes_open_reviews_of_same_pr(env: Env) -> None:
     new_sha = "b" * 40
     env.put_spec(sample_text())
@@ -589,8 +723,57 @@ async def test_superseded_status_is_not_overwritten_by_worker(env: Env) -> None:
     assert (env.repo.reviews[rid]["status"], env.repo.reviews[rid]["verdict"]) == ("superseded", "pass")
 
 
+def closed_event(*, merged: bool, number: int = 5) -> dict[str, Any]:
+    body = pr_event("closed", number=number)
+    body["pull_request"]["merged"] = merged
+    return body
+
+
+async def test_closed_pr_supersedes_open_reviews_and_leaves_ui_list(env: Env) -> None:
+    """P2 — needs_human 검토가 있는 PR 을 결정 없이 닫으면 superseded, 승인 화면 목록(GET /reviews)에서 빠진다."""
+    env.put_spec(sample_text())
+    rid = send_pr(env, pr_event("opened")).json()["review_id"]
+    await env.set_status(rid, status="needs_human")
+    await env.repo.insert_review(review_id="rv_done", app="sample-app", target_env="aws", repo_id=REPO,
+                                 spec_ref={"repository": REPO, "commit": "c" * 40, "path": "deploy.yaml"},
+                                 pr_head_sha="c" * 40, requested_by="x", pr_number=5)
+    await env.set_status("rv_done", status="committed")
+    assert [r["review_id"] for r in env.client.get("/reviews", params={"status": "needs_human"}).json()] == [rid]
+
+    resp = send_pr(env, closed_event(merged=False))
+
+    assert resp.json() == {"closed": 5, "superseded": [rid]}
+    row = env.repo.reviews[rid]
+    assert (row["status"], row["error"], row["superseded_by"]) == ("superseded", "PR closed", None)
+    assert env.repo.reviews["rv_done"]["status"] == "committed"
+    assert env.client.get("/reviews", params={"status": "needs_human"}).json() == []
+    # 멈춘 그래프에 사람 결정이 와도 받지 않는다
+    resp = env.client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "h"})
+    assert resp.status_code == 409
+
+
+async def test_merged_close_does_nothing(env: Env) -> None:
+    env.put_spec(sample_text())
+    rid = send_pr(env, pr_event("opened")).json()["review_id"]
+    await env.set_status(rid, status="waiting_ci")
+
+    assert send_pr(env, closed_event(merged=True)).json() == {"ignored": "merged"}
+    assert env.repo.reviews[rid]["status"] == "waiting_ci"
+
+
+def test_reopened_after_close_reviews_same_sha_again(env: Env) -> None:
+    env.put_spec(sample_text())
+    first = send_pr(env, pr_event("opened")).json()["review_id"]
+    send_pr(env, closed_event(merged=False))
+
+    body = send_pr(env, pr_event("reopened")).json()
+
+    assert body["review_id"] != first
+    assert env.repo.reviews[body["review_id"]]["status"] == "received"
+    assert len(env.publisher.sent) == 2
+
+
 @pytest.mark.parametrize("body", [
-    pr_event("closed"),
     pr_event("edited"),
     pr_event("opened", base="release"),  # 기본 브랜치가 아닌 PR
 ])

@@ -8,11 +8,13 @@
     GET  /intakes/{intake_id}           명세 없음·빈 명세·형식 오류 처리 기록 (PR 커밋 상태의 링크)
     POST /reviews/{review_id}/decision  needs_human 검토에 사람 결정 → review.resumed(human_decision)  [Bearer REVIEW_API_TOKEN]
     POST /webhooks/github               pull_request opened·synchronize·reopened → 검토 시작
+                                        closed(병합 없이) → 그 PR 의 끝나지 않은 검토 superseded
                                         (deploy.yaml 없음·빈 파일·형식 오류 → spec_intakes, review_api.intake)
                                         check_suite completed → review.resumed(ci_completed)
     POST /webhooks/argocd               배포 Healthy·Degraded 기록, Healthy 면 baselines 갱신, Degraded 면 판단 사례
                                         [Bearer ARGOCD_WEBHOOK_TOKEN]
-    GET  /healthz
+    GET  /healthz                       프로세스가 떠 있는지만 (ALB 헬스체크·livenessProbe)
+    GET  /readyz                        DB SELECT 1·Kafka producer 연결. 하나라도 실패하면 503 (readinessProbe)
 
 토큰이 설정되지 않은 [Bearer] 경로는 503 으로 거절한다 (fail-closed). GET 경로와 /webhooks/github(서명 검증)는 그대로.
 """
@@ -26,13 +28,13 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, get_args
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from review_ai.graph import check_edited_ops
@@ -49,6 +51,7 @@ from review_api.argocd import ArgoCdEvent, handle_deploy_event
 from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spec, open_intake, process_intake,
                                sweep_stale_intakes)
 from review_api.lockfile import regenerate_lockfile
+from review_api.recovery import sweep_stale_reviews
 from review_common.github import GitHubError, SpecNotFound
 from review_common.ids import new_review_id
 from review_common.repository import ReviewDbStatus, ReviewRepository
@@ -97,13 +100,43 @@ class ApiDeps:
     repair_llm: LlmClient | None = None  # 형식 오류 명세 복구. None 이면 yaml_error·schema_error 는 REPAIR_UNAVAILABLE
     transform_llm: LlmClient | None = None  # 새 앱 코드 패치(SQLite→Postgres·/metrics). None 이면 TRANSFORM_UNAVAILABLE
     lockfile: Callable[[str, str], Awaitable[str]] = regenerate_lockfile  # 코드 패치가 바꾼 의존성의 잠금 파일
+    # /readyz 가 볼 의존성 — 이름 → 실패하면 예외를 내는 확인. 비어 있으면 늘 준비됨
+    readiness: dict[str, Callable[[], Awaitable[Any]]] = field(default_factory=dict)
+
+
+READY_TIMEOUT_SECONDS = 2.0  # 확인 하나의 상한. readinessProbe timeoutSeconds 는 이보다 길게 (gitops, 기본 1초)
+
+
+def make_readiness(pool: Any, producer: Any) -> dict[str, Callable[[], Awaitable[Any]]]:
+    """운영 /readyz 확인 — 업무 DB SELECT 1, Kafka 브로커와 메타데이터 왕복(끊겼으면 KafkaError)."""
+    async def db() -> None:
+        async with pool.connection(timeout=READY_TIMEOUT_SECONDS) as conn:
+            await conn.execute("SELECT 1")
+
+    async def kafka() -> None:
+        await producer.client.fetch_all_metadata()
+
+    return {"db": db, "kafka": kafka}
+
+
+async def check_ready(checks: dict[str, Callable[[], Awaitable[Any]]]) -> dict[str, str]:
+    """각 확인을 동시에, READY_TIMEOUT_SECONDS 안에. 이름 → "ok" 또는 실패 사유."""
+    async def one(check: Callable[[], Awaitable[Any]]) -> str:
+        try:
+            await asyncio.wait_for(check(), READY_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001 — 사유만 보여 준다
+            return f"{type(exc).__name__}: {exc}"[:200] if str(exc) else type(exc).__name__
+        return "ok"
+
+    results = await asyncio.gather(*(one(check) for check in checks.values()))
+    return dict(zip(checks, results, strict=True))
 
 
 class SpecRefIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repository: str = Field(pattern=REPOSITORY, description="owner/repo")
-    commit: str = Field(pattern=r"^[0-9a-f]{7,40}$", description="PR head SHA")
+    commit: str = Field(pattern=r"^[0-9a-f]{40}$", description="PR head SHA (40자). 병합은 전체 SHA 가 필요하다")
     path: str = Field(default="deploy.yaml", min_length=1)
 
 
@@ -137,6 +170,13 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/readyz")
+    async def readyz(request: Request) -> JSONResponse:
+        checks = await check_ready(d(request).readiness)
+        ready = all(v == "ok" for v in checks.values())
+        return JSONResponse({"status": "ok" if ready else "unavailable", "checks": checks},
+                            status_code=200 if ready else 503)
 
     @app.post("/reviews", status_code=202)
     async def create_review(body: ReviewIn, request: Request,
@@ -216,7 +256,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             except ValueError as exc:
                 raise HTTPException(422, {"message": "edited_ops 를 적용할 수 없다", "errors": str(exc)}) from exc
         msg = HumanDecisionResumed(review_id=review_id, human_decision=body, resumed_at=datetime.now(UTC))
-        await deps_.publisher.send(RESUMED_TOPIC, review_id, msg.model_dump_json().encode())
+        await publish(deps_, RESUMED_TOPIC, review_id, msg.model_dump_json().encode())
         return {"review_id": review_id}
 
     @app.post("/webhooks/github", status_code=202)
@@ -251,7 +291,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         resumed = []
         for row in await deps_.repo.waiting_ci_by_head_sha(ci.head_sha):
             msg = CiCompletedResumed(review_id=row["review_id"], ci=ci, resumed_at=datetime.now(UTC))
-            await deps_.publisher.send(RESUMED_TOPIC, row["review_id"], msg.model_dump_json().encode())
+            await publish(deps_, RESUMED_TOPIC, row["review_id"], msg.model_dump_json().encode())
             resumed.append(row["review_id"])
         return {"resumed": resumed}
 
@@ -263,6 +303,15 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         return await handle_deploy_event(deps_.repo, event)
 
     return app
+
+
+async def publish(deps: ApiDeps, topic: str, key: str, value: bytes) -> None:
+    """발행 실패·시간 초과(KAFKA_SEND_TIMEOUT)는 503 — 웹훅 응답을 붙잡지 않는다. GitHub 은 실패한 전달을 다시 보낼 수 있다."""
+    try:
+        await deps.publisher.send(topic, key, value)
+    except Exception as exc:
+        log.exception("%s %s 발행 실패", topic, key)
+        raise HTTPException(503, "메시지를 큐에 넣지 못했다") from exc
 
 
 async def fetch_spec(deps: ApiDeps, spec_ref: dict[str, str]) -> dict[str, Any]:
@@ -287,14 +336,19 @@ async def start_review(deps: ApiDeps, spec_ref: dict[str, str], requested_by: st
 
 async def submit_review(deps: ApiDeps, loaded: dict[str, Any], spec_ref: dict[str, str], requested_by: str, *,
                         pr_number: int | None = None, generated_spec: bool = False) -> str:
-    """review_id 발급 → DB received → review.requested 발행. review_id 반환."""
+    """review_id 발급 → DB received → review.requested 발행. review_id 반환.
+
+    같은 레포·head SHA 검토가 이미 있으면(동시에 온 같은 웹훅) 새로 발행하지 않고 그 review_id 를 돌려준다."""
     commit = spec_ref["commit"]
     review_id = new_review_id()
     message = build_review_requested(loaded, review_id=review_id, spec_ref=spec_ref, requested_by=requested_by,
                                      requested_at=datetime.now(UTC), generated_spec=generated_spec)
-    await deps.repo.insert_review(review_id=review_id, app=message.app, target_env=message.target_env,
-                                  repo_id=message.repo_id, spec_ref=spec_ref, pr_head_sha=commit,
-                                  requested_by=requested_by, pr_number=pr_number)
+    stored = await deps.repo.insert_review(review_id=review_id, app=message.app, target_env=message.target_env,
+                                           repo_id=message.repo_id, spec_ref=spec_ref, pr_head_sha=commit,
+                                           requested_by=requested_by, pr_number=pr_number)
+    if stored != review_id:
+        log.info("%s@%s: 검토 %s 가 이미 있다 — 새로 발행하지 않는다", message.repo_id, commit, stored)
+        return stored
     try:
         await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
     except Exception as exc:
@@ -344,8 +398,13 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
       생성 커밋 위에 커밋이 더 올라와도 같다(명세는 여전히 레포 분석으로 만든 것). 판단 근거는 spec_intakes 기록뿐이다 —
       명세 파일 내용·커밋 메시지·PR 작성자처럼 PR 을 올린 사람이 바꿀 수 있는 표시는 보지 않는다
     - 포크 PR 은 {"skipped": "fork"} — 검토·intake 모두 하지 않는다
+    - 병합 없이 닫힌 PR(closed, merged=false)은 끝나지 않은 검토를 superseded(error "PR closed")로 넘긴다 →
+      승인 화면 목록에서 빠진다. 체크포인터에 멈춘 그래프는 그대로 둔다 — 상태가 바뀌어 재개 claim 이 실패한다.
+      다시 열면(reopened) 같은 head SHA 라도 새로 검토한다
     """
     action = payload.get("action")
+    if action == "closed":
+        return await on_pull_request_closed(deps, payload)
     if action not in PR_ACTIONS:
         return {"ignored": f"action {action}"}
     pr, repo = payload["pull_request"], payload["repository"]
@@ -355,7 +414,7 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
         return {"skipped": "fork"}
     repository, head_sha, number = repo["full_name"], pr["head"]["sha"], pr["number"]
     existing = await deps.repo.find_by_head(repository, head_sha)
-    if existing is not None:
+    if existing is not None and not (action == "reopened" and existing["status"] == "superseded"):
         return {"skipped": "already reviewed", "review_id": existing["review_id"]}
     taken = await deps.repo.find_intake_by_head(repository, head_sha)
     if taken is not None:
@@ -381,6 +440,22 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
         await deps.repo.link_intake(source["intake_id"], review_id=review_id)
         result["from_intake"] = source["intake_id"]
     return result
+
+
+PR_CLOSED = "PR closed"
+
+
+async def on_pull_request_closed(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, Any]:
+    """병합 없이 닫힌 PR — 그 PR 의 끝나지 않은 검토(received·reviewing·needs_human·waiting_ci)를 superseded 로.
+
+    병합으로 닫힌 것(워커 merge_pr 이 병합했다)은 아무것도 하지 않는다 — 검토는 merging 이후 상태라 OPEN 에도 없다.
+    """
+    pr = payload["pull_request"]
+    if pr.get("merged"):
+        return {"ignored": "merged"}
+    superseded = await deps.repo.supersede_open(repository=payload["repository"]["full_name"],
+                                                pr_number=pr["number"], superseded_by=None, error=PR_CLOSED)
+    return {"closed": pr["number"], "superseded": superseded}
 
 
 # 기본값(10분·재시도 2번)이면 처리 중인 intake 를 STALE_AFTER(2분) 뒤 sweep 이 다시 가져가 두 번 처리한다
@@ -417,6 +492,7 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
     from aiokafka import AIOKafkaProducer
 
     from review_common.github import GitHubClient
+    from review_common.kafka import KafkaPublisher
     from review_common.migrate import migrate
     from review_common.repository import PostgresReviewRepository, make_pool
     from review_common.settings import db_conninfo, kafka_bootstrap
@@ -429,14 +505,10 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
     await producer.start()
     github = GitHubClient()
 
-    class KafkaPublisher:
-        async def send(self, topic: str, key: str, value: bytes) -> None:
-            await producer.send_and_wait(topic, value=value, key=key.encode())
-
     app.state.deps = ApiDeps(
         repo=PostgresReviewRepository(pool),
         specs=github,
-        publisher=KafkaPublisher(),
+        publisher=KafkaPublisher(producer),
         github_webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET"),
         argocd_webhook_token=os.environ.get("ARGOCD_WEBHOOK_TOKEN") or None,
         api_token=os.environ.get("REVIEW_API_TOKEN") or None,
@@ -448,12 +520,15 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
                                       if r.strip()),
         repair_llm=make_repair_llm(),
         transform_llm=make_transform_llm(),
+        readiness=make_readiness(pool, producer),
     )
-    sweep = asyncio.create_task(sweep_stale_intakes(app.state.deps))
+    sweeps = [asyncio.create_task(sweep_stale_intakes(app.state.deps)),
+              asyncio.create_task(sweep_stale_reviews(app.state.deps))]  # 멈춘 intake·검토 회수
     try:
         yield
     finally:
-        sweep.cancel()
+        for sweep in sweeps:
+            sweep.cancel()
         await producer.stop()
         await github.aclose()
         await pool.close()
