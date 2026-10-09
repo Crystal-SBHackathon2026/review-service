@@ -7,7 +7,7 @@ ReviewRepository 프로토콜 하나에 Postgres 구현과 메모리 구현(테�
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
@@ -80,6 +80,11 @@ def baseline_for(row: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+# committed 검토 → baselines 행 모양. 배포 확인 전이라 데이터 유무를 모른다 — None 은 데이터 있음으로 취급된다.
+_COMMITTED_AS_BASELINE = ("app, target_env, final_spec AS spec, spec_ref, merge_sha,"
+                          " NULL::boolean AS database_has_data, NULL::timestamptz AS observed_at")
+
+
 class ReviewRepository(Protocol):
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
@@ -147,6 +152,16 @@ class ReviewRepository(Protocol):
         ...
 
     async def get_baseline(self, app: str, target_env: str) -> dict[str, Any] | None: ...
+
+    async def baseline_or_last_committed(self, app: str, target_env: str) -> dict[str, Any] | None:
+        """검토가 비교할 이전 배포 — baselines 행, 없으면 같은 app·target_env 로 gitops 에 마지막으로 커밋한
+        검토(committed)의 final_spec 을 baselines 행 모양으로(database_has_data=None → 데이터 있음으로 취급).
+
+        baselines 는 Argo Notifications 웹훅으로만 쓰인다. local(자체 Argo CD, pull 모델)·gcp 는 웹훅이 닿지 않거나
+        구독이 없어 비어 있고, 그러면 STO-006(볼륨 제거)·STO-005·DB-001 이 걸리지 않는다. 대체 규칙은
+        latest_baseline_for_repository 와 같다.
+        """
+        ...
 
     async def upsert_baseline(self, *, app: str, target_env: str, spec: dict[str, Any], spec_ref: dict[str, Any],
                               merge_sha: str | None, observed_at: datetime) -> None: ...
@@ -403,12 +418,17 @@ class PostgresReviewRepository:
         return await self._fetchone(
             "SELECT * FROM reviews WHERE superseded_by = %s ORDER BY created_at DESC LIMIT 1", (review_id,))
 
+    async def baseline_or_last_committed(self, app: str, target_env: str) -> dict[str, Any] | None:
+        return await self.get_baseline(app, target_env) or await self._fetchone(
+            f"SELECT {_COMMITTED_AS_BASELINE} FROM reviews"
+            " WHERE app = %s AND target_env = %s AND status = 'committed' AND final_spec IS NOT NULL"
+            " ORDER BY updated_at DESC LIMIT 1", (app, target_env))
+
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
         return await self._fetchone(
             "SELECT * FROM baselines WHERE spec_ref->>'repository' = %s ORDER BY observed_at DESC NULLS LAST LIMIT 1",
             (repository,)) or await self._fetchone(
-            "SELECT app, target_env, final_spec AS spec, spec_ref, merge_sha, NULL::boolean AS database_has_data,"
-            " NULL::timestamptz AS observed_at FROM reviews"
+            f"SELECT {_COMMITTED_AS_BASELINE} FROM reviews"
             " WHERE spec_ref->>'repository' = %s AND status = 'committed' AND final_spec IS NOT NULL"
             " ORDER BY updated_at DESC LIMIT 1", (repository,))
 
@@ -644,8 +664,15 @@ class InMemoryReviewRepository:
         rows.sort(key=lambda b: b["observed_at"] or datetime.min.replace(tzinfo=UTC))
         if rows:
             return copy.deepcopy(rows[-1])
-        committed = [r for r in self.reviews.values() if r["spec_ref"].get("repository") == repository
-                     and r["status"] == "committed" and r["final_spec"] is not None]
+        return self._last_committed_as_baseline(lambda r: r["spec_ref"].get("repository") == repository)
+
+    async def baseline_or_last_committed(self, app: str, target_env: str) -> dict[str, Any] | None:
+        return await self.get_baseline(app, target_env) or self._last_committed_as_baseline(
+            lambda r: r["app"] == app and r["target_env"] == target_env)
+
+    def _last_committed_as_baseline(self, match: Callable[[dict[str, Any]], bool]) -> dict[str, Any] | None:
+        committed = [r for r in self.reviews.values()
+                     if match(r) and r["status"] == "committed" and r["final_spec"] is not None]
         if not committed:
             return None
         last = max(committed, key=lambda r: r["updated_at"])
