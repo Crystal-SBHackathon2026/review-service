@@ -6,10 +6,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from review_ai.judge.fake_llm import ScriptedLLM
 from review_ai.spec.deploy_spec import AppSpec
+from review_api import intake
 from review_api.lockfile import LockfileUnavailable
 from tests.test_api import HEAD, pr_event, send_pr
 from tests.test_intake import IntakeEnv
@@ -106,6 +108,18 @@ def test_lockfile_failure_stops_the_commit() -> None:
     row = env.only_intake()
     assert (row["status"], row["reason"]) == ("rejected", "LOCKFILE_UNAVAILABLE")
     assert row["details"][0]["message"] == "npm 이 없다" and env.github.parents == {}
+
+
+def test_oversized_lockfile_is_not_read_whole_and_stops_the_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intake, "MAX_LOCK_BYTES", len(OLD_LOCK) - 1)
+    lockfile = Lockfile()
+    env = todo_env(ScriptedLLM(good_answer), lockfile)
+    send_pr(env, pr_event("opened"))
+
+    row = env.only_intake()
+    assert (row["status"], row["reason"]) == ("rejected", "LOCKFILE_UNAVAILABLE")
+    assert env.github.read_limits["package-lock.json"] == len(OLD_LOCK) - 1
+    assert lockfile.calls == [] and env.github.parents == {}
 
 
 def test_other_package_managers_lockfiles_are_not_regenerated() -> None:
