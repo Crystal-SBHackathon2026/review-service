@@ -128,23 +128,26 @@ def intake_kind(text: str | None) -> IntakeKind | None:
     return None
 
 
-def intake_answer(case: dict[str, Any]) -> dict[str, Any]:
-    """복구 정답 — 고치기 전 샘플. 가짜 oracle 이 내고, preserves_sample 이 결과와 비교한다."""
-    return yaml.safe_load((SAMPLES / case["intake"]["sample"]).read_text(encoding="utf-8"))
+def intake_answer(case: dict[str, Any]) -> dict[str, Any] | None:
+    """복구 정답 — 고치기 전 샘플(raw 케이스엔 없다). 가짜 복구가 내고, preserves_sample 이 결과와 비교한다."""
+    sample = case["intake"].get("sample")
+    return yaml.safe_load((SAMPLES / sample).read_text(encoding="utf-8")) if sample else None
 
 
-async def run_intake(case: dict[str, Any], repair_llm: RecordingLLM) -> tuple[IntakeKind, IntakeOutcome]:
+async def run_intake(case: dict[str, Any],
+                     make_repair: Callable[[], RecordingLLM]) -> tuple[IntakeKind, IntakeOutcome, RecordingLLM | None]:
+    """복구 LLM 은 원문이 형식 오류일 때만 만든다 — 생성 케이스엔 정답 샘플이 없어도 된다."""
     analysis = load_repo(case["intake"]["repo"])
     text = intake_text(case)
     kind = intake_kind(text)
     if kind is None:
         raise ValueError(f"{case['id']}: intake 케이스의 원문이 정상 명세다 — edit 가 깨뜨리지 못했다")
-    if kind in ("yaml_error", "schema_error"):
-        assert text is not None
-        outcome = await repair_intake(kind, text, context=analysis.context, baseline=None, llm=repair_llm)
-    else:
-        outcome = prepare_intake(kind, context=analysis.context, findings=analysis.findings)
-    return kind, outcome
+    if kind not in ("yaml_error", "schema_error"):
+        return kind, prepare_intake(kind, context=analysis.context, findings=analysis.findings), None
+    assert text is not None
+    repair_llm = make_repair()
+    outcome = await repair_intake(kind, text, context=analysis.context, baseline=None, llm=repair_llm)
+    return kind, outcome, repair_llm
 
 
 @dataclass
@@ -155,6 +158,8 @@ class _Run:
     final: dict[str, Any] | None
     outcome: IntakeOutcome | None = None
     kind: IntakeKind | None = None
+    repair_llm: RecordingLLM | None = None
+    paused: str | None = None       # resume 케이스: 사람 응답을 넣기 전 verdict (needs_human 이어야 한다)
     resume_error: str | None = None
     unchanged: bool = True  # 사람 응답이 거절됐을 때 상태가 그대로인가
 
@@ -204,15 +209,19 @@ def _check_intake(case: dict[str, Any], run: _Run) -> list[str]:
     codes = {d.get("code") for d in outcome.details}
     if set(exp.get("intake_issues", [])) - codes:
         failures.append(f"복구 게이트 사유 누락 {exp['intake_issues']} (실제 {sorted(c for c in codes if c)})")
-    if exp.get("preserves_sample") and outcome.content is not None:
-        repaired = DeploySpec.model_validate(yaml.safe_load(outcome.content))
-        if repaired != DeploySpec.model_validate(intake_answer(case)):
+    if exp.get("preserves_sample"):
+        answer = intake_answer(case)
+        if outcome.content is None or answer is None:
+            failures.append("비교할 복구 결과나 정답 샘플이 없다")
+        elif DeploySpec.model_validate(yaml.safe_load(outcome.content)) != DeploySpec.model_validate(answer):
             failures.append("복구한 명세가 원래 샘플과 다르다")
     return failures
 
 
 def _check_resume(case: dict[str, Any], run: _Run) -> list[str]:
     exp, failures = case["expect"], []
+    if run.paused not in (None, "needs_human"):  # 승인 API 는 needs_human 검토에만 응답을 받는다
+        failures.append(f"사람 확인에서 멈추지 않았다({run.paused}) — 재개할 수 없는 상태에 응답을 넣었다")
     if "resume_error" in exp:
         if run.resume_error is None or exp["resume_error"] not in run.resume_error:
             failures.append(f"사람 응답 거절 사유 {run.resume_error!r} 에 {exp['resume_error']!r} 가 없다")
@@ -264,23 +273,37 @@ def _usage(*llms: RecordingLLM) -> dict[str, int]:
 
 def _repair_role(case: dict[str, Any]) -> str | None:
     intake = case.get("intake")
-    return intake.get("repair", REVIEWER) if intake and "sample" in intake else None
+    return intake.get("repair", REVIEWER) if intake else None
 
 
-async def _execute(case: dict[str, Any], llm: RecordingLLM, repair_llm: RecordingLLM,
+def _repair_factory(case: dict[str, Any], repairer: Repairer | None) -> Callable[[], RecordingLLM]:
+    role = _repair_role(case)
+
+    def build() -> RecordingLLM:  # intake 케이스에서 원문이 형식 오류일 때만 불린다
+        make = (repairer or REPAIR_FAKES["oracle"]) if role == REVIEWER else REPAIR_FAKES[str(role)]
+        answer = intake_answer(case)
+        if answer is None and make in REPAIR_FAKES.values():  # 실제 Claude 는 정답 없이 돈다
+            raise ValueError(f"{case['id']}: 가짜 복구는 정답이 필요하다 — raw 대신 sample + edit 로 써라")
+        return RecordingLLM(make(answer or {}))
+
+    return build
+
+
+async def _execute(case: dict[str, Any], llm: RecordingLLM, make_repair: Callable[[], RecordingLLM],
                    retriever: Retriever) -> _Run:
-    outcome, kind = None, None
+    outcome, kind, repair_llm = None, None, None
     if "intake" in case:
-        kind, outcome = await run_intake(case, repair_llm)
+        kind, outcome, repair_llm = await run_intake(case, make_repair)
         if outcome.action == "rejected":
-            return _Run(spec=None, final=None, outcome=outcome, kind=kind)
+            return _Run(spec=None, final=None, outcome=outcome, kind=kind, repair_llm=repair_llm)
         assert outcome.content is not None
         spec = yaml.safe_load(outcome.content)
     else:
         spec = build_spec(case)
     final = await run_graph(initial_state(spec, review_id=f"eval-{case['id']}"), llm=llm, retriever=retriever)
-    run = _Run(spec=spec, final=final, outcome=outcome, kind=kind)
+    run = _Run(spec=spec, final=final, outcome=outcome, kind=kind, repair_llm=repair_llm)
     if "resume" in case:
+        run.paused = final["decision"]["verdict"]
         run.final, run.resume_error, run.unchanged = await resume(final, case["resume"], llm, retriever)
     return run
 
@@ -290,19 +313,18 @@ async def run_case(case: dict[str, Any], reviewer: Callable[[], LlmClient], retr
     """reviewer 는 judge 자리, repairer 는 형식 오류 복구 자리(intake 케이스). 없으면 가짜 oracle 복구."""
     role, repair_role = case["llm"], _repair_role(case)
     llm = RecordingLLM(reviewer() if role == REVIEWER else FAKES[role]())
-    make_repair = (repairer or REPAIR_FAKES["oracle"]) if repair_role in (None, REVIEWER) else REPAIR_FAKES[repair_role]
-    repair_llm = RecordingLLM(make_repair(intake_answer(case)) if repair_role else FAKES["unavailable"]())
     started = time.perf_counter()
-    run = await _execute(case, llm, repair_llm, retriever)
+    run = await _execute(case, llm, _repair_factory(case, repairer), retriever)
     validation = run.final["decision"]["validation"] if run.final else {}
     citations = validation.get("citations_ok") if validation.get("llm_available") else None
-    failures = _check(case, run, (llm, repair_llm))
+    recorders = (llm, run.repair_llm) if run.repair_llm else (llm,)
+    failures = _check(case, run, recorders)
     # 일부러 틀린 복구 가짜를 쓰는 케이스는 게이트 평가다 — reviewer 지표에 섞지 않는다
     label = f"repair:{repair_role}" if repair_role not in (None, REVIEWER) else role
     return CaseResult(
         case_id=case["id"], llm_role=label, ok=not failures, failures=failures,
-        verdict=run.verdict, reasons=run.reasons, llm_calls=len(llm.requests) + len(repair_llm.requests),
-        citations_ok=citations, usage=_usage(llm, repair_llm), seconds=time.perf_counter() - started,
+        verdict=run.verdict, reasons=run.reasons, llm_calls=sum(len(r.requests) for r in recorders),
+        citations_ok=citations, usage=_usage(*recorders), seconds=time.perf_counter() - started,
     )
 
 
