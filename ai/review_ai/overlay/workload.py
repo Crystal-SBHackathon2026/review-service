@@ -26,7 +26,7 @@ def _probe(path: str, port: int, period: int) -> dict[str, Any]:
     return {"httpGet": {"path": path, "port": port}, "periodSeconds": period}
 
 
-def _env(spec: AppSpec) -> list[dict[str, Any]]:
+def container_env(spec: AppSpec) -> list[dict[str, Any]]:
     plain = [{"name": k, "value": v} for k, v in spec.runtime.env.items()]
     refs = [
         {"name": s.name, "valueFrom": {"secretKeyRef": {"name": secret_name(spec), "key": s.name}}}
@@ -35,7 +35,7 @@ def _env(spec: AppSpec) -> list[dict[str, Any]]:
     return plain + refs
 
 
-def _resources(spec: AppSpec) -> dict[str, Any]:
+def resources(spec: AppSpec) -> dict[str, Any]:
     r = spec.runtime.resources
     out: dict[str, Any] = {"requests": {"cpu": r.cpu_request, "memory": r.memory_request}}
     limits = {k: v for k, v in (("cpu", r.cpu_limit), ("memory", r.memory_limit)) if v}
@@ -50,14 +50,14 @@ def container(spec: AppSpec) -> dict[str, Any]:
         "name": spec.metadata.name,  # image 는 넣지 않는다 — rollout_ops 가 base 값(CI 가 태그를 쓴 값)을 복사한다
         "ports": [{"containerPort": rt.port}],
     }
-    env = _env(spec)
+    env = container_env(spec)
     if env:
         c["env"] = env
     if rt.health.readiness:
         c["readinessProbe"] = _probe(rt.health.readiness, rt.port, READINESS_PERIOD)
     if rt.health.liveness:
         c["livenessProbe"] = _probe(rt.health.liveness, rt.port, LIVENESS_PERIOD)
-    c["resources"] = _resources(spec)
+    c["resources"] = resources(spec)
     if spec.storage.volumes:
         c["volumeMounts"] = [{"name": v.name, "mountPath": v.mount_path} for v in spec.storage.volumes]
     return c

@@ -18,7 +18,8 @@ from review_ai.state import Finding
 
 FAKE_MODEL = "fake-oracle"
 FIX_KIND = {"SEC-001": "env", "SEC-002": "env", "RUN-001": "code", "RUN-002": "code", "RUN-004": "code", "DB-004": "code",
-            "DB-001": "none", "DB-008": "none", "STO-005": "none", "STO-006": "none", "STO-001": "none"}
+            "DB-001": "none", "DB-008": "none", "STO-005": "none", "STO-006": "none", "STO-001": "none",
+            "RUN-006": "code"}
 BASE_LIMITS = {"cpu_limit": BASE_RESOURCES.cpu_limit, "memory_limit": BASE_RESOURCES.memory_limit}
 
 
@@ -52,6 +53,12 @@ def _db005_ops(spec: dict[str, Any]) -> list[dict[str, Any]]:
     return ops + [_op("add", "/database/volume", "data"), _op("replace", "/database/placement", "volume")]
 
 
+def _bluegreen_ops(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    if "rollout" in spec:
+        return [_op("replace", "/rollout/strategy", "bluegreen")]
+    return [_op("add", "/rollout", {"strategy": "bluegreen"})]
+
+
 def _ops_for(finding: Finding, spec: dict[str, Any], env: str) -> list[dict[str, Any]]:
     rule, path = finding["rule_id"], finding["location"]["spec_path"]
     if rule in {"DB-003", "STO-002"}:
@@ -73,6 +80,8 @@ def _ops_for(finding: Finding, spec: dict[str, Any], env: str) -> list[dict[str,
         return _db002_ops(spec, env)
     if rule == "DB-005":
         return _db005_ops(spec)
+    if rule == "RUN-007":
+        return _bluegreen_ops(spec)
     return []
 
 

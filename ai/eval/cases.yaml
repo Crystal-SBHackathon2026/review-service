@@ -219,6 +219,28 @@ cases:
     llm: reviewer
     expect: {verdict: pass, findings: [NET-001, STO-004], rounds: 1, values: {/storage/buckets/0/encryption: true}}
 
+  # ── 배포 계획: 스키마·DB 변경이면 전략을 bluegreen 으로, 호환 안 되는 스키마 변경은 사람에게 ──────────
+  - id: plan-db-switch-without-data-goes-bluegreen
+    sample: 04-human-engine-change-with-data.yaml
+    mutate:
+      - {op: replace, path: /baseline/facts/database_has_data, value: false}
+    llm: reviewer
+    expect: {verdict: pass, findings: [RUN-007], rounds: 1, values: {/rollout/strategy: bluegreen}}
+  - id: plan-breaking-migration-needs-human
+    sample: 04-human-engine-change-with-data.yaml
+    mutate:
+      - {op: replace, path: /database, value: {engine: postgres, version: "16", placement: managed,
+                                               migration: {command: [npm, run, migrate], change: breaking}}}
+    llm: reviewer
+    expect: {verdict: needs_human, reasons_include: [AUTOFIX_FORBIDDEN], findings: [RUN-006, RUN-007], rounds: 0}
+  - id: plan-expand-migration-passes
+    sample: 04-human-engine-change-with-data.yaml
+    mutate:
+      - {op: replace, path: /database, value: {engine: postgres, version: "16", placement: managed,
+                                               migration: {command: [npm, run, migrate], change: expand}}}
+    llm: reviewer
+    expect: {verdict: pass, findings: [], llm_calls: 0, rounds: 0}
+
   # ── 엣지케이스: 명세 없음·형식 오류·값 없는 승인 (plan 4-a) ──────────────────────
   - id: e01-missing
     intake: {repo: sample-app, file: missing}

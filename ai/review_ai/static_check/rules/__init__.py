@@ -35,4 +35,6 @@ CHECKS: dict[str, Check] = {
     "RUN-002": runtime.missing_liveness,
     "RUN-004": runtime.arch_mismatch,
     "RUN-005": runtime.missing_resource_limits,
+    "RUN-006": runtime.breaking_schema_change,
+    "RUN-007": runtime.canary_with_incompatible_versions,
 }

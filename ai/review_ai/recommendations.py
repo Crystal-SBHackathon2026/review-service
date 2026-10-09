@@ -102,6 +102,9 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
         elif rule == "RUN-005":
             ops = _resource_limit_ops(spec, before)
             why = "gitops base 와 같은 리소스 상한(250m / 128Mi)을 채움"
+        elif rule == "RUN-007":
+            ops = [{"op": "add", "path": "/rollout", "value": {**spec.get("rollout", {}), "strategy": "bluegreen"}}]
+            why = "두 버전이 섞여 요청을 받지 않도록 미리보기 확인 뒤 한 번에 전환(bluegreen)"
         elif rule in {"DB-001", "DB-008"} and previous:
             old, current = previous.database, before.database
             for field in ("engine", "version", "placement", "volume"):

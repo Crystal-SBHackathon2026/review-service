@@ -43,7 +43,7 @@ def test_only_empty_input_generates(raw: str | dict | None, sample_app: dict) ->
     response = result.to_response()
     assert response["preset"] == "container-http/v1"
     assert AppSpec.model_validate(yaml.safe_load(response["yaml"])) == result.spec
-    assert {r["source"] for r in response["recommendations"]} == {"catalog", "preset"}
+    assert {r["source"] for r in response["recommendations"]} == {"catalog", "preset", "rule"}
 
 
 @pytest.mark.parametrize("raw", ["[]", "false", "0", [], False, 0, {"runtime": {"port": 3000}}, "broken: ["])
@@ -101,7 +101,7 @@ def test_baseline_preserves_data_network_and_secrets(sample_app: dict) -> None:
     assert result.spec.network == baseline.spec.network
     assert result.spec.requirements.persistence
     assert not result.verification
-    assert {r.source for r in result.recommendations} == {"baseline"}
+    assert {r.source for r in result.recommendations} == {"baseline", "rule"}
     assert baseline.model_dump() == before
 
 
