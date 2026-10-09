@@ -164,3 +164,35 @@ def test_applied_ops_reproduces_resumed_spec() -> None:
     state = {"rounds": [{"patch": {"ops": [REMOVE_TOKEN]}}], "decision": {"verdict": "pass"}}
     original = load_sample_dict("06-human-plaintext-secret.yaml")
     assert "EXTERNAL_API_TOKEN" not in apply_ops(original, applied_ops(state))["runtime"]["env"]
+
+
+async def test_generated_spec_without_baseline_waits_for_human_even_when_clean() -> None:
+    final = await _review("01-pass-sample-app-aws.yaml", generated_spec=True)
+
+    assert (final["status"], final["decision"]["reasons"]) == ("needs_human", ["GENERATED_SPEC_UNVERIFIED"])
+
+
+async def test_generated_spec_is_not_asked_again_after_human_decision() -> None:
+    """사람이 확인하고 고친 뒤의 재검사는 같은 이유로 다시 멈추지 않는다."""
+    paused = await _review("01-pass-sample-app-aws.yaml", generated_spec=True)
+    final = await _resume(paused, _approved({"op": "replace", "path": "/runtime/replicas", "value": 2}))
+
+    assert (final["status"], final["decision"]["reasons"]) == ("pass", [])
+
+
+async def test_generated_spec_flows_from_kafka_message() -> None:
+    from datetime import UTC, datetime
+
+    from review_ai.messages import ReviewRequested, build_review_requested
+
+    spec = load_sample_dict("01-pass-sample-app-aws.yaml")
+    sent = build_review_requested(spec, review_id="r", spec_ref={"repository": "r", "commit": "c"},
+                                  requested_by="hyeyeon", requested_at=datetime.now(UTC), generated_spec=True)
+    message = ReviewRequested.model_validate_json(sent.model_dump_json())
+    assert ReviewRequested.model_fields["generated_spec"].default is False  # 이전 메시지는 일반 검토
+    state = initial_state(dict(message.deploy_spec), review_id=message.review_id,
+                          generated_spec=message.generated_spec)
+
+    final = await run_graph(state, llm=FAKES["oracle"](), retriever=FileRetriever())
+
+    assert final["decision"]["reasons"] == ["GENERATED_SPEC_UNVERIFIED"]

@@ -45,6 +45,11 @@ class ReviewRequested(BaseModel):
         default=False,
         description="spec_ref.commit 이 워커가 applied_ops 를 커밋한 것(봇 커밋)이면 True — 또 fix 면 needs_human",
     )
+    generated_spec: bool = Field(
+        default=False,
+        description="intake 가 baseline 없이 만든 명세가 들어 있는 PR 이면 True — pass 여도 needs_human. "
+                    "Review API 가 spec_intakes 기록으로 정한다 (명세 내용·PR 작성자가 바꿀 수 있는 표시가 아님)",
+    )
 
     @model_validator(mode="after")
     def _safe_payload(self) -> ReviewRequested:
@@ -71,6 +76,7 @@ def build_review_requested(
     requested_by: str,
     requested_at: datetime,
     autofix_commit: bool = False,
+    generated_spec: bool = False,
 ) -> ReviewRequested:
     body = mask_spec({k: v for k, v in spec.items() if k != "baseline"})
     return ReviewRequested(
@@ -84,4 +90,5 @@ def build_review_requested(
         requested_by=requested_by,
         requested_at=requested_at,
         autofix_commit=autofix_commit,
+        generated_spec=generated_spec,
     )
