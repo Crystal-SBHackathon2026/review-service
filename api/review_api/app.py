@@ -103,7 +103,7 @@ class SpecRefIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repository: str = Field(pattern=REPOSITORY, description="owner/repo")
-    commit: str = Field(pattern=r"^[0-9a-f]{7,40}$", description="PR head SHA")
+    commit: str = Field(pattern=r"^[0-9a-f]{40}$", description="PR head SHA (40자). 병합은 전체 SHA 가 필요하다")
     path: str = Field(default="deploy.yaml", min_length=1)
 
 

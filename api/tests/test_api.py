@@ -133,6 +133,16 @@ def test_bad_request_shape_is_422(env: Env) -> None:
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize("commit", [HEAD[:7], HEAD[:39], HEAD + "a", HEAD.upper()])
+def test_short_sha_accepted_by_api(env: Env, commit: str) -> None:
+    """P1-7 — 짧은 SHA 를 접수하면 병합 단계(merge_pull 의 sha)에서야 실패했다. 이제 접수할 때 422."""
+    env.put_spec(sample_text(), sha=commit)
+    resp = env.request_review(sha=commit)
+
+    assert resp.status_code == 422
+    assert env.repo.reviews == {} and env.publisher.sent == []
+
+
 def test_publish_failure_marks_failed(env: Env) -> None:
     async def boom(*_: Any) -> None:
         raise RuntimeError("kafka down")
