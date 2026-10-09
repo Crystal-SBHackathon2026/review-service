@@ -16,8 +16,8 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from review_ai.judge.llm import CachedLLM, ClaudeLLM, LlmUnavailable
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
-from review_ai.retrieval.case_retriever import CaseRetriever, CompositeRetriever
-from review_ai.retrieval.file_retriever import FileRetriever
+from review_ai.retrieval.case_retriever import CaseRetriever
+from review_ai.retrieval.runtime import make_retriever, qdrant_from_url
 from review_common.github import GitHubClient, GitHubGitClient
 from review_common.migrate import migrate
 from review_common.repository import PostgresReviewRepository, make_pool
@@ -69,7 +69,9 @@ async def run() -> None:
         await checkpointer.setup()
         repo = PostgresReviewRepository(pool)
         await producer.start()
-        deps = Deps(repo=repo, github=github, publisher=KafkaPublisher(), llm=make_llm(), retriever=CompositeRetriever(FileRetriever(), CaseRetriever(repo)),
+        # 규칙 문서(파일) → Qdrant 의미 검색(QDRANT_URL 이 있을 때, 실패하면 건너뜀) → 판단 사례
+        retriever = make_retriever(CaseRetriever(repo), qdrant=qdrant_from_url(os.environ.get("QDRANT_URL")))
+        deps = Deps(repo=repo, github=github, publisher=KafkaPublisher(), llm=make_llm(), retriever=retriever,
                     commit_overlay=make_commit_overlay(GitHubGitClient(github)),  # gitops 레포: GITOPS_REPO
                     ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None)
         graph = build_graph(deps, checkpointer)
