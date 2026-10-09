@@ -1,0 +1,37 @@
+# 평가셋 intake 케이스의 레포 — sample-app 14411fd 의 분석 대상 파일을 줄인 것 (tests/test_intake_analyze.py 와 같은 내용).
+# context: 파이프라인이 웹훅·DEFAULT_TARGET 으로 아는 값. 나머지는 analyze_repository 가 files 에서 채운다.
+# tree: 분석이 읽지 않지만 레포에 있는 파일
+context:
+  repository: Crystal-SBHackathon2026/sample-app
+  target: {env: aws, region: ap-northeast-2, namespace: sample-app}
+tree: [package-lock.json, README.md, test/app.test.js]
+files:
+  Dockerfile: |
+    FROM node:22-alpine
+    WORKDIR /app
+    ENV NODE_ENV=production
+    COPY package.json package-lock.json ./
+    RUN npm ci --omit=dev
+    USER node
+    EXPOSE 8080
+    HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+    CMD ["node", "src/server.js"]
+  package.json: '{"name": "sample-app", "dependencies": {"express": "^4.21.2"}, "devDependencies": {"pg": "^8"}}'
+  .github/workflows/ci.yml: |
+    env:
+      IMAGE: ghcr.io/crystal-sbhackathon2026/sample-app
+    jobs:
+      build:
+        runs-on: ubuntu-latest
+        steps:
+          - run: docker build -t "$IMAGE:${{ github.sha }}" .
+          - uses: docker/login-action@v3
+            with:
+              registry: ghcr.io
+  src/app.js: |
+    const express = require("express");
+    const info = { version: process.env.APP_VERSION || "dev", environment: process.env.DEPLOY_ENV || "local" };
+    const failRate = Number(process.env.FAIL_RATE || 0);
+    const healthFail = process.env.HEALTH_FAIL === "true";
+  src/server.js: |
+    const port = Number(process.env.PORT || 8080);

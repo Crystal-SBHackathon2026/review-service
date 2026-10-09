@@ -1,7 +1,7 @@
 """환각 평가셋 실행.
 
     .venv/bin/python scripts/run_eval.py                       # 가짜 LLM (키 없이)
-    ANTHROPIC_API_KEY=... .venv/bin/python scripts/run_eval.py --llm claude --repeat 3
+    ANTHROPIC_API_KEY=... .venv/bin/python scripts/run_eval.py --llm claude --repeat 3  # judge·복구 모두 Claude
     .venv/bin/python scripts/run_eval.py --retriever qdrant --qdrant-url http://localhost:6333
 
 결과 JSON 은 eval/reports/ 에 남는다 (git 에는 올리지 않는다).
@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from review_ai.evaluation import REVIEWER, load_eval_cases, run_case, summarize  # noqa: E402
+from review_ai.intake.repair import RepairOutput  # noqa: E402
 from review_ai.judge.fake_llm import FAKES  # noqa: E402
 from review_ai.judge.llm import CachedLLM, ClaudeLLM  # noqa: E402
 from review_ai.retrieval.file_retriever import FileRetriever  # noqa: E402
@@ -55,8 +56,10 @@ async def main() -> None:
     if args.llm == "claude":
         claude = ClaudeLLM(**({"model": args.model} if args.model else {}))
         reviewer = lambda: claude  # noqa: E731 — 반복마다 새로 호출해야 흔들림을 잰다 (캐시 없음)
+        claude_repair = ClaudeLLM(output=RepairOutput, **({"model": args.model} if args.model else {}))
+        repairer = lambda _answer: claude_repair  # noqa: E731 — 정답은 가짜 oracle 만 쓴다
     else:
-        reviewer = FAKES["oracle"]
+        reviewer, repairer = FAKES["oracle"], None
     retriever = await make_retriever(args.retriever, args.qdrant_url)
 
     results = []
@@ -65,7 +68,7 @@ async def main() -> None:
             continue
         times = args.repeat if case["llm"] == REVIEWER else 1
         for _ in range(times):
-            result = await run_case(case, reviewer, retriever)
+            result = await run_case(case, reviewer, retriever, repairer)
             results.append(result)
             mark = "OK " if result.ok else "FAIL"
             print(f"{mark} {case['id']:<40} {result.verdict:<12} {','.join(result.reasons) or '-':<30} "

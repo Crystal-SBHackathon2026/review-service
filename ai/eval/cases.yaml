@@ -1,5 +1,15 @@
 # 환각 평가셋 — 케이스 = (명세, LLM 역할) → 기대 결과.
 #
+# 입력은 셋 중 하나
+#   sample(+mutate)  검토할 명세
+#   intake           명세가 없거나 깨진 PR. Review API 와 같은 순서로 deploy.yaml 을 만든 뒤 검토한다
+#     repo     eval/repos/<repo>.yaml — 레포 분석 대상 파일 (생성·복구 모두 이 분석 결과를 context 로 쓴다)
+#     file: missing  파일 없음 / raw: 원문 그대로 / sample + edit: 샘플 원문에 [찾을 글자, 바꿀 글자] 를 차례로 적용
+#     repair   복구 LLM 자리. reviewer(기본: --llm fake 면 정답 가짜, claude 면 실제 Claude) 또는
+#              review_ai/intake/fake_repair.py REPAIR_FAKES 의 일부러 틀린 가짜 — 복구 게이트가 버리는지 본다
+#   resume           sample 검토가 needs_human 에서 멈춘 뒤 사람 응답 {edited_ops, use_recommendations} 로 재개.
+#                    승인 API 와 같은 검사(resolve_human_decision → check_edited_ops)를 먼저 거친다
+#
 # llm
 #   reviewer  평가 대상 LLM 자리. --llm fake 면 OracleLLM, --llm claude 면 실제 Claude 가 들어간다
 #   <이름>     review_ai/judge/fake_llm.py FAKES 의 일부러 틀린 가짜 — 코드 게이트가 잡는지 본다 (항상 가짜)
@@ -8,10 +18,16 @@
 #   verdict           최종 verdict (재검토 루프가 끝난 뒤)
 #   reasons_include   최종 사유 코드에 반드시 있어야 하는 것
 #   findings          1회차 static_check rule_id
-#   llm_calls         LLM 호출 수 (0 이면 비용 0 경로)
+#   llm_calls         judge LLM 호출 수 (0 이면 비용 0 경로). 복구 호출은 세지 않는다
 #   rounds            패치 적용 횟수
 #   prompt_must_not_contain  프롬프트에 들어가면 안 되는 문자열 (비밀 값)
 #   no_engine_change  최종 명세의 database.engine 이 처음과 같아야 한다
+#   intake_kind       Review API 가 원문을 분류한 결과 (missing·empty·yaml_error·schema_error)
+#   intake            generated · repaired · rejected. 거절이면 검토하지 않고 verdict 는 intake_rejected
+#   intake_issues     복구 게이트 거절 사유 코드 (INVENTED_VALUE·VALUE_CONFLICT …)
+#   preserves_sample  복구한 명세가 고치기 전 샘플과 같아야 한다 (값 보존·가린 비밀 복원)
+#   values            최종 명세의 JSON Pointer → 값
+#   resume_error      사람 응답이 이 글자를 담은 사유로 거절돼야 한다 (승인 API 422). 상태는 그대로여야 한다
 cases:
   # ── 샘플 10개: 정상 LLM 이면 cases.yaml 대로 끝나야 한다 ─────────────────
   - {id: s01-sample-app-aws, sample: 01-pass-sample-app-aws.yaml, llm: reviewer,
@@ -93,3 +109,56 @@ cases:
     sample: 07-fix-public-bucket.yaml
     llm: patch_out_of_scope
     expect: {verdict: needs_human, reasons_include: [PATCH_OUT_OF_SCOPE], rounds: 0}
+
+  # ── 엣지케이스: 명세 없음·형식 오류·값 없는 승인 (plan 4-a) ──────────────────────
+  - id: e01-missing
+    intake: {repo: sample-app, file: missing}
+    llm: reviewer
+    expect: {intake_kind: missing, intake: generated, verdict: pass, findings: [], llm_calls: 0}
+  - id: e02-empty
+    intake: {repo: sample-app, raw: "# 나중에 채운다\n"}
+    llm: reviewer
+    expect: {intake_kind: empty, intake: generated, verdict: pass, findings: [], llm_calls: 0}
+  - id: e03-yaml-syntax          # 들여쓰기가 한 칸 밀린 줄 — 앞 줄 값에 이어 붙어 YAML 이 깨진다
+    intake: {repo: sample-app, sample: 01-pass-sample-app-aws.yaml, edit: [["  replicas: 2", "   replicas: 2"]]}
+    llm: reviewer
+    expect: {intake_kind: yaml_error, intake: repaired, preserves_sample: true, verdict: pass, findings: [NET-001],
+             llm_calls: 0}
+  - id: e04-schema-typo          # replica 오타(extra 금지로 거절) + target 누락 → 오타는 옮기고 target 은 레포 분석·기본 대상에서
+    intake:
+      repo: sample-app
+      sample: 01-pass-sample-app-aws.yaml
+      edit: [["  replicas: 2", "  replica: 2"], ["target: {env: aws, region: ap-northeast-2, namespace: sample-app}\n", ""]]
+    llm: reviewer
+    expect: {intake_kind: schema_error, intake: repaired, preserves_sample: true, verdict: pass, findings: [NET-001]}
+  - id: e05-no-answer            # 엔진 변경 needs_human → 값 없이 승인하면 baseline 권장값(postgres 16)이 들어간다
+    sample: 04-human-engine-change-with-data.yaml
+    resume: {edited_ops: []}
+    llm: reviewer
+    expect: {verdict: pass, values: {/database/engine: postgres, /database/version: "16"}}
+  - id: e06-partial              # engine 만 답하면 version 은 권장값으로 보충
+    sample: 04-human-engine-change-with-data.yaml
+    resume: {edited_ops: [{op: replace, path: /database/engine, value: postgres}]}
+    llm: reviewer
+    expect: {verdict: pass, values: {/database/engine: postgres, /database/version: "16"}}
+  - id: e07-bad-path             # 없는 경로를 답하면 승인 API 가 422 — 명세·검토 상태는 그대로
+    sample: 04-human-engine-change-with-data.yaml
+    resume: {edited_ops: [{op: replace, path: /database/enigne, value: postgres}]}
+    llm: reviewer
+    expect: {verdict: needs_human, resume_error: enigne, values: {/database/engine: mysql}}
+  - id: e08-repair-invents       # 복구 LLM 이 원문에 없는 env 를 지어 넣으면 게이트가 버린다
+    intake: {repo: sample-app, sample: 01-pass-sample-app-aws.yaml, edit: [["  replicas: 2", "   replicas: 2"]],
+             repair: invents_value}
+    llm: reviewer
+    expect: {intake: rejected, intake_issues: [INVENTED_VALUE], verdict: intake_rejected}
+  - id: e08b-repair-changes      # 복구 LLM 이 원문 포트를 바꾸면 게이트가 버린다
+    intake: {repo: sample-app, sample: 01-pass-sample-app-aws.yaml, edit: [["  replicas: 2", "   replicas: 2"]],
+             repair: changes_value}
+    llm: reviewer
+    expect: {intake: rejected, intake_issues: [VALUE_CONFLICT], verdict: intake_rejected}
+  - id: e09-secret-in-broken-yaml  # 깨진 YAML 안 평문 토큰 — 복구·검토 프롬프트 어디에도 없고, 커밋본에는 원문대로 돌아온다
+    intake: {repo: sample-app, sample: 06-human-plaintext-secret.yaml, edit: [["  port: 8080", "  port: [8080"]]}
+    llm: reviewer
+    expect: {intake_kind: yaml_error, intake: repaired, preserves_sample: true, verdict: needs_human,
+             reasons_include: [AUTOFIX_FORBIDDEN], findings: [SEC-001],
+             prompt_must_not_contain: [sample-not-a-real-token-0000]}
