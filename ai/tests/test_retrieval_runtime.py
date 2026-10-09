@@ -20,7 +20,7 @@ def findings(sample: str) -> list:
 
 
 class Broken:
-    async def search(self, findings, target_env):
+    async def search(self, findings, target_env, scope=None):
         raise ConnectionError("qdrant down")
 
 
@@ -61,7 +61,7 @@ async def test_qdrant_adds_semantic_docs_after_rule_documents() -> None:
 
 async def test_extra_retrievers_come_last() -> None:
     class Cases:
-        async def search(self, findings, target_env):
+        async def search(self, findings, target_env, scope=None):
             return [{"chunk_id": "case:x", "rule_id": "DB-001", "doc_type": "case", "provider": "gcp", "score": 1.0,
                      "match": "exact_rule", "source_uri": "review://x", "text": "t"}]
 
