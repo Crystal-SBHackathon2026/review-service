@@ -6,6 +6,10 @@
 3. 남은 finding 이 전부 검증된 패치 대상 → fix
 4. 남은 것이 low 경고뿐 → pass
 
+spec_unverified(intake 가 baseline 없이 만든 명세)면 findings 가 없어도 needs_human(GENERATED_SPEC_UNVERIFIED) 이다.
+레포 분석만으로는 공개 범위·env·replicas 를 모른다 — 빈 network 가 그대로 통과해 ingress 가 지워진 장애(10/09)가 있었다.
+다른 사유가 있으면 같이 낸다. fix 도 하지 않는다 — 명세 자체를 사람이 확인해야 하므로 AI 가 먼저 고치지 않는다.
+
 3 에서 자동 수정이 막혀 있으면(autofix_allowed=False) fix 대신 needs_human(LOOP_EXHAUSTED) 이다. 둘 다 "AI 가 또 고치려는" 경우다.
 - 봇 커밋 재검토: 워커가 applied_ops 를 커밋한 SHA 를 다시 검토했는데 또 fix — 다시 커밋하면 무한 루프
 - 사람이 고친 뒤 재검사: 사람이 손댄 명세를 AI 가 이어서 고치지 않는다
@@ -103,14 +107,17 @@ def decide_verdict(
     rounds: Sequence[dict[str, Any]] = (),
     llm_meta: dict[str, Any] | None = None,
     autofix_allowed: bool = True,
+    spec_unverified: bool = False,
 ) -> Decision:
     items = [item.model_dump() for item in llm_out.items] if llm_out else []
     extra = list(llm_out.extra_opinions) if llm_out else []
     base = Decision(verdict="pass", reasons=[], items=items, extra_opinions=extra,
                     validation=dict(validation), llm=llm_meta)  # type: ignore[typeddict-item]
-    if not findings:
+    if not findings and not spec_unverified:
         return base
-    reasons = _human_reasons(findings, docs, llm_out, validation, rounds)
+    reasons = _human_reasons(findings, docs, llm_out, validation, rounds) if findings else set()
+    if spec_unverified:
+        reasons.add("GENERATED_SPEC_UNVERIFIED")
     if reasons:
         ordered = [code for code in REASON_CODES if code in reasons]
         return {**base, "verdict": "needs_human", "reasons": ordered}

@@ -9,6 +9,7 @@
   승인 + edited_ops 없음 → commit_overlay, 승인 + edited_ops 있음 → static_check 부터 재검사, 거절 → status=rejected 로 종료
 - status 에 running 추가 — initial_state 값. judge 가 verdict 로 바꾼다
 - autofix_commit 추가 — 워커가 applied_ops 를 커밋한 SHA 를 다시 검토할 때 True. 또 fix 면 needs_human(LOOP_EXHAUSTED)
+- generated_spec 추가 — intake 가 baseline 없이 만든 명세의 검토면 True. pass 여도 needs_human(GENERATED_SPEC_UNVERIFIED)
 """
 
 from __future__ import annotations
@@ -31,7 +32,12 @@ REASON_CODES = (
     "IRREVERSIBLE",
     "LLM_UNAVAILABLE",
     "LOOP_EXHAUSTED",
+    "GENERATED_SPEC_UNVERIFIED",
 )
+# 사유 코드만으로는 사람이 무엇을 확인할지 모르는 경우의 설명 — Review API 가 reason_messages 로 같이 보여 준다
+REASON_MESSAGES: dict[str, str] = {
+    "GENERATED_SPEC_UNVERIFIED": "baseline 없이 생성된 명세 — 공개 범위(network·ingress)·env·replicas 확인 필요",
+}
 
 
 class Finding(TypedDict):
@@ -114,4 +120,5 @@ class ReviewState(TypedDict, total=False):
     status: ReviewStatus  # verdict 값, 사람이 거절하면 rejected. 커밋 결과는 섞지 않고 deploy_result 에 둔다
     human_decision: HumanDecision | None  # needs_human 뒤 재개할 때만 있다. 있으면 AI 가 다시 자동 수정하지 않는다
     autofix_commit: bool  # 검토 대상 커밋이 워커가 applied_ops 를 커밋한 것(봇 커밋)이면 True — 재수정 루프 방지
+    generated_spec: bool  # intake 가 baseline 없이 만든 명세면 True — 사람이 확인하기 전에는 병합하지 않는다
     deploy_result: DeployResult | None  # commit_overlay 만 쓴다 (pass 가 아니면 없음)

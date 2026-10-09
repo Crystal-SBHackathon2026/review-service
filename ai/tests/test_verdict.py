@@ -163,3 +163,25 @@ def test_applied_ops_ignores_patch_unless_verdict_is_fix(verdict: str) -> None:
 def test_applied_ops_empty_without_rounds_or_patch() -> None:
     assert applied_ops({"rounds": [], "decision": {"verdict": "pass"}, "patch": None}) == []
     assert applied_ops({}) == []
+
+
+# --- baseline 없이 생성된 명세 (GENERATED_SPEC_UNVERIFIED) -------------------------------------------
+
+def test_unverified_generated_spec_needs_human_even_without_findings() -> None:
+    """10/09 sample-app #11 — 레포 분석으로 만든 명세가 network: {} 로 pass 해 ingress 가 지워졌다."""
+    decision = decide_verdict([], [], None, Validation(llm_available=False), spec_unverified=True)
+    assert (decision["verdict"], decision["reasons"]) == ("needs_human", ["GENERATED_SPEC_UNVERIFIED"])
+
+
+def test_unverified_generated_spec_is_not_auto_fixed() -> None:
+    findings = findings_for("03-fix-sqlite-replicas-gcp.yaml")
+    assert decide(findings)["verdict"] == "fix"
+    decision = decide(findings, spec_unverified=True)
+    assert (decision["verdict"], decision["reasons"]) == ("needs_human", ["GENERATED_SPEC_UNVERIFIED"])
+
+
+def test_unverified_generated_spec_keeps_other_reasons() -> None:
+    findings = findings_for("04-human-engine-change-with-data.yaml")
+    plain = decide(findings)["reasons"]
+    assert plain and "GENERATED_SPEC_UNVERIFIED" not in plain
+    assert decide(findings, spec_unverified=True)["reasons"] == [*plain, "GENERATED_SPEC_UNVERIFIED"]

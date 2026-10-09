@@ -18,6 +18,8 @@
           (LLM + 코드 게이트). 통과하면 package-lock.json 을 npm 으로 다시 만들어 코드·명세를 한 커밋에 올린다
         - 생성·복구하면 PR 브랜치에 커밋 → synchronize 웹훅이 그 SHA 를 일반 검토로
           시작한다 (autofix_commit 아님). 커밋 SHA 는 브랜치를 옮기기 전에 행에 남긴다 — 웹훅이 먼저 와도 연결된다
+        - baseline 으로 만들었는지(baseline_used)도 같이 남긴다. baseline 없이 만든 명세(missing·empty)가 든 PR 의
+          검토는 pass 여도 needs_human(GENERATED_SPEC_UNVERIFIED) — app.on_pull_request
     PR 표시: 커밋 상태 review-service/intake. 토큰에 권한이 없으면 로그만 남기고 기록은 그대로 둔다.
     파드가 처리 중에 죽으면 processing 행이 남는다 → resume_stale_intakes 가 STALE_AFTER 뒤에 다시 처리한다.
 """
@@ -257,7 +259,7 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
     commit = row["result_commit_sha"] or await deps.github.prepare_files_commit(
         repository, parent=head_sha, files=_commit_files(outcome, row["path"], transform),
         message=_message(outcome, transform))
-    await deps.repo.link_intake(row["intake_id"], result_commit_sha=commit)
+    await deps.repo.link_intake(row["intake_id"], result_commit_sha=commit, baseline_used=baseline is not None)
     try:
         await deps.github.update_branch(repository, row["head_ref"], commit)
     except RefConflict:

@@ -35,6 +35,7 @@ from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.recommendations import resolve_human_decision
 from review_ai.spec.deploy_spec import REPOSITORY
+from review_ai.state import REASON_MESSAGES
 from review_ai.transform import TRANSFORM_MAX_TOKENS
 from review_ai.transform.prompt import TransformOutput
 from review_api.argocd import ArgoCdEvent
@@ -123,7 +124,9 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         keys = ("review_id", "app", "target_env", "spec_ref", "status", "verdict", "reasons", "findings", "decision",
                 "rounds", "human_decision", "deploy_result", "merge_sha", "gitops_commit_sha", "error",
                 "superseded_by", "requested_by", "created_at", "updated_at")
-        return {k: row.get(k) for k in keys}
+        reasons = row.get("reasons") or []
+        return {**{k: row.get(k) for k in keys},
+                "reason_messages": {code: REASON_MESSAGES[code] for code in reasons if code in REASON_MESSAGES}}
 
     @app.get("/verify")
     async def verify(request: Request, sha: str = Query(min_length=7)) -> dict[str, Any]:
@@ -144,7 +147,8 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         if row is None:
             raise HTTPException(404, "intake 가 없다")
         keys = ("intake_id", "repository", "pr_number", "head_sha", "path", "kind", "errors", "status", "reason",
-                "message", "details", "result_commit_sha", "review_id", "requested_by", "created_at", "updated_at")
+                "message", "details", "result_commit_sha", "baseline_used", "review_id", "requested_by", "created_at",
+                "updated_at")
         return {k: row.get(k) for k in keys}
 
     @app.post("/reviews/{review_id}/decision", status_code=202)
@@ -254,17 +258,17 @@ async def start_review(deps: ApiDeps, spec_ref: dict[str, str], requested_by: st
 
 
 async def submit_review(deps: ApiDeps, loaded: dict[str, Any], spec_ref: dict[str, str], requested_by: str, *,
-                        pr_number: int | None = None) -> str:
+                        pr_number: int | None = None, generated_spec: bool = False) -> str:
     """review_id 발급 → DB received → review.requested 발행. review_id 반환."""
     commit = spec_ref["commit"]
     review_id = new_review_id()
     message = build_review_requested(loaded, review_id=review_id, spec_ref=spec_ref, requested_by=requested_by,
-                                     requested_at=datetime.now(UTC))
+                                     requested_at=datetime.now(UTC), generated_spec=generated_spec)
     await deps.repo.insert_review(review_id=review_id, app=message.app, target_env=message.target_env,
                                   repo_id=message.repo_id, spec_ref=spec_ref, pr_head_sha=commit,
                                   requested_by=requested_by, pr_number=pr_number)
     try:
-        await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.model_dump_json().encode())
+        await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
     except Exception as exc:
         log.exception("review %s: review.requested 발행 실패", review_id)
         await deps.repo.update_review(review_id, status="failed", error=f"publish: {exc}"[:2000])
@@ -283,6 +287,9 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
     - 새 검토를 만들면 그 PR 의 끝나지 않은 이전 검토는 superseded 로 넘긴다
     - deploy.yaml 이 없거나 비었거나 깨졌으면 검토 대신 intake 를 연다 (review_api.intake). 처리는 응답 뒤
     - intake 가 만든 생성 커밋에 온 웹훅이면 새 검토를 그 intake 에 잇는다
+    - 그 PR 에 intake 가 baseline 없이 만든 명세 커밋이 있으면 generated_spec 으로 보낸다 → pass 여도 needs_human.
+      생성 커밋 위에 커밋이 더 올라와도 같다(명세는 여전히 레포 분석으로 만든 것). 판단 근거는 spec_intakes 기록뿐이다 —
+      명세 파일 내용·커밋 메시지·PR 작성자처럼 PR 을 올린 사람이 바꿀 수 있는 표시는 보지 않는다
     """
     action = payload.get("action")
     if action not in PR_ACTIONS:
@@ -306,9 +313,13 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
         return await open_intake(deps, payload, SpecProblem("missing", "deploy.yaml 이 없다"), spec_ref["path"])
     except SpecProblem as problem:
         return await open_intake(deps, payload, problem, spec_ref["path"])
-    review_id = await submit_review(deps, loaded, spec_ref, payload["sender"]["login"], pr_number=number)
+    generated = await deps.repo.unverified_generation_for_pr(repository, number)
+    review_id = await submit_review(deps, loaded, spec_ref, payload["sender"]["login"], pr_number=number,
+                                    generated_spec=generated is not None)
     superseded = await deps.repo.supersede_open(repository=repository, pr_number=number, superseded_by=review_id)
     result: dict[str, Any] = {"review_id": review_id, "superseded": superseded}
+    if generated is not None:
+        result["generated_spec"] = generated["intake_id"]
     source = await deps.repo.find_intake_by_result_commit(repository, head_sha)
     if source is not None:
         await deps.repo.link_intake(source["intake_id"], review_id=review_id)

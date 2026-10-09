@@ -43,7 +43,7 @@ from review_ai.errors import TransientError
 from review_ai.graph import apply_human_edits as ai_apply_human_edits
 from review_ai.graph import apply_patch
 from review_ai.judge.llm import LlmClient
-from review_ai.judge.node import judge_unavailable, make_judge
+from review_ai.judge.node import judge_unavailable, make_judge, spec_unverified
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.patching import apply_ops
@@ -241,6 +241,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         커밋 객체를 먼저 만들어 SHA 를 알아낸 뒤 → 새 검토를 DB 에 넣고 → 브랜치를 옮긴다. 브랜치가 움직이면
         GitHub 이 pull_request synchronize 웹훅을 보내는데, 그때 Review API 가 같은 SHA 검토를 이미 찾을 수 있어야
         (autofix_commit 이 빠진) 중복 검토를 만들지 않는다.
+        baseline 없이 생성된 명세(generated_spec)는 사람이 아직 확인하지 않았으면 새 검토에도 넘긴다 — 빠지면 봇 커밋
+        재검토가 pass 로 자동 병합된다. 사람이 승인·수정한 뒤면 넘기지 않는다 (같은 확인을 두 번 묻지 않는다).
         """
         rid, ref = state["review_id"], state["spec_ref"]
         repository, path, parent = ref["repository"], ref["path"], ref["commit"]
@@ -262,7 +264,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         new_rid = new_review_id()
         new_ref = {**ref, "commit": new_sha}
         message = build_review_requested(fixed, review_id=new_rid, spec_ref=new_ref, requested_by=f"autofix:{rid}",
-                                         requested_at=datetime.now(UTC), autofix_commit=True)
+                                         requested_at=datetime.now(UTC), autofix_commit=True,
+                                         generated_spec=spec_unverified(state))
         await repo.insert_review(review_id=new_rid, app=message.app, target_env=message.target_env,
                                  repo_id=message.repo_id, spec_ref=new_ref, pr_head_sha=new_sha,
                                  requested_by=message.requested_by, pr_number=pull["number"])
@@ -271,7 +274,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         except GitHubError as exc:  # 그사이 사람이 푸시했다 — 이 수정은 버린다
             await repo.update_review(new_rid, status="failed", error=f"브랜치 갱신 실패: {exc}"[:2000])
             return await _fail(rid, f"commit_fix: {exc}")
-        await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.model_dump_json().encode())
+        await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
         await repo.update_review(rid, status="superseded", superseded_by=new_rid)
         await _record_case(state)
         log.info("review %s: 수정 %d건을 %s 로 커밋 → 재검토 %s", rid, len(ops), new_sha, new_rid)

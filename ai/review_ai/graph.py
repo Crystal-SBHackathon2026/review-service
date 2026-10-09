@@ -127,7 +127,7 @@ def build_graph(llm: LlmClient | None, retriever: Retriever) -> Any:
 
 
 def initial_state(deploy_spec: dict[str, Any], *, review_id: str, spec_ref: dict[str, str] | None = None,
-                  autofix_commit: bool = False) -> ReviewState:
+                  autofix_commit: bool = False, generated_spec: bool = False) -> ReviewState:
     return ReviewState(
         review_id=review_id,
         target_env=deploy_spec["target"]["env"],
@@ -140,6 +140,7 @@ def initial_state(deploy_spec: dict[str, Any], *, review_id: str, spec_ref: dict
         retry_count=0,
         status="running",
         autofix_commit=autofix_commit,
+        generated_spec=generated_spec,
     )
 
 

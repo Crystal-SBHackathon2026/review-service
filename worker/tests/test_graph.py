@@ -206,6 +206,46 @@ async def test_autofix_commit_review_that_needs_fix_again_goes_to_human(harness:
     assert harness.github.commits == []
 
 
+async def _request_generated(h: Harness, spec: dict[str, Any]) -> None:
+    """Review API 가 intake 의 baseline 없는 생성 명세 PR 이라고 표시한 검토 요청."""
+    from review_ai.messages import build_review_requested
+
+    ref = {"repository": spec["metadata"]["repository"], "commit": HEAD, "path": "deploy.yaml"}
+    msg = build_review_requested(spec, review_id=RID, spec_ref=ref, requested_by="octo-dev",
+                                 requested_at=datetime.now(UTC), generated_spec=True)
+    await h.repo.insert_review(review_id=RID, app=msg.app, target_env=msg.target_env, repo_id=msg.repo_id,
+                               spec_ref=ref, pr_head_sha=HEAD, requested_by="octo-dev", pr_number=7)
+    h.github.files[HEAD] = yaml.safe_dump(spec, sort_keys=False)
+    h.github.open_pr(ref["repository"], HEAD)
+    await h.handler.handle("review.requested", msg.model_dump_json().encode())
+
+
+async def test_generated_spec_passing_review_waits_for_human_not_ci(harness: Harness) -> None:
+    """10/09 sample-app #11 — baseline 없이 만든 명세가 pass → 병합 → ingress 삭제. 사람 확인 전에는 병합하지 않는다."""
+    harness.github.suites[HEAD] = [suite(conclusion="success")]  # CI 가 이미 끝나 있어도
+    await _request_generated(harness, load_sample(SAMPLE_01))
+
+    row = harness.row()
+    assert (row["status"], row["verdict"], row["reasons"]) == ("needs_human", "needs_human",
+                                                                ["GENERATED_SPEC_UNVERIFIED"])
+    assert harness.github.merged == [] and harness.github.commits == []
+
+    await harness.human(RID, "approved")
+    assert harness.github.merged == [("Crystal-SBHackathon2026/sample-app", 7, HEAD)]
+
+
+async def test_generated_spec_edited_by_human_is_not_asked_again_after_autofix_commit(harness: Harness) -> None:
+    """사람이 고친 값을 봇이 커밋한 새 검토는 generated_spec 을 넘기지 않는다 — 같은 확인을 두 번 묻지 않는다."""
+    await _request_generated(harness, load_sample(SAMPLE_01))
+    await harness.human(RID, "approved", [{"op": "replace", "path": "/runtime/replicas", "value": 2}])
+
+    [(_, _, value)] = harness.publisher.sent
+    msg = ReviewRequested.model_validate_json(value)
+    assert (msg.autofix_commit, msg.generated_spec) == (True, False)
+    await harness.deliver_published()
+    assert harness.row(msg.review_id)["status"] == "waiting_ci"
+
+
 async def test_fork_pr_cannot_be_autofixed(harness: Harness) -> None:
     harness.github.open_pr("Crystal-SBHackathon2026/sample-orders", HEAD, fork=True)
     await harness.request(load_sample(SAMPLE_05))

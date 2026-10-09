@@ -73,7 +73,7 @@ docker compose --profile app up -d --build
 | 종류(`kind`) | 처리 | 결과(`status`·`reason`) |
 |---|---|---|
 | `missing`·`empty` | 그 레포의 최근 baseline(없으면 `DEFAULT_TARGET`)으로 `review_ai.intake.prepare_intake` → PR 브랜치에 `deploy.yaml` 커밋 → synchronize 웹훅이 그 커밋을 **일반 검토**로 시작(`autofix_commit` 아님), `review_id` 로 연결 | `generated`·`GENERATED` |
-| `missing`·`empty` (새 앱 — baseline 없음) | PR head 의 Dockerfile·의존성 파일·CI 워크플로·소스를 읽어 근거가 분명한 값만 채운다(`review_ai.intake.analyze`, LLM 없음). 다 채워지면 위와 같이 커밋하고, 커밋 메시지에 값마다 근거 파일을 적는다 | `generated`·`GENERATED` |
+| `missing`·`empty` (새 앱 — baseline 없음) | PR head 의 Dockerfile·의존성 파일·CI 워크플로·소스를 읽어 근거가 분명한 값만 채운다(`review_ai.intake.analyze`, LLM 없음). 다 채워지면 위와 같이 커밋하고, 커밋 메시지에 값마다 근거 파일을 적는다. **그 PR 의 검토는 pass 여도 `needs_human`(`GENERATED_SPEC_UNVERIFIED`)** — 레포 분석으로는 공개 범위·env·replicas 를 모른다(아래) | `generated`·`GENERATED` |
 | `missing`·`empty` (새 앱, 확인 안 된 값 남음) | 추정값은 자동 병합·배포로 이어질 수 있어 커밋하지 않는다. `details` 에 항목별로 레포 분석이 못 채운 이유(DB 드라이버는 있는데 배치 모름, 비밀 이름의 환경변수 등) | `rejected`·`UNVERIFIED` |
 | `yaml_error`·`schema_error` | 기본값으로 덮지 않는다. PR head 원문을 비밀을 가려 Claude 에 보내 **형식만** 고치게 하고(`review_ai.intake.repair`), 코드 게이트가 결과 값을 원문과 하나씩 대조한다 — 원문 값을 바꾸거나 지우거나 원문·확인된 값(baseline·레포 분석)·스키마 기본값에 없는 값을 쓰면 버린다. 통과하면 생성과 같이 커밋(`fix:`, 메시지에 바꾼 곳·이유) → 일반 검토. 가린 비밀은 원문 같은 위치에서만 되돌린다 | `repaired`·`REPAIRED` |
 | `yaml_error`·`schema_error` (복구 실패) | 게이트 위반은 `details` 에 경로·코드(`VALUE_CONFLICT`·`INVENTED_VALUE`·`DROPPED_VALUE`·`OUTPUT_INVALID`). 비밀을 옮겨야 하면 `MASKED_VALUE`. API 에 키가 없으면 LLM 을 부르지 않는다. 오류 기록은 줄·칸·경로만(원문 조각 없음) | `rejected`·`REPAIR_REJECTED`·`MASKED_VALUE`·`REPAIR_UNAVAILABLE` |
@@ -81,6 +81,12 @@ docker compose --profile app up -d --build
 - 그 밖의 거절: 포크 PR(`FORK_PR`), 대상 환경 모름(`NO_TARGET`), 처리 중 새 커밋(`BRANCH_MOVED`), 생성 커밋이 다시 intake 대상(`LOOP_GUARD` — 웹훅·커밋 무한 반복 방지), GitHub·Claude 일시 오류(`failed`·`ERROR` — 새 커밋을 올리면 다시 처리)
 - PR 표시: 커밋 상태 `review-service/intake` (pending → success·failure·error). 링크는 `GET /intakes/{id}`. `GET /verify?sha=` 는 검토가 없으면 `intake_failed`·`intake_processing`·`intake_generated`·`intake_repaired` 를 돌려준다(`passed: false`)
 - 처리 중 파드가 죽으면 2분 넘은 `processing` 행을 API 가 1분마다 다시 처리한다. 커밋 SHA 는 브랜치를 옮기기 전에 행에 남겨 같은 커밋으로 마저 끝낸다
+- **baseline 없이 생성한 명세는 자동 병합하지 않는다** (10/09 sample-app #11 — `network: {}` 명세가 pass → 병합 → gitops ingress 삭제 → ALB 삭제).
+  intake 는 생성 커밋 SHA 와 함께 `baseline_used` 를 남기고, 웹훅은 **그 PR(레포·PR 번호)에 baseline 없이 만든 `missing`·`empty` 생성 커밋이 있으면**
+  `review.requested` 에 `generated_spec: true` 를 싣는다 → judge 가 findings 와 무관하게 `needs_human`(`GENERATED_SPEC_UNVERIFIED`), AI 자동 수정도 하지 않는다.
+  생성 커밋 위에 커밋이 더 올라와도 같다. 판단 근거는 `spec_intakes` 기록뿐 — 명세 내용·커밋 메시지·PR 작성자는 보지 않는다.
+  사람이 승인(·수정)하면 이어서 진행하고, 그 뒤 재검사·봇 수정 커밋 재검토에서는 다시 묻지 않는다. `GET /reviews/{id}` 의 `reason_messages` 에 확인할 항목이 나온다.
+  baseline 으로 만든 명세와 형식 오류 복구(`repaired` — 값은 원문 대조)는 예전처럼 일반 검토다
 
 ## 상태 흐름 (`reviews.status`)
 
