@@ -15,8 +15,8 @@ from review_ai.judge.fake_llm import ScriptedLLM
 from review_ai.secrets_pattern import MASK
 from review_ai.spec.deploy_spec import AppSpec
 from review_api.app import ApiDeps, create_app, make_repair_llm
-from review_api.intake import STALE_AFTER, STATUS_CONTEXT, resume_stale_intakes
-from review_common.github import GitHubError, RefConflict
+from review_api.intake import MAX_READ_BYTES, MAX_SPEC_BYTES, STALE_AFTER, STATUS_CONTEXT, resume_stale_intakes
+from review_common.github import FileTooLarge, GitHubError, RefConflict
 from tests.test_api import HEAD, REPO, SECRET, FakePublisher, FakeSpecs, pr_event, sample_text, send_pr
 
 NEW = "e" * 40
@@ -35,14 +35,19 @@ class FakeGitHub:
         self.commit_error: Exception | None = None
         self.tree: dict[str, str] = {}  # PR head 의 파일 — 레포 분석이 읽는다
         self.read_error: GitHubError | None = None
+        self.read_limits: dict[str, int | None] = {}
 
     async def list_files(self, repository: str, ref: str) -> list[str]:
         if self.read_error:
             raise self.read_error
         return list(self.tree)
 
-    async def get_file(self, repository: str, path: str, ref: str) -> str:
-        return self.tree[path]
+    async def get_file(self, repository: str, path: str, ref: str, *, max_bytes: int | None = None) -> str:
+        self.read_limits[path] = max_bytes
+        text = self.tree[path]
+        if max_bytes is not None and len(text.encode()) > max_bytes:
+            raise FileTooLarge(f"{path} 가 {max_bytes}바이트를 넘는다")
+        return text
 
     async def prepare_files_commit(self, repository: str, *, parent: str, files: dict[str, str | None],
                                    message: str) -> str:
@@ -196,6 +201,17 @@ async def test_deleted_spec_before_deploy_report_keeps_committed_spec(ienv: Inta
     assert row["baseline_used"] is True  # baseline 으로 만들었으니 #41 의 GENERATED_SPEC_UNVERIFIED 대상이 아니다
 
 
+async def test_large_source_file_is_left_out_and_blocks_absence_claims(ienv: IntakeEnv) -> None:
+    ienv.github.tree = {**SAMPLE_TREE, "src/db.js": "// " + "x" * MAX_READ_BYTES + "\nrequire('pg');\n"}
+    send_pr(ienv, pr_event("opened"))
+
+    row = ienv.only_intake()
+    assert (row["status"], row["reason"], row["result_commit_sha"]) == ("rejected", "UNVERIFIED", None)
+    database = next(d for d in row["details"] if d["path"] == "/database")
+    assert "큰 파일은 읽지 않는다" in database["message"]  # 못 읽은 파일로 'DB 없음'을 결론내지 않는다
+    assert set(ienv.github.read_limits.values()) == {MAX_READ_BYTES}
+
+
 # --- 배포 대상이 아닌 레포 ---------------------------------------------------------------------------
 
 def test_missing_spec_in_unknown_repo_is_skipped_quietly() -> None:
@@ -320,6 +336,20 @@ async def test_repair_that_changes_values_is_rejected() -> None:
     conflict = {"code": "VALUE_CONFLICT", "path": "/runtime/replicas", "message": "원문에 있던 값과 다르다"}
     assert conflict in row["details"]
     assert env.github.parents == {} and env.states() == [(HEAD, "pending"), (HEAD, "failure")]
+
+
+async def test_oversized_broken_spec_is_not_read_into_repair() -> None:
+    calls: list[Any] = []
+    env = IntakeEnv(repair_llm=ScriptedLLM(lambda request: calls.append(request) or {}))
+    await env.approve_baseline()
+    env.put(BROKEN + "#" * MAX_SPEC_BYTES)
+    send_pr(env, pr_event("opened"))
+
+    row = env.only_intake()
+    assert (row["status"], row["reason"], row["result_commit_sha"]) == ("rejected", "REPAIR_REJECTED", None)
+    assert [d["code"] for d in row["details"]] == ["TOO_LARGE"]
+    assert calls == [] and env.github.read_limits["deploy.yaml"] == MAX_SPEC_BYTES
+    assert env.states() == [(HEAD, "pending"), (HEAD, "failure")]
 
 
 async def test_transient_llm_error_fails_with_retry_hint() -> None:
@@ -581,3 +611,24 @@ async def test_github_client_posts_commit_status() -> None:
     assert (body["state"], len(body["description"]), body["target_url"]) == (
         "failure", 140, "https://review.example/intakes/in_1")
     assert "target_url" not in seen[1][1] and denied.value.status_code == 403
+
+
+async def test_github_client_get_file_stops_at_max_bytes() -> None:
+    import httpx
+
+    from review_common.github import API, GitHubClient, SpecNotFound
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/missing.yaml"):
+            return httpx.Response(404)
+        return httpx.Response(200, content="한글 deploy".encode())
+
+    client = GitHubClient("t", client=httpx.AsyncClient(base_url=API, transport=httpx.MockTransport(handler)))
+
+    assert await client.get_file(REPO, "deploy.yaml", HEAD) == "한글 deploy"
+    assert await client.get_file(REPO, "deploy.yaml", HEAD, max_bytes=13) == "한글 deploy"
+    with pytest.raises(FileTooLarge) as too_large:
+        await client.get_file(REPO, "deploy.yaml", HEAD, max_bytes=12)
+    assert too_large.value.status_code == 413 and not too_large.value.transient
+    with pytest.raises(SpecNotFound):
+        await client.get_file(REPO, "missing.yaml", HEAD)
