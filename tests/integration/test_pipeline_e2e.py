@@ -85,7 +85,7 @@ class FakeGitHub:
         return self.spec_text
 
     async def pulls_for_commit(self, repository: str, sha: str) -> list[dict[str, Any]]:
-        return [{"number": 3, "state": "open", "head": {"sha": HEAD}}]
+        return [{"number": 3, "state": "open", "head": {"sha": HEAD, "repo": {"full_name": REPO}}}]
 
     async def merge_pull(self, repository: str, number: int, *, head_sha: str) -> str:
         self.merged.append(number)
