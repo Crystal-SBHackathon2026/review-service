@@ -64,6 +64,8 @@ from review_common.github import GitHubError
 from review_common.ids import new_review_id
 from review_common.repository import ReviewRepository
 from review_common.resumed import CiResult, HumanDecisionModel
+from review_worker import metrics
+from review_worker.metrics import app_env, timed_node
 
 log = logging.getLogger(__name__)
 
@@ -199,6 +201,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         log.warning("review %s: failed — %s", review_id, error)
         await repo.update_review(review_id, status="failed", error=error[:2000])
         row = await repo.get_review(review_id)
+        if row:
+            metrics.finished(row["app"], row["target_env"], "failed")
         await _verify_status(review_id, row and row.get("spec_ref"), "failure", error)
         return Command(goto=END)
 
@@ -233,6 +237,11 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             findings=state.get("findings") or [], rounds=state.get("rounds") or [],
             final_spec=app_spec(state["deploy_spec"]),
         )
+        app, env = app_env(state)
+        metrics.safe(lambda: metrics.VERDICTS.labels(app, env, decision["verdict"]).inc())
+        if decision["verdict"] == "needs_human":
+            for reason in decision["reasons"]:
+                metrics.safe(lambda reason=reason: metrics.NEEDS_HUMAN_REASONS.labels(reason).inc())
         return {}
 
     def route_after_result(state: dict[str, Any]) -> str:
@@ -259,6 +268,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             await repo.update_review(rid, status="rejected", human_decision=decision)
             await _verify_status(rid, state.get("spec_ref"), "failure", f"사람이 거절 ({decision['approver']})")
             await _record_case(state, human=decision)
+            metrics.finished(*app_env(state), "rejected")
             return Command(goto=END, update={"human_decision": decision, "status": "rejected"})
         try:
             decision = resolve_human_decision(state, decision)
@@ -326,6 +336,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             await repo.update_review(new_rid, status="failed", error=f"브랜치 갱신 실패: {exc}"[:2000])
             return await _fail(rid, f"commit_fix: {exc}")
         await repo.update_review(rid, status="superseded", superseded_by=new_rid)
+        metrics.finished(*app_env(state), "superseded")
         try:
             await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
         except Exception as exc:  # noqa: BLE001 — 브랜치는 이미 옮겼다. 새 검토는 received 로 남고 review sweep 이 다시 발행한다
@@ -411,6 +422,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         log.warning("review %s: 병합 안 함 — %s", rid, reason)
         result = DeployResult(status="blocked", commit_sha=None, reason=reason)
         await repo.update_review(rid, status="blocked", error=reason, deploy_result=result)
+        metrics.finished(*app_env(state), "blocked")
         await _verify_status(rid, state.get("spec_ref"), "failure", reason)
         return Command(goto=END, update={"deploy_result": result})
 
@@ -443,6 +455,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
                 await asyncio.sleep(deps.retry_backoff_seconds * 2**attempt)
         await repo.update_review(state["review_id"], status=result["status"], deploy_result=result,
                                  gitops_commit_sha=result["commit_sha"] if result["status"] == "committed" else None)
+        metrics.finished(*app_env(state), result["status"])
         if result["status"] == "blocked":  # 병합은 됐지만 배포는 막혔다
             await _verify_status(state["review_id"], state.get("spec_ref"), "failure", result["reason"] or "blocked")
         if result["status"] == "committed" and state.get("human_decision"):  # 사람 없이 그대로 통과한 검토는 남길 판단이 없다
@@ -450,22 +463,27 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         return {"deploy_result": result}
 
     graph = StateGraph(ReviewState)
-    graph.add_node("static_check", make_static_check())
-    graph.add_node("retrieve_evidence", make_retrieve_evidence(deps.retriever))
-    graph.add_node("judge", judge)
-    graph.add_node("record_result", record_result)
-    graph.add_node("apply_patch", apply_patch)
-    graph.add_node("await_human", await_human)
-    graph.add_node("wait_human", wait_human, destinations=("apply_human_edits", "await_human", "await_ci", "commit_fix", END))
-    graph.add_node("apply_human_edits", apply_human_edits, destinations=("static_check", "await_human"))
-    graph.add_node("commit_fix", commit_fix, destinations=(END,))
-    graph.add_node("await_ci", await_ci)
-    graph.add_node("check_ci", check_ci, destinations=("wait_ci", "confirm_ci", END))
-    graph.add_node("wait_ci", wait_ci, destinations=("await_ci", "confirm_ci", END))
-    graph.add_node("confirm_ci", confirm_ci, destinations=("await_ci", "guard_overlay", END))
-    graph.add_node("guard_overlay", guard_overlay, destinations=("merge_pr", END))
-    graph.add_node("merge_pr", merge_pr, destinations=("commit_overlay", END))
-    graph.add_node("commit_overlay", commit_overlay)
+
+    def node(name: str, fn: Callable[[dict[str, Any]], Awaitable[Any]], **kwargs: Any) -> None:
+        """노드마다 처리 시간·예외 지표 (review_worker_node_*)."""
+        graph.add_node(name, timed_node(name, fn), **kwargs)
+
+    node("static_check", make_static_check())
+    node("retrieve_evidence", make_retrieve_evidence(deps.retriever))
+    node("judge", judge)
+    node("record_result", record_result)
+    node("apply_patch", apply_patch)
+    node("await_human", await_human)
+    node("wait_human", wait_human, destinations=("apply_human_edits", "await_human", "await_ci", "commit_fix", END))
+    node("apply_human_edits", apply_human_edits, destinations=("static_check", "await_human"))
+    node("commit_fix", commit_fix, destinations=(END,))
+    node("await_ci", await_ci)
+    node("check_ci", check_ci, destinations=("wait_ci", "confirm_ci", END))
+    node("wait_ci", wait_ci, destinations=("await_ci", "confirm_ci", END))
+    node("confirm_ci", confirm_ci, destinations=("await_ci", "guard_overlay", END))
+    node("guard_overlay", guard_overlay, destinations=("merge_pr", END))
+    node("merge_pr", merge_pr, destinations=("commit_overlay", END))
+    node("commit_overlay", commit_overlay)
 
     graph.add_edge(START, "static_check")
     graph.add_edge("static_check", "retrieve_evidence")
