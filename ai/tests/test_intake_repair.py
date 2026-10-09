@@ -10,10 +10,11 @@ from typing import Any
 
 import pytest
 import yaml
+from pydantic import BaseModel
 
 from review_ai.errors import TransientError
 from review_ai.intake import commit_message
-from review_ai.intake.lines import read_lines, redact_lines
+from review_ai.intake.lines import SCHEMA_KEYS, read_lines, redact_lines
 from review_ai.intake.repair import (
     _MISSING, PROMPT_VERSION, RepairOutput, RepairRequest, _default_at, build_request, read_original,
     reference_values, repair_intake,
@@ -21,7 +22,8 @@ from review_ai.intake.repair import (
 from review_ai.judge.fake_llm import ScriptedLLM, UnavailableLLM
 from review_ai.judge.llm import CachedLLM, ClaudeLLM, LlmRefused, LlmResponse
 from review_ai.preparation import GenerationContext
-from review_ai.secrets_pattern import MASK
+from review_ai.secrets_pattern import MASK, is_secret_name
+from review_ai.spec import deploy_spec
 from review_ai.spec.deploy_spec import AppSpec, Baseline, DeploySpec
 from tests.conftest import SAMPLES
 
@@ -81,6 +83,11 @@ async def repair(raw: str, fake: Any, kind: str = "yaml_error", baseline: Baseli
     f"PRIVATE_KEY: |\n  -----BEGIN\n  {SECRET}\nnext: 1\n",
     f"url: postgres://app:{SECRET}@db:5432/app\n",
     f"  port: [8080\n  password: '{SECRET}'\n",
+    f"env:\n  DB_PASSWORD:\n    {SECRET}\nnext: 1\n",                 # 값이 다음 줄
+    f'env:\n  DB_PASSWORD: "first\n    {SECRET}"\nnext: 1\n',         # 닫히지 않은 따옴표 — 여러 줄 문자열
+    f"env: {{DB_PASSWORD:\n   {SECRET}, X: y}}\n",                   # 흐름 값이 다음 줄로
+    f"env:\n  API_TOKEN: [{SECRET}]\n",
+    f"env:\n  - DB_PASSWORD:\n      {SECRET}\n",
 ])
 def test_redact_lines_hides_secret_names_and_values(text: str) -> None:
     masked = redact_lines(text)
@@ -94,6 +101,11 @@ def test_redact_lines_keeps_ordinary_values() -> None:
             "secrets:\n  - {name: DB_PASSWORD, source: generated}\n")
 
     assert redact_lines(text) == text
+
+
+def test_schema_keys_cover_every_field_that_looks_secret() -> None:
+    models = [v for v in vars(deploy_spec).values() if isinstance(v, type) and issubclass(v, BaseModel)]
+    assert {f for m in models for f in m.model_fields if is_secret_name(f)} == SCHEMA_KEYS
 
 
 def test_read_lines_tracks_paths_through_lists_and_flow_values() -> None:
@@ -110,6 +122,15 @@ def test_read_lines_tracks_paths_through_lists_and_flow_values() -> None:
     assert read.raw[("runtime", "port")] == "[8080" and read.raw[("runtime",)] == "extra text"
     assert ("runtime", "note", "free text") not in read.values  # 블록 글자는 값이 아니다
     assert read.ambiguous == {("runtime", "replicas")}
+
+
+def test_read_lines_joins_flow_values_across_lines() -> None:
+    read = read_lines("metadata: {name: app,\n  repository: o/app}\nimage:\n  platforms: [amd64,\n    arm64]\n"
+                      "runtime:\n  port: [8080\n  replicas: 2\n")
+
+    assert read.values[("metadata", "repository")] == "o/app" and ("repository",) not in read.values
+    assert read.values[("image", "platforms", 1)] == "arm64"
+    assert read.raw == {("runtime", "port"): "[8080"} and read.values[("runtime", "replicas")] == 2
 
 
 def test_read_original_marks_error_lines_and_locations() -> None:
@@ -303,6 +324,13 @@ async def test_output_failing_schema_is_rejected_with_location() -> None:
 
     assert outcome.reason == "REPAIR_REJECTED" and outcome.details[0] == {
         "code": "OUTPUT_INVALID", "path": "/runtime/replicas", "message": "Input should be less than or equal to 10"}
+
+
+async def test_repository_case_is_not_a_change() -> None:
+    raw = YAML_BROKEN.replace(REPO, REPO.lower())
+    outcome = await repair(raw, llm(_set("metadata.repository", REPO.lower())))
+
+    assert outcome.action == "repaired"
 
 
 async def test_other_repository_is_rejected() -> None:

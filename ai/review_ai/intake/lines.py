@@ -26,11 +26,13 @@ _KEY = r"""(?:"[^"\n]*"|'[^'\n]*'|[^\s"'#\[\]{},:][^#:\n]*?)"""
 KEY_LINE = re.compile(rf"^(?P<key>{_KEY})\s*:(?:\s+(?P<rest>.*))?$")
 # 이름이 비밀인 키 — 블록(`KEY: v`)·흐름(`{KEY: v, ...}`)·셸(`KEY=v`) 어디든. 값은 따로 VALUE 로 잡는다:
 # 값까지 한 정규식으로 먹으면 `cmd: run DB_PASSWORD=x` 처럼 앞 키의 값 안에 있는 비밀 이름을 건너뛴다
-SECRET_NAME = re.compile(r"""(?:^|(?<=[\s{,\[-]))["']?(?P<name>[A-Za-z_][\w.-]*)["']?\s*(?::(?=\s)|=)\s*""")
+SECRET_NAME = re.compile(r"""(?:^|(?<=[\s{,\[-]))["']?(?P<name>[A-Za-z_][\w.-]*)["']?\s*(?::(?=\s|$)|=)\s*""")
 VALUE = re.compile(r""""[^"\n]*"|'[^'\n]*'|[^\s,{}\[\]#][^,}\]#\n]*""")
 # k8s 식 env 항목을 흐름 스타일로 쓴 것: {name: DB_PASSWORD, value: hunter2}
 FLOW_NAME_VALUE = re.compile(r"""name\s*:\s*["']?(?P<name>[A-Za-z_]\w*)["']?\s*,\s*value\s*:\s*""")
 BLOCK_SCALAR = re.compile(r"^[|>][-+0-9]*$")
+# 명세 필드 이름 중 비밀 이름처럼 보이는 것 — `secrets:` 아래는 참조(이름·출처) 목록이지 값이 아니다
+SCHEMA_KEYS = frozenset({"secrets"})
 
 
 def _strip_comment(text: str) -> str:
@@ -54,21 +56,40 @@ def _indent(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
 
-def _mask_pairs(line: str, pattern: re.Pattern[str]) -> str:
-    spans = []
+def _secret_span(line: str, start: int) -> tuple[int, bool]:
+    """비밀 값의 끝과 '값이 다음 줄로 이어지는가'. 이어지는 값(빈 값·닫히지 않은 따옴표·괄호)은 줄 끝까지 가린다."""
+    end = len(_strip_comment(line).rstrip())
+    rest = line[start:end]
+    if not rest.strip():
+        return start, True                      # KEY: ⏎ 다음 줄들이 값
+    if rest[0] in "{[":
+        return end, rest.count(rest[0]) > rest.count("}" if rest[0] == "{" else "]")
+    value = VALUE.match(line, start)
+    text = value[0].rstrip() if value else ""
+    if text[:1] in "\"'" and (len(text) < 2 or text[-1] != text[0]):
+        return end, True                        # 닫히지 않은 따옴표 — 여러 줄 문자열
+    return start + len(text), False
+
+
+def _mask_pairs(line: str, pattern: re.Pattern[str]) -> tuple[str, bool]:
+    """비밀 이름 뒤의 값을 가린다. 값이 다음 줄로 이어지면 True."""
+    spans, continues = [], False
     for m in pattern.finditer(line):
-        value = VALUE.match(line, m.end()) if is_secret_name(m["name"]) else None
-        if value and value[0].strip():
-            spans.append((value.start(), value.start() + len(value[0].rstrip())))
+        if not is_secret_name(m["name"]) or m["name"] in SCHEMA_KEYS:
+            continue
+        end, more = _secret_span(line, m.end())
+        continues = continues or more
+        if end > m.end():
+            spans.append((m.end(), end))
     for start, end in reversed(spans):
         line = line[:start] + QUOTED_MASK + line[end:]
-    return line
+    return line, continues
 
 
 def redact_lines(text: str) -> str:
     """원문 줄 구조는 그대로, 비밀 값만 "***MASKED***" 로. 줄 수가 같아 오류 줄 번호가 그대로 맞는다."""
     out: list[str] = []
-    block_over: int | None = None      # 비밀 키의 | 블록 — 이 들여쓰기보다 깊은 줄은 전부 값
+    block_over: int | None = None      # 비밀 값이 이어지는 줄(| 블록·다음 줄 값·여러 줄 따옴표) — 더 깊은 줄은 전부 값
     name_col: int | None = None        # 비밀 이름을 가진 `name:` 의 칸 — 같은 칸의 `value:` 를 가린다
     for line in text.splitlines():
         body = line.replace("\t", "  ")
@@ -90,7 +111,11 @@ def redact_lines(text: str) -> str:
             name_col = key_col
         if m and is_secret_name(_unquote(m["key"])) and BLOCK_SCALAR.match((m["rest"] or "").strip()):
             block_over = key_col
-        out.append(redact(_mask_pairs(_mask_pairs(line, FLOW_NAME_VALUE), SECRET_NAME)))
+        line, flow_more = _mask_pairs(line, FLOW_NAME_VALUE)
+        line, more = _mask_pairs(line, SECRET_NAME)
+        if (flow_more or more) and block_over is None:
+            block_over = indent
+        out.append(redact(line))
     return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 
 
@@ -133,13 +158,35 @@ def _scalar(rest: str) -> tuple[bool, Any]:
         return (False, None) if rest[:1] in "[{\"'&*!|>%@`" else (True, rest)
 
 
+MAX_FLOW_LINES = 30
+
+
+def _value(rest: str, lines: list[str], no: int) -> tuple[bool, Any, int]:
+    """값과 그 값이 끝난 줄 번호. 여러 줄에 걸친 흐름 값({…}·[…])은 다음 줄을 붙여 읽힐 때까지 이어 본다."""
+    ok, value = _scalar(rest)
+    if ok or rest[:1] not in "{[":
+        return ok, value, no
+    joined = rest
+    for nxt in range(no, min(no + MAX_FLOW_LINES, len(lines))):
+        joined += " " + _strip_comment(lines[nxt].replace("\t", "  ")).strip()
+        try:
+            return True, yaml.safe_load(joined), nxt + 1
+        except yaml.YAMLError:
+            continue
+    return False, None, no
+
+
 def read_lines(text: str) -> LineRead:
     """들여쓰기로 경로를 추적한다. 리스트 '-' 는 부모 키와 같은 칸이어도 자식이다(칸 + 0.5 로 비교)."""
     read = LineRead()
     stack: list[tuple[float, Path]] = [(-1, ())]
     counters: dict[Path, int] = {}
     block_over: int | None = None
-    for no, line in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    done = 0  # 여러 줄 흐름 값으로 이미 읽은 마지막 줄
+    for no, line in enumerate(lines, 1):
+        if no <= done:
+            continue
         body = _strip_comment(line.replace("\t", "  ")).rstrip()
         if not body.strip() or body.strip() in ("---", "..."):
             continue
@@ -160,7 +207,7 @@ def read_lines(text: str) -> LineRead:
             if not content:
                 continue
             if not KEY_LINE.match(content):
-                ok, value = _scalar(content)
+                ok, value, done = _value(content, lines, no)
                 read.put(item, value, no) if ok else read.put_raw(item, content, no)
                 continue
         m = KEY_LINE.match(content)
@@ -178,6 +225,6 @@ def read_lines(text: str) -> LineRead:
             block_over = col
             read.put_raw(path, rest, no)
             continue
-        ok, value = _scalar(rest)
+        ok, value, done = _value(rest, lines, no)
         read.put(path, value, no) if ok else read.put_raw(path, rest, no)
     return read

@@ -14,7 +14,7 @@ from review_ai.errors import TransientError
 from review_ai.judge.fake_llm import ScriptedLLM
 from review_ai.secrets_pattern import MASK
 from review_ai.spec.deploy_spec import AppSpec
-from review_api.app import ApiDeps, create_app
+from review_api.app import ApiDeps, create_app, make_repair_llm
 from review_api.intake import STALE_AFTER, STATUS_CONTEXT, resume_stale_intakes
 from review_common.github import GitHubError, RefConflict
 from tests.test_api import HEAD, REPO, SECRET, FakePublisher, FakeSpecs, pr_event, sample_text, send_pr
@@ -310,6 +310,15 @@ async def test_transient_llm_error_fails_with_retry_hint() -> None:
     row = env.only_intake()
     assert (row["status"], row["reason"]) == ("failed", "ERROR") and "다시 처리한다" in row["message"]
     assert env.states() == [(HEAD, "pending"), (HEAD, "error")]
+
+
+def test_repair_llm_finishes_before_stale_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    client = make_repair_llm()._inner._client  # type: ignore[union-attr]
+
+    assert client.timeout * (client.max_retries + 1) < STALE_AFTER.total_seconds()
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    assert make_repair_llm() is None
 
 
 async def test_fork_pr_is_not_committed(ienv: IntakeEnv) -> None:

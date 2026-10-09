@@ -308,10 +308,14 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
     return result
 
 
+# 기본값(10분·재시도 2번)이면 처리 중인 intake 를 STALE_AFTER(2분) 뒤 sweep 이 다시 가져가 두 번 처리한다
+REPAIR_CLIENT_OPTIONS: dict[str, Any] = {"timeout": 45.0, "max_retries": 1}
+
+
 def make_repair_llm() -> LlmClient | None:
     """형식 오류 명세 복구용 Claude. 워커 judge 와 같은 키·모델, 출력 스키마만 RepairOutput."""
     try:
-        return CachedLLM(ClaudeLLM(output=RepairOutput))
+        return CachedLLM(ClaudeLLM(output=RepairOutput, client_options=REPAIR_CLIENT_OPTIONS))
     except LlmUnavailable as exc:
         log.warning("명세 복구 LLM 없이 시작 — 형식 오류 명세는 REPAIR_UNAVAILABLE 로 거절한다: %s", exc)
         return None

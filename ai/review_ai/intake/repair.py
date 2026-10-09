@@ -208,8 +208,8 @@ def _in_text(value: Any, text: str) -> bool:
 
 
 def _raw_for(original: Original, path: Path) -> str | None:
-    """경로나 그 부모가 '값을 못 읽은 줄'이면 그 글자."""
-    return next((original.raw[path[:n]] for n in range(len(path), -1, -1) if path[:n] in original.raw), None)
+    """경로나 그 부모가 '값을 못 읽은 줄'이면 그 글자. 최상위에 흘린 글자는 어느 값의 근거도 아니다."""
+    return next((original.raw[path[:n]] for n in range(len(path), 0, -1) if path[:n] in original.raw), None)
 
 
 @dataclass(frozen=True)
@@ -296,7 +296,7 @@ def _gate(kind: IntakeKind, raw_output: str, original: Original, repository: str
                   for e in json.loads(exc.json(include_url=False, include_input=False))]
         return _rejected("REPAIR_REJECTED", f"{label} — 자동 복구 결과도 형식 검사를 통과하지 못했다. 직접 고쳐라",
                          issues)
-    if spec.metadata.repository != repository:
+    if spec.metadata.repository.lower() != repository.lower():  # GitHub 레포 이름은 대소문자를 가리지 않는다
         return _rejected("REPAIR_REJECTED", f"{label} — 자동 복구가 다른 레포의 명세를 만들었다",
                          [Issue("REPOSITORY_CHANGED", "/metadata/repository", f"PR 레포({repository})와 다르다")])
     issues, changes = _check(dict(flatten(spec.model_dump(mode="json", exclude_none=True))), original, reference)

@@ -69,13 +69,14 @@ class ClaudeLLM:
     """Claude API. structured outputs 로 output 스키마(기본 LlmReview)를 강제하고, 시스템 프롬프트는 캐시한다."""
 
     def __init__(self, client: Any = None, model: str = DEFAULT_MODEL,
-                 output: type[BaseModel] = LlmReview) -> None:
+                 output: type[BaseModel] = LlmReview, client_options: dict[str, Any] | None = None) -> None:
+        """client_options 는 키가 있을 때 만드는 AsyncAnthropic 인자(timeout·max_retries 등)."""
         import anthropic
 
         if client is None:
             if not os.environ.get("ANTHROPIC_API_KEY"):
                 raise LlmUnavailable("ANTHROPIC_API_KEY 가 없다")
-            client = anthropic.AsyncAnthropic()
+            client = anthropic.AsyncAnthropic(**(client_options or {}))
         self._anthropic = anthropic
         self._client = client
         self._schema = anthropic.transform_schema(output.model_json_schema())
