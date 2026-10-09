@@ -38,6 +38,14 @@ DbEngine = Literal["none", "postgres", "mysql", "sqlite"]
 DbPlacement = Literal["managed", "in-cluster", "volume", "external"]
 SecretSource = Literal["aws-secrets-manager", "gcp-secret-manager", "k8s-secret", "generated"]
 AccessMode = Literal["ReadWriteOnce", "ReadWriteMany"]
+Strategy = Literal["canary", "bluegreen"]
+# 이 배포가 DB 스키마를 어떻게 바꾸는가 — 마이그레이션 실행 시점과 배포 전략이 여기서 정해진다 (review_ai.deploy_plan)
+#   none      스키마 변경 없음
+#   expand    추가만 (테이블·nullable 컬럼·인덱스) — 옛 코드가 새 스키마에서도 돈다 → 새 버전 전에 실행
+#   contract  제거만 (옛 코드만 쓰던 컬럼·테이블) — 새 코드가 옛 스키마에서도 돈다 → 새 버전이 다 뜬 뒤 실행
+#   breaking  이름 변경·타입 변경처럼 옛 코드와 새 코드가 같은 스키마에서 함께 돌 수 없다
+SchemaChange = Literal["none", "expand", "contract", "breaking"]
+MIGRATION_ENGINES = ("postgres", "mysql")
 
 
 class _Frozen(BaseModel):
@@ -108,6 +116,13 @@ class Requirements(_Frozen):
     persistence: bool = Field(default=False, description="재배포 뒤에도 데이터가 남아야 하는가")
 
 
+class Migration(_Frozen):
+    """배포 때 앱 이미지로 실행할 마이그레이션. 렌더러가 Argo CD hook Job 으로 만든다."""
+
+    command: tuple[str, ...] = Field(min_length=1, description="앱 이미지 안에서 실행할 명령 (예: [npm, run, migrate])")
+    change: SchemaChange = Field(description="이 배포의 스키마 변경 종류 — 실행 시점(PreSync·PostSync)과 배포 전략을 정한다")
+
+
 class Database(_Frozen):
     engine: DbEngine = "none"
     version: str | None = Field(default=None, description="메이저 버전 (예: '16', '8.0')")
@@ -119,11 +134,15 @@ class Database(_Frozen):
     env_var: str = Field(default="DATABASE_URL", pattern=ENV_NAME)
     backup_retention_days: int = Field(default=1, ge=0, le=35)
     publicly_accessible: bool = False
+    migration: Migration | None = None
 
     @model_validator(mode="after")
     def _placement_when_engine(self) -> Database:
         if self.engine != "none" and self.placement is None:
             raise ValueError("database.engine 이 none 이 아니면 placement 가 필요하다")
+        if self.migration is not None and self.engine not in MIGRATION_ENGINES:
+            # SQLite 파일은 앱 파드의 볼륨 안에 있어 별도 Job 이 열 수 없다 — 앱이 시작할 때 마이그레이션한다
+            raise ValueError(f"database.migration 은 {'·'.join(MIGRATION_ENGINES)} 에서만 쓴다 (지금 {self.engine})")
         return self
 
 
@@ -176,6 +195,12 @@ class Bucket(_Frozen):
     encryption: bool = True
 
 
+class Rollout(_Frozen):
+    """canary: base Rollout 의 단계 배포를 그대로 쓴다. bluegreen: 새 버전을 미리보기 Service 로 띄워 확인한 뒤 한 번에 전환한다."""
+
+    strategy: Strategy = "canary"
+
+
 class Storage(_Frozen):
     volumes: tuple[Volume, ...] = ()
     buckets: tuple[Bucket, ...] = ()
@@ -195,6 +220,7 @@ class AppSpec(_Frozen):
     secrets: tuple[SecretRef, ...] = ()
     network: Network = Network()
     storage: Storage = Storage()
+    rollout: Rollout = Rollout()
 
 
 class BaselineFacts(_Frozen):

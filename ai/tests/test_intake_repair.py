@@ -146,7 +146,7 @@ def test_read_original_marks_error_lines_and_locations() -> None:
 
 
 def test_reference_keeps_only_verified_values(sample_app: dict) -> None:
-    assert set(reference_values(context(), None)) == {"api_version", "kind", "metadata", "target", "network"}
+    assert set(reference_values(context(), None)) == {"api_version", "kind", "metadata", "target", "network", "rollout"}
     baseline = Baseline(spec_ref="m1", spec=sample_app)
     assert reference_values(context(), baseline)["runtime"]["replicas"] == 2
 
