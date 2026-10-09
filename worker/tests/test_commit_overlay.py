@@ -9,7 +9,9 @@ import pytest
 import yaml
 
 from review_ai.errors import TransientError
-from review_worker.commit_overlay import commit_message, make_commit_overlay
+from review_common.github import GitHubGitClient
+from review_worker.commit_overlay import PROTECTED_OVERLAY_FILES, commit_message, make_commit_overlay
+from tests.test_git_client import FakeGitHubApi, client, files_at_head
 
 SAMPLES = Path(__file__).resolve().parents[2] / "ai" / "samples"
 REPO = "Crystal-SBHackathon2026/sample-app"
@@ -37,7 +39,9 @@ class FakeGit:
             raise self.read_error
         return self.raw
 
-    async def commit_files(self, directory: str, files: Mapping[str, str], message: str) -> str:
+    async def commit_files(self, directory: str, files: Mapping[str, str], message: str, *,
+                           protected=()) -> str:
+        self.protected = tuple(protected)
         if self.commit_error:
             raise self.commit_error
         self.commits.append((directory, dict(files), message))
@@ -173,3 +177,59 @@ async def test_병합_전_검사는_ingress_삭제만_사유로_돌려준다():
 
     assert await make_overlay_guard(keep)(state()) is None
     assert await make_overlay_guard(drop)(state()) == "OVERLAY_RESOURCE_REMOVED: ingress.yaml"
+
+
+# --- 커밋 재시도 중에 생긴 보호 파일 (실제 GitHubGitClient + 가짜 GitHub API) -----------------------------
+
+class SampleGitClient(GitHubGitClient):
+    """gitops 쪽은 실제 GitHubGitClient, 앱 레포 명세는 샘플."""
+
+    raw = ""
+
+    async def read_file(self, repository: str, path: str, ref: str) -> str:
+        return self.raw
+
+
+def gitops_client(api: FakeGitHubApi, raw: str) -> SampleGitClient:
+    git = client(api, SampleGitClient)
+    git.raw = raw
+    return git
+
+
+NO_INGRESS = "network:\n  ingress: {public: true, tls: false}\n"
+OVERLAY_DIR = "apps/sample-app/overlays/aws"
+
+
+@pytest.mark.asyncio
+async def test_재시도_중에_ingress_가_생기면_지우지_않고_blocked():
+    raw = FakeGit("01-pass-sample-app-aws.yaml").raw.replace(NO_INGRESS, "")
+    api = FakeGitHubApi({f"{OVERLAY_DIR}/kustomization.yaml": "old"})  # 첫 검사 때는 ingress 없음
+    api.conflicts = 1  # 그 사이 다른 곳이 ingress.yaml 을 넣었다
+    api.conflict_files = {f"{OVERLAY_DIR}/kustomization.yaml": "old", f"{OVERLAY_DIR}/ingress.yaml": "ingress"}
+
+    out = await make_commit_overlay(gitops_client(api, raw))(state())
+
+    assert out == {"deploy_result": {"status": "blocked", "commit_sha": None,
+                                     "reason": "OVERLAY_RESOURCE_REMOVED: ingress.yaml"}}
+    assert (len(api.created_trees), api.created_commits, api.ref_updates) == (1, 1, 1)
+    assert f"{OVERLAY_DIR}/ingress.yaml" in files_at_head(api)
+
+
+@pytest.mark.asyncio
+async def test_명세에_ingress_가_있으면_재시도해도_정상_커밋():
+    raw = FakeGit("01-pass-sample-app-aws.yaml").raw
+    api = FakeGitHubApi({f"{OVERLAY_DIR}/kustomization.yaml": "old"})
+    api.conflicts = 1
+    api.conflict_files = {f"{OVERLAY_DIR}/kustomization.yaml": "old", f"{OVERLAY_DIR}/ingress.yaml": "ingress"}
+
+    out = await make_commit_overlay(gitops_client(api, raw))(state())
+
+    assert out["deploy_result"]["status"] == "committed" and out["deploy_result"]["commit_sha"] == api.head
+    assert files_at_head(api)[f"{OVERLAY_DIR}/ingress.yaml"] != "ingress"
+
+
+@pytest.mark.asyncio
+async def test_커밋할_때_보호_파일_목록을_넘긴다():
+    git = FakeGit("01-pass-sample-app-aws.yaml")
+    await make_commit_overlay(git)(state())
+    assert git.protected == PROTECTED_OVERLAY_FILES

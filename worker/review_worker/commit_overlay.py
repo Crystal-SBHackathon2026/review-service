@@ -23,6 +23,7 @@ from review_ai.patching import apply_ops
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.state import DeployResult, ReviewState
 from review_ai.verdict import applied_ops
+from review_common.github import ProtectedFileRemoval
 
 __all__ = ["GitClient", "make_commit_overlay", "make_overlay_guard", "commit_message", "removed_protected",
            "PROTECTED_OVERLAY_FILES", "OVERLAY_RESOURCE_REMOVED"]
@@ -45,11 +46,11 @@ class GitClient(Protocol):
         ...
 
     async def commit_files(
-        self, directory: str, files: Mapping[str, str], message: str
+        self, directory: str, files: Mapping[str, str], message: str, *, protected: Iterable[str] = ()
     ) -> str:
         """gitops 레포의 directory 아래를 files 로 맞추고 커밋한다. 커밋 SHA 를 돌려준다.
 
-        구현체가 지켜야 할 것 두 가지.
+        구현체가 지켜야 할 것 세 가지.
 
         1. directory 안에 있지만 files 에 없는 파일은 지운다. overlay 는 생성물이라
            명세에서 볼륨이 빠졌는데 예전 pvc-*.yaml 이 남으면 kustomize 가 없는
@@ -57,6 +58,8 @@ class GitClient(Protocol):
         2. push 가 충돌하면 rebase 해서 다시 시도한다. gitops 에 커밋하는 곳이
            셋이다 — sample-app CI(이미지 태그), review-service CI(이미지 태그),
            그리고 이 노드. 같은 시점에 겹칠 수 있다.
+        3. protected(directory 기준 파일 이름) 중 지우게 되는 파일이 있으면 커밋하지 않고
+           ProtectedFileRemoval 을 던진다. 충돌로 다시 만들 때마다 새로 읽은 main 기준으로 본다.
 
         네트워크 오류는 TransientError 로 올린다. 재시도해도 안 되는 충돌도 마찬가지다.
         """
@@ -151,11 +154,16 @@ def make_commit_overlay(
         if removed:
             return _blocked(removed_reason(removed))
 
-        sha = await git.commit_files(
-            rendered.directory,
-            rendered.files,
-            commit_message(spec.metadata.name, spec.target.env, state["spec_ref"]["commit"]),
-        )
+        # 위 검사 뒤 커밋 사이에 gitops 가 바뀌면(충돌 재시도) commit_files 가 새 main 기준으로 다시 본다.
+        try:
+            sha = await git.commit_files(
+                rendered.directory,
+                rendered.files,
+                commit_message(spec.metadata.name, spec.target.env, state["spec_ref"]["commit"]),
+                protected=PROTECTED_OVERLAY_FILES,
+            )
+        except ProtectedFileRemoval as e:
+            return _blocked(removed_reason(e.paths))
         return _committed(sha)
 
     return commit_overlay

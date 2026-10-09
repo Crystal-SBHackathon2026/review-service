@@ -488,7 +488,7 @@ class FakeGitClient:
     async def read_file(self, repository: str, path: str, ref: str) -> str:
         return self.github.files[ref]
 
-    async def commit_files(self, directory: str, files: Any, message: str) -> str:
+    async def commit_files(self, directory: str, files: Any, message: str, *, protected: Any = ()) -> str:
         if self.fail_times:
             self.fail_times -= 1
             raise TransientError("gitops ref 충돌")
@@ -528,6 +528,35 @@ async def test_commit_overlay_blocking_warning_is_blocked() -> None:
     assert (row["status"], row["gitops_commit_sha"]) == ("blocked", None)
     assert "DB_PROVISIONING_REQUIRED" in row["deploy_result"]["reason"]
     assert git.commits == []
+
+
+async def test_protected_file_appearing_during_commit_retry_is_blocked_with_failure_status() -> None:
+    """병합 전·커밋 전 검사 땐 ingress 가 없었는데 gitops 커밋 충돌 사이에 생겼다 → 지우지 않고 blocked, verify failure."""
+    from review_common.github import GitHubGitClient
+    from review_worker.commit_overlay import make_commit_overlay
+    from tests.test_commit_overlay import OVERLAY_DIR
+    from tests.test_git_client import FakeGitHubApi, client
+
+    h = Harness()
+    api = FakeGitHubApi({f"{OVERLAY_DIR}/kustomization.yaml": "old"})  # 병합 전·커밋 전 검사 때는 ingress 없음
+    api.conflicts = 1
+    api.conflict_files = {f"{OVERLAY_DIR}/kustomization.yaml": "old", f"{OVERLAY_DIR}/ingress.yaml": "ingress"}
+
+    class AppSpecFromHarness(GitHubGitClient):  # gitops 는 실제 클라이언트, 앱 레포 명세는 하네스
+        async def read_file(self, repository: str, path: str, ref: str) -> str:
+            return h.github.files[ref]
+
+    h.deps.commit_overlay = make_commit_overlay(client(api, AppSpecFromHarness))
+    spec = load_sample(SAMPLE_01)
+    spec.pop("network")
+    await h.request(spec)
+    await _finish_ci(h)
+
+    row = h.row()
+    assert (row["status"], row["gitops_commit_sha"]) == ("blocked", None)
+    assert row["deploy_result"]["reason"] == "OVERLAY_RESOURCE_REMOVED: ingress.yaml"
+    assert h.github.statuses[-1][1:] == ("failure", "OVERLAY_RESOURCE_REMOVED: ingress.yaml")
+    assert api.created_commits == 1  # 충돌 난 첫 시도뿐
 
 
 async def test_commit_overlay_retries_transient_error() -> None:

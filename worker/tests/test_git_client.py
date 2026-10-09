@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from review_ai.errors import TransientError
-from review_common.github import GitHubClient, GitHubGitClient, git_blob_sha
+from review_common.github import GitHubClient, GitHubError, GitHubGitClient, ProtectedFileRemoval, git_blob_sha
 
 GITOPS = "Crystal-SBHackathon2026/gitops"
 DIR = "apps/sample-app/overlays/aws"
@@ -25,7 +25,9 @@ class FakeGitHubApi:
         self.conflicts = 0
         self.server_errors = 0
         self.created_trees: list[list[dict[str, Any]]] = []
+        self.created_commits = 0
         self.ref_updates = 0
+        self.conflict_files: dict[str, str] | None = None  # 충돌 때 다른 곳이 먼저 커밋한 main 의 파일 (기본: 처음 그대로)
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         if self.server_errors:
@@ -58,6 +60,7 @@ class FakeGitHubApi:
         if method == "POST" and rest == "commits":
             sha = f"c{len(self.commits)}"
             self.commits[sha] = body["tree"]
+            self.created_commits += 1
             return httpx.Response(201, json={"sha": sha})
         if method == "PATCH" and rest == "refs/heads/main":
             assert body["force"] is False
@@ -65,16 +68,20 @@ class FakeGitHubApi:
             if self.conflicts:
                 self.conflicts -= 1
                 self.head = f"other{self.conflicts}"  # 다른 CI 가 먼저 커밋했다
-                self.commits[self.head] = "t0"
+                tree = "t0"
+                if self.conflict_files is not None:
+                    tree = f"t{len(self.trees)}"
+                    self.trees[tree] = dict(self.conflict_files)
+                self.commits[self.head] = tree
                 return httpx.Response(422, json={"message": "Update is not a fast forward"})
             self.head = body["sha"]
             return httpx.Response(200, json={})
         raise AssertionError(f"{method} {path}")
 
 
-def client(api: FakeGitHubApi) -> GitHubGitClient:
+def client(api: FakeGitHubApi, cls: type[GitHubGitClient] = GitHubGitClient) -> GitHubGitClient:
     http = httpx.AsyncClient(base_url="https://api.github.com", transport=httpx.MockTransport(api.handler))
-    return GitHubGitClient(GitHubClient("t", client=http), gitops_repo=GITOPS, backoff_seconds=0)
+    return cls(GitHubClient("t", client=http), gitops_repo=GITOPS, backoff_seconds=0)
 
 
 def files_at_head(api: FakeGitHubApi) -> dict[str, str]:
@@ -120,6 +127,43 @@ async def test_server_error_is_transient() -> None:
     api.server_errors = 1
     with pytest.raises(TransientError):
         await client(api).commit_files(DIR, {"kustomization.yaml": "new"}, "msg")
+
+
+async def test_protected_file_added_during_conflict_is_not_removed_on_retry() -> None:
+    """검사 뒤 다른 곳이 ingress.yaml 을 넣고 ref 가 충돌 → 재시도는 새 main 기준으로 보고 지우지 않고 멈춘다."""
+    api = FakeGitHubApi({f"{DIR}/kustomization.yaml": "old"})
+    api.conflicts = 1
+    api.conflict_files = {f"{DIR}/kustomization.yaml": "old", f"{DIR}/ingress.yaml": "ingress"}
+
+    with pytest.raises(ProtectedFileRemoval) as exc:
+        await client(api).commit_files(DIR, {"kustomization.yaml": "new"}, "msg", protected=("ingress.yaml",))
+
+    assert exc.value.paths == ["ingress.yaml"]
+    assert not isinstance(exc.value, (TransientError, GitHubError))
+    # 첫 시도의 tree·commit·ref 갱신(422) 하나씩 — 재시도에서는 아무것도 만들지 않았다
+    assert (len(api.created_trees), api.created_commits, api.ref_updates) == (1, 1, 1)
+    assert files_at_head(api)[f"{DIR}/ingress.yaml"] == "ingress"
+
+
+async def test_protected_file_removal_on_first_attempt_makes_no_commit() -> None:
+    api = FakeGitHubApi({f"{DIR}/kustomization.yaml": "old", f"{DIR}/ingress.yaml": "ingress"})
+
+    with pytest.raises(ProtectedFileRemoval):
+        await client(api).commit_files(DIR, {"kustomization.yaml": "new"}, "msg", protected=["ingress.yaml"])
+
+    assert (api.created_trees, api.created_commits, api.ref_updates) == ([], 0, 0)
+
+
+async def test_protected_file_kept_by_rendered_files_commits_normally() -> None:
+    api = FakeGitHubApi({f"{DIR}/kustomization.yaml": "old", f"{DIR}/ingress.yaml": "old"})
+    api.conflicts = 1
+    api.conflict_files = {f"{DIR}/kustomization.yaml": "old", f"{DIR}/ingress.yaml": "other"}
+
+    sha = await client(api).commit_files(DIR, {"kustomization.yaml": "new", "ingress.yaml": "new"}, "msg",
+                                         protected=("ingress.yaml",))
+
+    assert sha == api.head and api.ref_updates == 2
+    assert files_at_head(api) == {f"{DIR}/kustomization.yaml": "new", f"{DIR}/ingress.yaml": "new"}
 
 
 async def test_read_file_missing_is_file_not_found() -> None:
