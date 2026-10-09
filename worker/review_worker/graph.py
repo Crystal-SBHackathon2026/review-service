@@ -8,7 +8,7 @@
                           승인              → await_ci (AI 가 고친 회차가 있으면 commit_fix)
                           거절              → END (rejected)
     pass + 수정 있음  → commit_fix → END (superseded — 수정 커밋을 autofix_commit 새 검토로)
-    pass + 수정 없음  → await_ci → check_ci ─ CI 끝남 → merge_pr → commit_overlay(gitops 커밋) → END
+    pass + 수정 없음  → await_ci → check_ci ─ CI 끝남 → guard_overlay → merge_pr → commit_overlay(gitops 커밋) → END
                                            └ 아직    → wait_ci ⏸ → (재개) 다시 확인, 다른 suite 가 남았으면 await_ci
 
 ⏸ 는 LangGraph interrupt. review.resumed 가 오면 같은 thread_id(review_id) 로 Command(resume=...) 재개한다.
@@ -63,12 +63,23 @@ log = logging.getLogger(__name__)
 JUDGE_MAX_RETRIES = 3  # TransientError 재시도 횟수. 소진되면 judge_unavailable 로 계속한다
 GITHUB_MAX_ATTEMPTS = 3
 RECURSION_LIMIT = 100
+VERIFY_CONTEXT = "review-service/verify"  # 검토 결과 커밋 상태. sample-app 브랜치 보호의 필수 체크로 건다
+VERIFY_MAX_ATTEMPTS = 3  # merge_pr 직전 success 쓰기 — 필수 체크라 못 쓰면 병합이 막힌다
 CI_OK = frozenset({"success", "neutral", "skipped"})
 
 COMMIT_OVERLAY_MAX_ATTEMPTS = 3  # commit_overlay 의 TransientError(네트워크·gitops 충돌) 재시도
 
 # review_worker.commit_overlay.make_commit_overlay(git) 가 돌려주는 노드 모양. 바뀐 필드 {"deploy_result": ...} 만 돌려준다
 CommitOverlay = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+
+
+# review_worker.commit_overlay.make_overlay_guard(git) — 병합하면 안 되는 사유(지금 배포 중인 ingress 삭제 등) 또는 None
+OverlayGuard = Callable[[dict[str, Any]], Awaitable[str | None]]
+
+
+async def no_overlay_guard(state: dict[str, Any]) -> str | None:
+    """테스트용 — 검사하지 않는다. 실제 워커는 make_overlay_guard(GitHubGitClient) 를 쓴다."""
+    return None
 
 
 class GitHubPort(Protocol):
@@ -84,6 +95,9 @@ class GitHubPort(Protocol):
     async def pulls_for_commit(self, repository: str, sha: str) -> list[dict[str, Any]]: ...
 
     async def merge_pull(self, repository: str, number: int, *, head_sha: str) -> str: ...
+
+    async def create_commit_status(self, repository: str, sha: str, *, state: str, context: str, description: str,
+                                   target_url: str | None = None) -> None: ...
 
 
 class Publisher(Protocol):
@@ -103,9 +117,17 @@ class Deps:
     llm: LlmClient | None
     retriever: Retriever
     commit_overlay: CommitOverlay = commit_overlay_stub
+    overlay_guard: OverlayGuard = no_overlay_guard
     ci_app_slug: str | None = "github-actions"  # 이 GitHub App 의 check suite 만 CI 로 본다. None 이면 전부
+    public_url: str | None = None  # REVIEW_API_PUBLIC_URL — 커밋 상태 링크 /reviews/{id} 의 앞부분
     judge_max_retries: int = JUDGE_MAX_RETRIES
     retry_backoff_seconds: float = 1.0
+
+
+def is_fork_pull(pull: dict[str, Any], repository: str) -> bool:
+    """PR head 가 이 레포가 아니거나(포크) head 레포가 없으면(포크가 지워짐) True."""
+    head_repo = (pull.get("head") or {}).get("repo")
+    return head_repo is None or head_repo.get("full_name") != repository
 
 
 def app_spec(spec: dict[str, Any]) -> dict[str, Any]:
@@ -149,9 +171,28 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             raise GitHubError(f"PR #{pull['number']} head {pull['head']['sha']} 가 검토한 {sha} 와 다르다")
         return pull
 
+    async def _verify_status(review_id: str, spec_ref: dict[str, str] | None, state: str, description: str, *,
+                             attempts: int = 1) -> bool:
+        """PR head 에 커밋 상태 review-service/verify. 실패해도 검토는 계속한다 (경고만). 썼으면 True."""
+        if not spec_ref:
+            return False
+        url = f"{deps.public_url.rstrip('/')}/reviews/{review_id}" if deps.public_url else None
+        for attempt in range(1, attempts + 1):
+            try:
+                await github.create_commit_status(spec_ref["repository"], spec_ref["commit"], state=state,
+                                                  context=VERIFY_CONTEXT, description=description, target_url=url)
+                return True
+            except Exception as exc:  # noqa: BLE001 — 권한·네트워크. 상태 표시 때문에 검토를 멈추지 않는다
+                log.warning("review %s: 커밋 상태(%s) 기록 실패 %d/%d — %s", review_id, state, attempt, attempts, exc)
+                if attempt < attempts:
+                    await asyncio.sleep(deps.retry_backoff_seconds * 2**attempt)
+        return False
+
     async def _fail(review_id: str, error: str) -> Command:
         log.warning("review %s: failed — %s", review_id, error)
         await repo.update_review(review_id, status="failed", error=error[:2000])
+        row = await repo.get_review(review_id)
+        await _verify_status(review_id, row and row.get("spec_ref"), "failure", error)
         return Command(goto=END)
 
     async def _record_case(state: dict[str, Any], *, human: dict[str, Any] | None = None) -> None:
@@ -199,6 +240,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
 
     async def await_human(state: dict[str, Any]) -> dict[str, Any]:
         await repo.update_review(state["review_id"], status="needs_human")
+        reasons = ", ".join((state.get("decision") or {}).get("reasons") or []) or "사유 없음"
+        await _verify_status(state["review_id"], state.get("spec_ref"), "failure", f"사람 확인 필요: {reasons}")
         return {}
 
     async def wait_human(state: dict[str, Any]) -> Command:
@@ -207,6 +250,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         rid = state["review_id"]
         if decision["decision"] == "rejected":
             await repo.update_review(rid, status="rejected", human_decision=decision)
+            await _verify_status(rid, state.get("spec_ref"), "failure", f"사람이 거절 ({decision['approver']})")
             await _record_case(state, human=decision)
             return Command(goto=END, update={"human_decision": decision, "status": "rejected"})
         try:
@@ -249,7 +293,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         ops = applied_ops(state)
         try:
             pull = await _open_pull(ref)
-            if (pull["head"].get("repo") or {}).get("full_name", repository) != repository:
+            if is_fork_pull(pull, repository):
                 raise GitHubError(f"PR #{pull['number']} 은 포크 브랜치라 자동 커밋할 수 없다")
             raw = await _retry("deploy.yaml 읽기", lambda: github.get_file(repository, path, parent))
             fixed = apply_ops(yaml.safe_load(raw), ops)  # 원본(가리지 않은 값)에 적용. ops 는 env·시크릿을 건드리지 못한다
@@ -275,6 +319,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             await repo.update_review(new_rid, status="failed", error=f"브랜치 갱신 실패: {exc}"[:2000])
             return await _fail(rid, f"commit_fix: {exc}")
         await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
+        await _verify_status(new_rid, new_ref, "pending", "AI 검토 중 (수정 커밋)")  # 옛 SHA 상태는 그대로 둔다
         await repo.update_review(rid, status="superseded", superseded_by=new_rid)
         await _record_case(state)
         log.info("review %s: 수정 %d건을 %s 로 커밋 → 재검토 %s", rid, len(ops), new_sha, new_rid)
@@ -291,10 +336,13 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     async def _after_ci(state: dict[str, Any], conclusion: str) -> Command:
         if conclusion != "success":
             return await _fail(state["review_id"], f"CI {conclusion} ({state['spec_ref']['commit']})")
-        return Command(goto="merge_pr")
+        return Command(goto="guard_overlay")
 
     async def await_ci(state: dict[str, Any]) -> dict[str, Any]:
         await repo.update_review(state["review_id"], status="waiting_ci", final_spec=app_spec(state["deploy_spec"]))
+        approved = (state.get("human_decision") or {}).get("decision") == "approved"
+        await _verify_status(state["review_id"], state.get("spec_ref"), "success",
+                             "사람이 승인" if approved else "AI 검토 통과")
         return {}
 
     async def check_ci(state: dict[str, Any]) -> Command:
@@ -321,11 +369,36 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             return Command(goto="await_ci")
         return await _after_ci(state, conclusion)
 
+    async def guard_overlay(state: dict[str, Any]) -> Command:
+        """병합 전 — 지금 배포 중인 보호 리소스(ingress 등)를 지우는 명세면 병합하지 않고 blocked (10/09 sample-app#11 장애)."""
+        rid = state["review_id"]
+        for attempt in range(1, COMMIT_OVERLAY_MAX_ATTEMPTS + 1):
+            try:
+                reason = await deps.overlay_guard(state)
+                break
+            except TransientError as exc:
+                if attempt == COMMIT_OVERLAY_MAX_ATTEMPTS:
+                    raise
+                log.warning("review %s: overlay 검사 일시 오류 %d — %s", rid, attempt, exc)
+                await asyncio.sleep(deps.retry_backoff_seconds * 2**attempt)
+        if reason is None:
+            return Command(goto="merge_pr")
+        log.warning("review %s: 병합 안 함 — %s", rid, reason)
+        result = DeployResult(status="blocked", commit_sha=None, reason=reason)
+        await repo.update_review(rid, status="blocked", error=reason, deploy_result=result)
+        await _verify_status(rid, state.get("spec_ref"), "failure", reason)
+        return Command(goto=END, update={"deploy_result": result})
+
     async def merge_pr(state: dict[str, Any]) -> Command:
         rid, ref = state["review_id"], state["spec_ref"]
         await repo.update_review(rid, status="merging")
         try:
-            pull = await _open_pull(ref)
+            pull = await _open_pull(ref)  # 병합 직전에 PR 을 다시 읽는다
+            if is_fork_pull(pull, ref["repository"]):
+                raise GitHubError(f"fork PR — PR #{pull['number']} 은 포크 브랜치라 병합하지 않는다")
+            # 필수 체크라 success 가 없으면 GitHub 이 병합을 거절한다 — 병합 직전에 다시 쓴다
+            if not await _verify_status(rid, ref, "success", "AI 검토 통과 — 병합", attempts=VERIFY_MAX_ATTEMPTS):
+                raise GitHubError(f"커밋 상태 {VERIFY_CONTEXT} 를 쓰지 못해 병합하지 않는다")
             merge_sha = await github.merge_pull(ref["repository"], pull["number"], head_sha=ref["commit"])
         except GitHubError as exc:
             return await _fail(rid, f"merge_pr: {exc}")
@@ -345,6 +418,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
                 await asyncio.sleep(deps.retry_backoff_seconds * 2**attempt)
         await repo.update_review(state["review_id"], status=result["status"], deploy_result=result,
                                  gitops_commit_sha=result["commit_sha"] if result["status"] == "committed" else None)
+        if result["status"] == "blocked":  # 병합은 됐지만 배포는 막혔다
+            await _verify_status(state["review_id"], state.get("spec_ref"), "failure", result["reason"] or "blocked")
         if result["status"] == "committed" and state.get("human_decision"):  # 사람 없이 그대로 통과한 검토는 남길 판단이 없다
             await _record_case(state)
         return {"deploy_result": result}
@@ -360,8 +435,9 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     graph.add_node("apply_human_edits", apply_human_edits, destinations=("static_check", "await_human"))
     graph.add_node("commit_fix", commit_fix, destinations=(END,))
     graph.add_node("await_ci", await_ci)
-    graph.add_node("check_ci", check_ci, destinations=("wait_ci", "merge_pr", END))
-    graph.add_node("wait_ci", wait_ci, destinations=("await_ci", "merge_pr", END))
+    graph.add_node("check_ci", check_ci, destinations=("wait_ci", "guard_overlay", END))
+    graph.add_node("wait_ci", wait_ci, destinations=("await_ci", "guard_overlay", END))
+    graph.add_node("guard_overlay", guard_overlay, destinations=("merge_pr", END))
     graph.add_node("merge_pr", merge_pr, destinations=("commit_overlay", END))
     graph.add_node("commit_overlay", commit_overlay)
 

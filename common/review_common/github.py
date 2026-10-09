@@ -223,6 +223,18 @@ class GitHubGitClient:
                 raise TransientError(str(exc)) from exc
             raise
 
+    async def list_files(self, directory: str) -> list[str]:
+        """gitops main 의 directory 바로 아래 파일 이름 (하위 폴더 안은 빼고). 디렉터리가 없으면 빈 목록."""
+        prefix = directory.strip("/") + "/"
+        try:
+            head = await self._gh.branch_sha(self.gitops_repo, self.branch)
+            blobs = await self._gh.tree_blobs(self.gitops_repo, await self._gh.commit_tree_sha(self.gitops_repo, head))
+        except GitHubError as exc:
+            if exc.transient:
+                raise TransientError(str(exc)) from exc
+            raise
+        return sorted(p[len(prefix):] for p in blobs if p.startswith(prefix) and "/" not in p[len(prefix):])
+
     async def commit_files(self, directory: str, files: Mapping[str, str], message: str) -> str:
         directory = directory.strip("/")
         try:

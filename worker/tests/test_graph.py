@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
+
 import yaml
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -475,9 +477,13 @@ async def test_graph_exception_marks_failed() -> None:
 class FakeGitClient:
     """GitClient — 앱 레포는 FakeGitHub 파일, gitops 커밋은 메모리. 처음 fail_times 번은 TransientError."""
 
-    def __init__(self, github: Any, fail_times: int = 0) -> None:
+    def __init__(self, github: Any, fail_times: int = 0, existing: list[str] | None = None) -> None:
         self.github, self.fail_times = github, fail_times
         self.commits: list[tuple[str, dict[str, str], str]] = []
+        self.existing = existing or []  # gitops 에 지금 있는 overlay 파일 (기본: 새 앱)
+
+    async def list_files(self, directory: str) -> list[str]:
+        return list(self.existing)
 
     async def read_file(self, repository: str, path: str, ref: str) -> str:
         return self.github.files[ref]
@@ -659,3 +665,160 @@ async def test_next_review_of_same_rule_gets_case_as_evidence() -> None:
     assert docs.index(case_docs[0]) > 0  # 규칙 문서가 먼저
     assert "지난 검토 rv_first" in prompts[-1] and SECRET not in prompts[-1]
     assert h.row("rv_second")["decision"]["validation"]["citations_ok"]
+
+
+# --- 배포 중인 ingress 를 지우는 변경 막기 (10/09 sample-app#11 장애) -----------------------------------
+
+def _guarded(existing: list[str]) -> tuple[Harness, FakeGitClient]:
+    from review_worker.commit_overlay import make_commit_overlay, make_overlay_guard
+
+    h = Harness()
+    git = FakeGitClient(h.github, existing=existing)
+    h.deps.commit_overlay = make_commit_overlay(git)
+    h.deps.overlay_guard = make_overlay_guard(git)
+    return h, git
+
+
+def _without_ingress() -> dict[str, Any]:
+    spec = load_sample(SAMPLE_01)
+    spec["network"] = {}  # intake 가 만든 명세처럼 — 공개 진입점이 빠졌다
+    return spec
+
+
+async def test_spec_dropping_live_ingress_is_not_merged() -> None:
+    h, git = _guarded(existing=["ingress.yaml", "kustomization.yaml"])
+    await h.request(_without_ingress())
+    await _finish_ci(h)
+
+    row = h.row()
+    assert (row["status"], row["error"]) == ("blocked", "OVERLAY_RESOURCE_REMOVED: ingress.yaml")
+    assert row["deploy_result"] == {"status": "blocked", "commit_sha": None,
+                                    "reason": "OVERLAY_RESOURCE_REMOVED: ingress.yaml"}
+    assert h.github.merged == [] and git.commits == []  # 앱 레포도 gitops 도 그대로
+    assert row["merge_sha"] is None
+
+
+async def test_spec_keeping_ingress_is_merged() -> None:
+    h, git = _guarded(existing=["ingress.yaml", "kustomization.yaml"])
+    await h.request(load_sample(SAMPLE_01))
+    await _finish_ci(h)
+
+    assert h.row()["status"] == "committed"
+    assert h.github.merged and "ingress.yaml" in git.commits[0][1]
+
+
+async def test_new_app_without_overlay_proceeds() -> None:
+    h, git = _guarded(existing=[])
+    await h.request(_without_ingress())
+    await _finish_ci(h)
+
+    assert h.row()["status"] == "committed"
+    assert h.github.merged and set(git.commits[0][1]) == {"kustomization.yaml"}
+
+
+async def test_commit_overlay_checks_again_after_merge() -> None:
+    """병합 전 검사를 지난 뒤 gitops 에 ingress 가 생겼다 — commit_overlay 가 한 번 더 막는다."""
+    from review_worker.commit_overlay import make_commit_overlay
+
+    h = Harness()
+    git = FakeGitClient(h.github, existing=["ingress.yaml"])
+    h.deps.commit_overlay = make_commit_overlay(git)  # 병합 전 검사는 없음(no_overlay_guard) — 그사이 바뀐 상황
+    await h.request(_without_ingress())
+    await _finish_ci(h)
+
+    row = h.row()
+    assert (row["status"], row["deploy_result"]["reason"]) == ("blocked", "OVERLAY_RESOURCE_REMOVED: ingress.yaml")
+    assert git.commits == []
+
+
+# --- 포크 PR 은 병합하지 않는다 (P0-2) -------------------------------------------------------------------
+
+@pytest.mark.parametrize("head_repo", ["someone/fork", None])
+async def test_fork_pr_reaching_merge_is_not_merged(harness: Harness, head_repo: str | None) -> None:
+    """웹훅에서 막지만, 포크 PR 이 merge_pr 까지 와도 병합 API 를 부르지 않는다."""
+    harness.github.open_pr("Crystal-SBHackathon2026/sample-app", HEAD)
+    harness.github.pulls[HEAD][0]["head"]["repo"] = {"full_name": head_repo} if head_repo else None
+    await harness.request(load_sample(SAMPLE_01))
+    await _finish_ci(harness)
+
+    row = harness.row()
+    assert row["status"] == "failed" and "fork PR" in row["error"]
+    assert harness.github.merged == []
+
+
+# --- 커밋 상태 review-service/verify (⑤) ----------------------------------------------------------------
+
+async def test_pass_writes_success_before_merge(harness: Harness) -> None:
+    await harness.request(load_sample(SAMPLE_01))
+    assert harness.github.states() == ["success"]  # CI 대기로 넘어갈 때
+
+    await _finish_ci(harness)
+    events = harness.github.events
+    assert events.index("merge") > max(i for i, e in enumerate(events) if e == "status:success")
+    assert harness.github.merged  # (테스트 기본 commit_overlay 는 스텁이라 그 뒤는 blocked)
+
+
+async def test_needs_human_writes_failure_then_success_after_approval(harness: Harness) -> None:
+    sample = load_sample(SAMPLE_04)
+    await _seed_baseline(harness, sample)
+    await harness.request(sample)
+
+    [(sha, state, description)] = harness.github.statuses
+    assert (state, description) == ("failure", "사람 확인 필요: IRREVERSIBLE")
+
+    await harness.resume({"review_id": RID, "kind": "human_decision", "human_decision": {
+        "decision": "approved", "approver": "hyeyeon", "edited_ops": [], "use_recommendations": False}})
+    assert harness.github.statuses[-1][1:] == ("success", "사람이 승인")
+
+
+async def test_fix_commit_review_starts_pending_on_new_sha(harness: Harness) -> None:
+    """수정 커밋으로 넘긴 검토 — 옛 SHA 상태는 그대로, 새 SHA 는 pending 부터."""
+    await harness.request(load_sample(SAMPLE_05))
+
+    assert harness.row()["status"] == "superseded"
+    assert harness.github.states(HEAD) == []  # 옛 SHA 는 손대지 않는다
+    assert harness.github.states(FIX_SHA) == ["pending"]
+
+
+async def test_rejected_writes_failure(harness: Harness) -> None:
+    sample = load_sample(SAMPLE_04)
+    await _seed_baseline(harness, sample)
+    await harness.request(sample)
+    await harness.human(RID, "rejected")
+
+    assert harness.github.statuses[-1][1:] == ("failure", "사람이 거절 (hyeyeon)")
+
+
+async def test_status_errors_do_not_stop_review(harness: Harness) -> None:
+    """권한·네트워크로 상태를 못 써도 검토는 진행한다 (경고만)."""
+    harness.github.status_error = GitHubError("커밋 상태 기록 실패 403", 403)
+    sample = load_sample(SAMPLE_04)
+    await _seed_baseline(harness, sample)
+    await harness.request(sample)
+
+    assert harness.row()["status"] == "needs_human"
+
+
+async def test_merge_needs_success_status(harness: Harness) -> None:
+    """병합 직전 success 는 필수 — 3번 시도해도 못 쓰면 병합하지 않고 failed."""
+    await harness.request(load_sample(SAMPLE_01))
+    harness.github.status_error = GitHubError("커밋 상태 기록 실패 403", 403)
+    await _finish_ci(harness)
+
+    row = harness.row()
+    assert row["status"] == "failed" and "review-service/verify" in row["error"]
+    assert harness.github.merged == []
+
+
+async def test_status_links_to_review_when_public_url_set() -> None:
+    h = Harness(public_url="http://alb.example/")
+    seen: list[str | None] = []
+
+    async def record(repository: str, sha: str, *, state: str, context: str, description: str,
+                     target_url: str | None = None) -> None:
+        seen.append(target_url)
+
+    h.github.create_commit_status = record  # type: ignore[method-assign]
+    await h.request(load_sample(SAMPLE_01))
+
+    assert seen == [f"http://alb.example/reviews/{RID}"]

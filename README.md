@@ -54,7 +54,8 @@ docker compose --profile app up -d --build
 | `DEFAULT_TARGET` | API | baseline 이 없는 레포에 명세를 만들 대상 `env/region` (예 `aws/ap-northeast-2`). 없으면 그런 레포는 `NO_TARGET` |
 | `INTAKE_REPOSITORIES` | API | `owner/repo,…` — baseline 이 없어도 `deploy.yaml` 없음을 intake 로 볼 레포(새 앱). 웹훅이 조직 단위라 목록·baseline 에 없는 레포는 예전처럼 skip |
 | `REVIEW_API_PUBLIC_URL` | API | PR 커밋 상태의 링크(`/intakes/{id}`) 앞부분. 없으면 링크 없이 표시 |
-| `ARGOCD_WEBHOOK_TOKEN` | API | 있으면 `/webhooks/argocd` 가 `Authorization: Bearer <토큰>` 을 확인한다 |
+| `ARGOCD_WEBHOOK_TOKEN` | API | `/webhooks/argocd` 의 `Authorization: Bearer <토큰>`. **비어 있으면 503** (fail-closed) |
+| `REVIEW_API_TOKEN` | API | `POST /reviews`·`POST /reviews/{id}/decision` 의 `Authorization: Bearer <토큰>`. **비어 있으면 503** (fail-closed) |
 | `ANTHROPIC_API_KEY` `REVIEW_LLM_MODEL` | 워커·API | 워커: judge LLM. 키가 없으면 판단이 필요한 검토는 `LLM_UNAVAILABLE` 로 사람에게 간다. API: 형식 오류 명세 복구. 키가 없으면 `REPAIR_UNAVAILABLE` |
 
 ## 검토가 시작되는 곳
@@ -87,6 +88,20 @@ docker compose --profile app up -d --build
   생성 커밋 위에 커밋이 더 올라와도 같다. 판단 근거는 `spec_intakes` 기록뿐 — 명세 내용·커밋 메시지·PR 작성자는 보지 않는다.
   사람이 승인(·수정)하면 이어서 진행하고, 그 뒤 재검사·봇 수정 커밋 재검토에서는 다시 묻지 않는다. `GET /reviews/{id}` 의 `reason_messages` 에 확인할 항목이 나온다.
   baseline 으로 만든 명세와 형식 오류 복구(`repaired` — 값은 원문 대조)는 예전처럼 일반 검토다
+
+## 커밋 상태 `review-service/verify`
+
+검토 결과를 PR head 커밋 상태로 쓴다. 브랜치 보호의 필수 체크로 걸 수 있다
+(CI 잡으로 `/verify` 를 부르면 검토가 그 잡이 든 check suite 를 기다려 데드락이 난다 — 커밋 상태는 check suite 밖이다).
+
+| 시점 | state |
+|---|---|
+| 검토 생성 (API, 워커 수정 커밋의 새 SHA) | `pending` |
+| 통과·사람 승인 (CI 대기로 넘어갈 때), **병합 직전 다시** | `success` |
+| needs_human · rejected · blocked · failed | `failure` + 사유 |
+
+상태 쓰기가 실패해도 검토는 진행한다. 단 병합 직전 `success` 는 3번 시도해도 못 쓰면 병합하지 않고 `failed`.
+토큰에 **Commit statuses: write** 권한이 필요하다.
 
 ## 상태 흐름 (`reviews.status`)
 

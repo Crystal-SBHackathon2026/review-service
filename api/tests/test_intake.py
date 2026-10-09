@@ -87,7 +87,8 @@ class IntakeEnv:
             repo=self.repo, specs=self.specs, publisher=self.publisher, github_webhook_secret=SECRET,
             github=self.github, default_target=default_target, public_url="https://review.example/",
             intake_repositories=intake_repositories, repair_llm=repair_llm, transform_llm=transform_llm,
-            **({"lockfile": lockfile} if lockfile else {}))))
+            api_token="api-token", **({"lockfile": lockfile} if lockfile else {}))),
+            headers={"Authorization": "Bearer api-token"})
 
     def put(self, text: str, sha: str = HEAD) -> None:
         self.specs.files[(REPO, "deploy.yaml", sha)] = text
@@ -378,11 +379,12 @@ def test_repair_llm_finishes_before_stale_sweep(monkeypatch: pytest.MonkeyPatch)
 
 
 async def test_fork_pr_is_not_committed(ienv: IntakeEnv) -> None:
+    """포크 PR 은 웹훅에서 바로 건너뛴다 — intake 도 열지 않는다 (예전엔 intake 를 열고 FORK_PR 로 거절했다)."""
     await ienv.approve_baseline()
-    send_pr(ienv, pr_event("opened", head_repo="someone/sample-app"))
+    resp = send_pr(ienv, pr_event("opened", head_repo="someone/sample-app"))
 
-    assert (ienv.only_intake()["status"], ienv.only_intake()["reason"]) == ("rejected", "FORK_PR")
-    assert ienv.github.parents == {}
+    assert resp.json() == {"skipped": "fork"}
+    assert ienv.repo.intakes == {} and ienv.github.parents == {}
 
 
 async def test_intake_commit_needing_intake_again_stops(ienv: IntakeEnv) -> None:
@@ -632,3 +634,27 @@ async def test_github_client_get_file_stops_at_max_bytes() -> None:
     assert too_large.value.status_code == 413 and not too_large.value.transient
     with pytest.raises(SpecNotFound):
         await client.get_file(REPO, "missing.yaml", HEAD)
+
+
+# --- 커밋 상태 review-service/verify (⑤) ----------------------------------------------------------------
+
+def _verify_statuses(ienv: IntakeEnv) -> list[dict[str, Any]]:
+    return [s for s in ienv.github.statuses if s["context"] == "review-service/verify"]
+
+
+async def test_new_review_writes_pending_with_link(ienv: IntakeEnv) -> None:
+    ienv.put(sample_text())
+    rid = send_pr(ienv, pr_event("opened")).json()["review_id"]
+
+    [status] = _verify_statuses(ienv)
+    assert (status["sha"], status["state"], status["description"]) == (HEAD, "pending", "AI 검토 중")
+    assert status["target_url"] == f"https://review.example/reviews/{rid}"
+
+
+async def test_status_error_does_not_block_review(ienv: IntakeEnv) -> None:
+    ienv.github.status_error = GitHubError("커밋 상태 기록 실패 403", 403)
+    ienv.put(sample_text())
+    resp = send_pr(ienv, pr_event("opened"))
+
+    assert "review_id" in resp.json()
+    assert ienv.repo.reviews[resp.json()["review_id"]]["status"] == "received"

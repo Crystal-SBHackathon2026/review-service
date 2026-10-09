@@ -68,6 +68,7 @@ class FakeGitHub:
     def __init__(self, spec_text: str) -> None:
         self.spec_text = spec_text
         self.merged: list[int] = []
+        self.statuses: list[tuple[str, str]] = []
         self.suites: list[dict[str, Any]] = []
 
     async def check_suites(self, repository: str, sha: str) -> list[dict[str, Any]]:
@@ -85,11 +86,15 @@ class FakeGitHub:
         return self.spec_text
 
     async def pulls_for_commit(self, repository: str, sha: str) -> list[dict[str, Any]]:
-        return [{"number": 3, "state": "open", "head": {"sha": HEAD}}]
+        return [{"number": 3, "state": "open", "head": {"sha": HEAD, "repo": {"full_name": REPO}}}]
 
     async def merge_pull(self, repository: str, number: int, *, head_sha: str) -> str:
         self.merged.append(number)
         return MERGE_SHA
+
+    async def create_commit_status(self, repository: str, sha: str, *, state: str, context: str, description: str,
+                                   target_url: str | None = None) -> None:
+        self.statuses.append((context, state))
 
 
 class NullPublisher:
@@ -137,6 +142,11 @@ async def test_repository_on_postgres(pool: Any) -> None:
     assert (baseline["spec"], baseline["merge_sha"], baseline["database_has_data"]) == ({"v": 2}, "y", None)
     await repo.add_deploy_event(review_id="rv_1", app="sample-app", target_env="aws", kind="healthy",
                                 image_tag="c0ffee1", payload={"health": "Healthy"})
+    assert await repo.has_deploy_event(review_id="rv_1", kind="healthy", image_tag="c0ffee1")
+    assert not await repo.has_deploy_event(review_id="rv_1", kind="degraded", image_tag="c0ffee1")
+    assert not await repo.has_deploy_event(review_id="rv_1", kind="healthy", image_tag=None)
+    assert (await repo.find_by_merge_sha_exact(MERGE_SHA))["review_id"] == "rv_1"
+    assert await repo.find_by_merge_sha_exact(MERGE_SHA[:7]) is None  # 정확히 같을 때만
 
     with pytest.raises(psycopg.errors.CheckViolation):
         await repo.update_review("rv_1", status="nope")
@@ -340,9 +350,11 @@ async def test_api_to_kafka_to_worker(pool: Any) -> None:
         raise AssertionError(f"{review_id} 가 {status} 가 되지 않았다: {row and row['status']}")
 
     secret = "it-secret"
-    app = create_app(ApiDeps(repo=repo, specs=github, publisher=Publisher(), github_webhook_secret=secret))
+    app = create_app(ApiDeps(repo=repo, specs=github, publisher=Publisher(), github_webhook_secret=secret,
+                             api_token="it-api-token", argocd_webhook_token="it-argo-token"))
     try:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api",
+                                     headers={"Authorization": "Bearer it-api-token"}) as client:
             resp = await client.post("/reviews", json={
                 "spec_ref": {"repository": REPO, "commit": HEAD, "path": "deploy.yaml"}, "requested_by": "it"})
             assert resp.status_code == 202, resp.text
@@ -359,10 +371,10 @@ async def test_api_to_kafka_to_worker(pool: Any) -> None:
             assert resp.json() == {"resumed": [rid]}
             await drain_until(rid, "blocked")
 
-            resp = await client.post("/webhooks/argocd", json={
+            resp = await client.post("/webhooks/argocd", headers={"Authorization": "Bearer it-argo-token"}, json={
                 "app": "sample-app", "env": "aws", "health": "Healthy",
                 "images": [f"ghcr.io/crystal-sbhackathon2026/sample-app:{MERGE_SHA}"]})
-            assert resp.json() == {"review_id": rid, "recorded": "healthy"}
+            assert resp.json() == {"review_id": rid, "recorded": "healthy", "baseline": "updated"}
             assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == MERGE_SHA
             detail = (await client.get(f"/reviews/{rid}")).json()
             assert (detail["verdict"], detail["merge_sha"]) == ("pass", MERGE_SHA)

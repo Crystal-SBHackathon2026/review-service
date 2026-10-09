@@ -26,6 +26,10 @@ class FakeGit:
         self.commit_error = commit_error
         self.commits: list[tuple[str, dict[str, str], str]] = []
         self.reads: list[tuple[str, str, str]] = []
+        self.existing: list[str] = []  # gitops 에 지금 있는 overlay 파일 (기본: 새 앱)
+
+    async def list_files(self, directory: str) -> list[str]:
+        return list(self.existing)
 
     async def read_file(self, repository: str, path: str, ref: str) -> str:
         self.reads.append((repository, path, ref))
@@ -143,3 +147,29 @@ async def test_수정이_명세를_깨뜨리면_blocked():
 def test_커밋_메시지_형식():
     assert commit_message("sample-app", "aws", "b084c24e5a45f3") == \
         "chore: sample-app aws overlay 갱신 (b084c24)"
+
+
+@pytest.mark.asyncio
+async def test_지금_있는_ingress_를_지우는_커밋은_막는다():
+    git = FakeGit("01-pass-sample-app-aws.yaml")
+    git.raw = git.raw.replace("network:\n  ingress: {public: true, tls: false}\n", "")
+    git.existing = ["ingress.yaml", "kustomization.yaml"]
+    out = await make_commit_overlay(git)(state())
+
+    assert out == {"deploy_result": {"status": "blocked", "commit_sha": None,
+                                     "reason": "OVERLAY_RESOURCE_REMOVED: ingress.yaml"}}
+    assert git.commits == []
+
+
+@pytest.mark.asyncio
+async def test_병합_전_검사는_ingress_삭제만_사유로_돌려준다():
+    from review_worker.commit_overlay import make_overlay_guard
+
+    keep = FakeGit("01-pass-sample-app-aws.yaml")
+    keep.existing = ["ingress.yaml", "kustomization.yaml"]
+    drop = FakeGit("01-pass-sample-app-aws.yaml")
+    drop.raw = drop.raw.replace("network:\n  ingress: {public: true, tls: false}\n", "")
+    drop.existing = ["ingress.yaml"]
+
+    assert await make_overlay_guard(keep)(state()) is None
+    assert await make_overlay_guard(drop)(state()) == "OVERLAY_RESOURCE_REMOVED: ingress.yaml"
