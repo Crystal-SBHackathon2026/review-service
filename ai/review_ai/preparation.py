@@ -17,6 +17,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from review_ai.catalog import load_targets
+from review_ai.deploy_plan import STRATEGY_REASON, choose_strategy
 from review_ai.graph import initial_state, run_graph
 from review_ai.judge.llm import LlmClient
 from review_ai.masking import mask_spec
@@ -27,7 +28,7 @@ from review_ai.retrieval import Retriever
 from review_ai.secrets_pattern import MASK
 from review_ai.spec.deploy_spec import (
     API_VERSION, BASE_RESOURCES, DNS_LABEL, REPOSITORY, AppSpec, Baseline, Database, DeploySpec, Image,
-    Metadata, Network, Requirements, Runtime, SecretRef, Storage, Target,
+    Metadata, Network, Requirements, Rollout, Runtime, SecretRef, Storage, Target,
 )
 
 PRESET = "container-http/v1"
@@ -53,7 +54,7 @@ class GenerationContext(BaseModel):
 @dataclass(frozen=True)
 class Recommendation:
     path: str
-    source: Literal["preset", "catalog", "baseline"]
+    source: Literal["preset", "catalog", "baseline", "rule"]
     reason: str
 
     def as_dict(self) -> dict[str, str]:
@@ -178,6 +179,9 @@ def prepare_spec(
                             for field, (code, message) in checks.items() if getattr(context, field) is None)
     spec = AppSpec(api_version=API_VERSION, kind="DeploySpec",
                    metadata=Metadata(name=name, repository=context.repository), target=context.target, **values)
+    strategy = choose_strategy(spec, previous)
+    spec = spec.model_copy(update={"rollout": Rollout(strategy=strategy)})
+    recommendations.append(Recommendation("/rollout", "rule", STRATEGY_REASON[strategy]))
     return PreparedSpec(spec=spec, origin="generated", recommendations=tuple(recommendations),
                         verification=tuple(verification))
 

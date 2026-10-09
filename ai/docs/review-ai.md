@@ -110,7 +110,7 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
 ## 근거 문서 (knowledge/)
 
 S3 `review-docs` 버킷과 같은 구조다: `rules/{any,aws,gcp,local}/<ruleId>.md`, `incidents/K-*.md`(oneaction 리허설 카드 13장), `guides/*.md`, `warnings/<code>.md`(렌더러 경고 7개).
-문서의 `## ` 섹션 하나가 청크다. 구현한 규칙 25개(P0 12 + P1 13) 전부 문서가 있고, 환경별 청크 수는 테스트로 30개 이상을 유지한다.
+문서의 `## ` 섹션 하나가 청크다. 구현한 규칙 27개(P0 12 + P1 15) 전부 문서가 있고, 환경별 청크 수는 테스트로 30개 이상을 유지한다.
 
 - 규칙 문서는 ruleId 정확 매칭(점수 1.0)으로 찾고, 사례·가이드는 의미 검색(dense cosine, 0.5 미만 버림)으로 보탠다.
 - 정확 매칭은 ruleId 당 최대 8청크이고 **규칙 문서를 먼저** 채운 뒤 related_rules 사례·가이드를 붙인다(`retrieval.exact_first`). 경로 순으로 자르면 사례가 많은 DB-003 은 규칙 문서가 통째로 빠졌다.

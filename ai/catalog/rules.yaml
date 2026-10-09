@@ -273,3 +273,24 @@ rules:
     title: 리소스 상한이 없다
     check: runtime.resources 의 cpu_limit 또는 memory_limit 이 없다
     fix: base rollout.yaml 과 같은 값(250m / 128Mi)으로 채운다
+
+  # ── 배포 계획 (설계 '앱 분석/변환' ⑤ — review_ai.deploy_plan) ──
+  - id: RUN-006
+    category: runtime
+    severity: high
+    autofix: forbidden
+    priority: P1
+    providers: [any]
+    title: 옛 코드와 함께 돌 수 없는 스키마 변경을 한 번에 배포
+    check: database.migration.change 가 breaking 이다 (이름·타입 변경 등)
+    fix: expand(새 컬럼 추가·양쪽 쓰기) → contract(옛 컬럼 제거) 두 배포로 나눈다. 한 번에 해야 하면 bluegreen 으로 바꾸고 전환 전 오류 구간을 사람이 승인한다
+
+  - id: RUN-007
+    category: runtime
+    severity: high
+    autofix: allowed
+    priority: P1
+    providers: [any]
+    title: 두 버전이 함께 돌면 안 되는데 canary 배포
+    check: rollout.strategy 가 canary 이고, migration.change 가 breaking 이거나 이전 배포와 DB 엔진·배치가 다르다
+    fix: rollout.strategy 를 bluegreen 으로 — 미리보기에서 확인한 뒤 한 번에 전환해 두 버전이 섞이는 구간을 없앤다

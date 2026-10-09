@@ -31,7 +31,7 @@ def test_baseline_regenerates_committable_spec(kind: str, sample_app: dict) -> N
     assert outcome.content.startswith("# review-service 가 생성한 명세")
     regenerated = DeploySpec.model_validate(yaml.safe_load(outcome.content))
     assert same_settings(regenerated, AppSpec.model_validate(sample_app))  # 이전 승인 명세를 그대로 보존
-    assert {d["source"] for d in outcome.details} == {"baseline"}
+    assert {d["source"] for d in outcome.details} == {"baseline", "rule"}
 
 
 def test_new_app_without_verified_values_is_not_committed(sample_app: dict) -> None:

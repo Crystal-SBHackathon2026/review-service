@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from review_ai.deploy_plan import mixed_versions_unsafe
 from review_ai.static_check.context import CheckContext, Hit
 
 
@@ -32,3 +33,22 @@ def missing_resource_limits(ctx: CheckContext) -> list[Hit]:
     if not missing:
         return []
     return [Hit("/runtime/resources", f"{' · '.join(missing)} 없음")]
+
+
+def breaking_schema_change(ctx: CheckContext) -> list[Hit]:
+    """RUN-006 — 옛 코드와 새 코드가 함께 돌 수 없는 스키마 변경을 한 번에 배포한다."""
+    migration = ctx.spec.database.migration
+    if migration is None or migration.change != "breaking":
+        return []
+    return [Hit("/database/migration/change", f"breaking · 명령 {' '.join(migration.command)}")]
+
+
+def canary_with_incompatible_versions(ctx: CheckContext) -> list[Hit]:
+    """RUN-007 — 두 버전이 함께 돌면 안 되는데 canary 로 단계 배포한다."""
+    if ctx.spec.rollout.strategy != "canary":
+        return []
+    previous = ctx.previous
+    if previous is not None and ctx.has_existing_data and previous.database.engine != ctx.spec.database.engine:
+        return []  # 데이터가 있는 엔진 변경은 DB-001 이 사람에게 넘긴다 — 이전 계획을 정할 때 전략도 같이 정한다
+    reason = mixed_versions_unsafe(ctx.spec, ctx.previous)
+    return [Hit("/rollout/strategy", f"canary · {reason}")] if reason else []

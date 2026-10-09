@@ -9,7 +9,7 @@
 |---|---|
 | `review_ai/spec/deploy_spec.py` | Pydantic 모델(정본). 형식 검사와 `load_spec()` |
 | `schema/deploy_spec.schema.json` | 위 모델에서 내보낸 JSON Schema. 파이프라인 쪽 FastAPI 나 다른 언어가 쓸 수 있다 |
-| `catalog/rules.yaml` | 정적 검사 규칙 25개 (P0 12 + P1 13, 전부 구현 — RUN-003 은 10/09 폐기) |
+| `catalog/rules.yaml` | 정적 검사 규칙 27개 (P0 12 + P1 15, 전부 구현 — RUN-003 은 10/09 폐기) |
 | `catalog/targets.yaml` | 대상 환경 능력표 (aws·gcp·local). aws 만 실측(10/08) |
 | `samples/*.yaml` | 샘플 명세 10개 |
 | `samples/cases.yaml` | 샘플별 기대 finding·verdict·사유 |
@@ -32,10 +32,12 @@ image:    {repository, tag?, digest?, platforms: [amd64|arm64]}   # tag·digest 
 runtime:  {port, replicas, health{readiness,liveness}, resources, env{평문만}, termination_grace_seconds}
 requirements: {persistence}                    # 재배포 뒤에도 데이터가 남아야 하는가
 database: {engine: none|postgres|mysql|sqlite, version, placement: managed|in-cluster|volume|external,
-           engine_policy: preserve|allow_convert, volume, env_var, backup_retention_days, publicly_accessible}
+           engine_policy: preserve|allow_convert, volume, env_var, backup_retention_days, publicly_accessible,
+           migration: {command: [..], change: none|expand|contract|breaking} | null}   # postgres·mysql 만
 secrets:  [{name, source: aws-secrets-manager|gcp-secret-manager|k8s-secret|generated, key}]   # 값은 넣지 않는다
 network:  {ingress: {public, tls, host, allowed_cidrs} | null}
 storage:  {volumes: [{name, mount_path, size, persistent, access_mode}], buckets: [{name, public, versioning, encryption}]}
+rollout:  {strategy: canary|bluegreen}         # 생략하면 canary
 baseline: {spec_ref, spec: <이전 명세>, facts: {database_has_data, observed_at}} | null   # 파이프라인이 채움
 ```
 
@@ -52,6 +54,22 @@ baseline: {spec_ref, spec: <이전 명세>, facts: {database_has_data, observed_
 - 이 덕분에 위험 1번(데모의 DB 엔진 자동 변경)을 규칙 하나로 정리할 수 있다.
   첫 배포·데이터 없음이면 DB-002 가 `allowed`(샘플 05), 데이터가 있으면 DB-001 이 `forbidden`(샘플 04)이다.
 
+### 배포 계획 — 마이그레이션 시점과 전략 (`review_ai/deploy_plan.py`)
+
+배포 중에는 옛 버전과 새 버전이 잠깐 같이 돈다. 그 구간에 두 버전이 같은 스키마·같은 DB 에서 돌 수 있는지로 정한다.
+
+| 변경 | 마이그레이션 Job (Argo CD hook) | 전략 |
+|---|---|---|
+| `none`·`expand` (추가만) | PreSync — 새 버전보다 먼저. 실패하면 동기화가 멈춰 새 버전이 뜨지 않는다 | canary |
+| `contract` (제거만) | PostSync — 새 버전이 다 뜬 뒤 | canary |
+| `breaking` (이름·타입 변경) | PreSync | bluegreen + 사람 승인 (RUN-006) |
+| 이전 배포와 DB 엔진·배치가 다름 | — | bluegreen (RUN-007) |
+
+- 렌더러는 bluegreen 이면 Rollout `strategy` 를 통째로 `blueGreen` 으로 바꾸고 `<앱>-preview` Service 를 만든다. canary 는 base 를 그대로 쓴다.
+- 마이그레이션 Job 은 앱과 같은 이미지로 돈다 — kustomize `replacements` 가 Rollout 컨테이너 이미지(CI 가 태그를 쓴 값)를 복사한다.
+  재시도 없음(`backoffLimit: 0`), 5분 제한, env·시크릿은 앱 컨테이너와 같다.
+- 생성 명세(prepare_spec)도 같은 함수(`choose_strategy`)로 전략을 고른다.
+
 ### 비밀 값은 명세에 넣지 않는다
 
 `secrets` 에는 어디서 읽을지만 적는다. `runtime.env` 에 비밀처럼 보이는 평문이 있으면 SEC-001 이 잡고,
@@ -65,9 +83,9 @@ evidence 에도 값을 남기지 않는다. `source: generated` 는 배포 시 �
 | secret | SEC-001 평문 비밀 · SEC-005 DB 접속 시크릿 없음 | SEC-002 대상 환경에 없는 비밀 저장소 · SEC-003 시크릿 이름 중복 · SEC-004 env·secrets 이름 중복 |
 | network | NET-001 TLS 없음 (low) | NET-002 내부 전용인데 전체 대역 허용 |
 | storage | STO-001 접근 모드 미지원 · STO-003 공개 버킷 · STO-005 볼륨 축소 | STO-002 RWO 볼륨 복제 · STO-004 버킷 암호화 꺼짐 · STO-006 persistent 볼륨 제거 |
-| runtime | RUN-001 readiness 없음 · RUN-004 아키텍처 불일치 | RUN-002 liveness 없음 (low) · RUN-005 리소스 상한 없음 (low) |
+| runtime | RUN-001 readiness 없음 · RUN-004 아키텍처 불일치 | RUN-002 liveness 없음 (low) · RUN-005 리소스 상한 없음 (low) · RUN-006 호환 안 되는 스키마 변경 · RUN-007 두 버전이 함께 돌면 안 되는데 canary |
 
-카탈로그의 규칙 25개를 모두 구현했다. RUN-003(이미지 digest 고정 없음)은 폐기했다 — 배포 이미지는 CI 가 gitops base 에
+카탈로그의 규칙 27개를 모두 구현했다. RUN-003(이미지 digest 고정 없음)은 폐기했다 — 배포 이미지는 CI 가 gitops base 에
 커밋 SHA 태그로 고정하고 명세의 `image.tag`·`digest` 는 렌더러가 쓰지 않는다. 병합 전 PR 에는 digest 가 아직 없어 모든 검토에 고칠 수 없는 경고가 붙는다.
 
 `autofix` 는 규칙에 `allowed` / `forbidden` / `when_no_data` 로 적고, Finding 을 만들 때 인스턴스마다 `allowed` 나 `forbidden` 으로 확정한다.

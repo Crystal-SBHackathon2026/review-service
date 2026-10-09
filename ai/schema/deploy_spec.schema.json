@@ -42,7 +42,8 @@
             "volume": null,
             "env_var": "DATABASE_URL",
             "backup_retention_days": 1,
-            "publicly_accessible": false
+            "publicly_accessible": false,
+            "migration": null
           }
         },
         "secrets": {
@@ -64,6 +65,12 @@
           "default": {
             "volumes": [],
             "buckets": []
+          }
+        },
+        "rollout": {
+          "$ref": "#/$defs/Rollout",
+          "default": {
+            "strategy": "canary"
           }
         }
       },
@@ -254,6 +261,17 @@
           "default": false,
           "title": "Publicly Accessible",
           "type": "boolean"
+        },
+        "migration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Migration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "title": "Database",
@@ -424,6 +442,38 @@
       "title": "Metadata",
       "type": "object"
     },
+    "Migration": {
+      "additionalProperties": false,
+      "description": "배포 때 앱 이미지로 실행할 마이그레이션. 렌더러가 Argo CD hook Job 으로 만든다.",
+      "properties": {
+        "command": {
+          "description": "앱 이미지 안에서 실행할 명령 (예: [npm, run, migrate])",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Command",
+          "type": "array"
+        },
+        "change": {
+          "description": "이 배포의 스키마 변경 종류 — 실행 시점(PreSync·PostSync)과 배포 전략을 정한다",
+          "enum": [
+            "none",
+            "expand",
+            "contract",
+            "breaking"
+          ],
+          "title": "Change",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "change"
+      ],
+      "title": "Migration",
+      "type": "object"
+    },
     "Network": {
       "additionalProperties": false,
       "properties": {
@@ -499,6 +549,23 @@
         }
       },
       "title": "Resources",
+      "type": "object"
+    },
+    "Rollout": {
+      "additionalProperties": false,
+      "description": "canary: base Rollout 의 단계 배포를 그대로 쓴다. bluegreen: 새 버전을 미리보기 Service 로 띄워 확인한 뒤 한 번에 전환한다.",
+      "properties": {
+        "strategy": {
+          "default": "canary",
+          "enum": [
+            "canary",
+            "bluegreen"
+          ],
+          "title": "Strategy",
+          "type": "string"
+        }
+      },
+      "title": "Rollout",
       "type": "object"
     },
     "Runtime": {
@@ -740,7 +807,8 @@
         "volume": null,
         "env_var": "DATABASE_URL",
         "backup_retention_days": 1,
-        "publicly_accessible": false
+        "publicly_accessible": false,
+        "migration": null
       }
     },
     "secrets": {
@@ -762,6 +830,12 @@
       "default": {
         "volumes": [],
         "buckets": []
+      }
+    },
+    "rollout": {
+      "$ref": "#/$defs/Rollout",
+      "default": {
+        "strategy": "canary"
       }
     },
     "baseline": {
