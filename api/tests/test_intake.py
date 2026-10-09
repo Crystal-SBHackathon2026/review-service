@@ -648,7 +648,7 @@ async def test_new_review_writes_pending_with_link(ienv: IntakeEnv) -> None:
 
     [status] = _verify_statuses(ienv)
     assert (status["sha"], status["state"], status["description"]) == (HEAD, "pending", "AI 검토 중")
-    assert status["target_url"] == f"https://review.example/reviews/{rid}"
+    assert status["target_url"] == f"https://review.example/ui/reviews/{rid}"
 
 
 async def test_status_error_does_not_block_review(ienv: IntakeEnv) -> None:

@@ -3,7 +3,9 @@
     POST /reviews                       deploy.yaml 검토 요청 → 202 {review_id}  [Bearer REVIEW_API_TOKEN]
     GET  /reviews?status=..&limit=50    검토 목록, 최신순. status 는 여러 번 줄 수 있다 (사람 승인 화면)
     GET  /reviews/{review_id}           상태·verdict·사유·rounds·deploy_result
+    GET  /reviews/{review_id}/progress  진행 화면용 — 검토 이력·단계·환경별 배포·링크 (review_api.progress)
     GET  /ui                            needs_human 승인 화면 (static/index.html). 토큰은 화면에서 입력받는다
+    GET  /ui/reviews[/{review_id}]      진행 화면 (static/progress.html, 읽기 전용). PR 커밋 상태 Details 가 여기로 온다
     GET  /verify?sha=<PR head SHA>      그 SHA 의 검토가 통과했는지 (CI 용). 명세가 없거나 깨진 SHA 는 intake 상태
     GET  /intakes/{intake_id}           명세 없음·빈 명세·형식 오류 처리 기록 (PR 커밋 상태의 링크)
     POST /reviews/{review_id}/decision  needs_human 검토에 사람 결정 → review.resumed(human_decision)  [Bearer REVIEW_API_TOKEN]
@@ -46,7 +48,6 @@ from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.recommendations import resolve_human_decision
 from review_ai.spec.deploy_spec import REPOSITORY
-from review_ai.state import REASON_MESSAGES
 from review_ai.transform import TRANSFORM_MAX_TOKENS
 from review_ai.transform.prompt import TransformOutput
 from review_api.argocd import ArgoCdEvent, handle_deploy_event
@@ -54,6 +55,7 @@ from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spe
                                sweep_stale_intakes)
 from review_api import metrics
 from review_api.lockfile import regenerate_lockfile
+from review_api.progress import ProgressSettings, build_progress, review_view
 from review_api.recovery import sweep_stale_reviews
 from review_common.github import GitHubError, SpecNotFound
 from review_common.ids import new_review_id
@@ -68,6 +70,7 @@ INTAKE_FAILED = frozenset({"rejected", "failed"})
 REVIEW_STATUSES = frozenset(get_args(ReviewDbStatus))
 
 UI_PAGE = Path(__file__).parent / "static" / "index.html"
+PROGRESS_PAGE = Path(__file__).parent / "static" / "progress.html"
 # 화면은 같은 주소의 API 만 부른다. 인라인 스크립트·스타일 한 장이라 외부 리소스는 막는다
 UI_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';"
@@ -98,13 +101,14 @@ class ApiDeps:
     ci_app_slug: str | None = "github-actions"  # 이 GitHub App 의 check_suite 만 CI 결과로 본다. None 이면 전부
     github: IntakeGitHub | None = None  # 명세 생성 커밋·PR 커밋 상태. None 이면 intake 는 기록만 하고 거절
     default_target: str | None = None   # "aws/ap-northeast-2" — baseline 없는 레포의 명세를 만들 대상
-    public_url: str | None = None       # PR 커밋 상태 링크(/intakes/{id})의 앞부분
+    public_url: str | None = None       # PR 커밋 상태 링크(/intakes/{id}·/ui/reviews/{id})의 앞부분
     intake_repositories: frozenset[str] = frozenset()  # baseline 이 없어도 deploy.yaml 없음을 intake 로 볼 레포
     repair_llm: LlmClient | None = None  # 형식 오류 명세 복구. None 이면 yaml_error·schema_error 는 REPAIR_UNAVAILABLE
     transform_llm: LlmClient | None = None  # 새 앱 코드 패치(SQLite→Postgres·/metrics). None 이면 TRANSFORM_UNAVAILABLE
     lockfile: Callable[[str, str], Awaitable[str]] = regenerate_lockfile  # 코드 패치가 바꾼 의존성의 잠금 파일
     # /readyz 가 볼 의존성 — 이름 → 실패하면 예외를 내는 확인. 비어 있으면 늘 준비됨
     readiness: dict[str, Callable[[], Awaitable[Any]]] = field(default_factory=dict)
+    progress: ProgressSettings = field(default_factory=ProgressSettings)  # DEPLOY_ENVS·PLANNED_ENVS·APP_URLS
 
 
 READY_TIMEOUT_SECONDS = 2.0  # 확인 하나의 상한. readinessProbe timeoutSeconds 는 이보다 길게 (gitops, 기본 1초)
@@ -219,18 +223,24 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
     async def ui() -> FileResponse:
         return FileResponse(UI_PAGE, media_type="text/html; charset=utf-8", headers=UI_HEADERS)
 
+    @app.get("/ui/reviews", include_in_schema=False)
+    @app.get("/ui/reviews/{review_id}", include_in_schema=False)
+    async def progress_ui() -> FileResponse:
+        return FileResponse(PROGRESS_PAGE, media_type="text/html; charset=utf-8", headers=UI_HEADERS)
+
     @app.get("/reviews/{review_id}")
     async def get_review(review_id: str, request: Request) -> dict[str, Any]:
         row = await d(request).repo.get_review(review_id)
         if row is None:
             raise HTTPException(404, "검토가 없다")
-        keys = ("review_id", "app", "target_env", "spec_ref", "status", "verdict", "reasons", "findings", "decision",
-                "rounds", "human_decision", "deploy_result", "merge_sha", "gitops_commit_sha", "error",
-                "superseded_by", "requested_by", "created_at", "updated_at", "pr_number", "judged_at",
-                "human_decided_at", "merged_at", "gitops_committed_at")
-        reasons = row.get("reasons") or []
-        return {**{k: row.get(k) for k in keys},
-                "reason_messages": {code: REASON_MESSAGES[code] for code in reasons if code in REASON_MESSAGES}}
+        return review_view(row)
+
+    @app.get("/reviews/{review_id}/progress")
+    async def get_progress(review_id: str, request: Request) -> dict[str, Any]:
+        progress = await build_progress(d(request).repo, review_id, d(request).progress)
+        if progress is None:
+            raise HTTPException(404, "검토가 없다")
+        return progress
 
     @app.get("/verify")
     async def verify(request: Request, sha: str = Query(min_length=7)) -> dict[str, Any]:
@@ -418,7 +428,7 @@ async def post_verify_status(deps: ApiDeps, spec_ref: dict[str, str], review_id:
     """PR head 에 커밋 상태 review-service/verify. 실패해도(권한·네트워크) 검토는 그대로 진행한다."""
     if deps.github is None:
         return
-    target_url = f"{deps.public_url.rstrip('/')}/reviews/{review_id}" if deps.public_url else None
+    target_url = f"{deps.public_url.rstrip('/')}/ui/reviews/{review_id}" if deps.public_url else None  # 진행 화면
     try:
         await deps.github.create_commit_status(spec_ref["repository"], spec_ref["commit"], state=state,
                                                context=VERIFY_CONTEXT, description=description,
@@ -572,6 +582,7 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
         repair_llm=make_repair_llm(),
         transform_llm=make_transform_llm(),
         readiness=make_readiness(pool, producer),
+        progress=ProgressSettings.from_env(os.environ),
     )
     sweeps = [asyncio.create_task(sweep_stale_intakes(app.state.deps)),
               asyncio.create_task(sweep_stale_reviews(app.state.deps))]  # 멈춘 intake·검토 회수

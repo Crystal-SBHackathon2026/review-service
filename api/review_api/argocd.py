@@ -15,7 +15,10 @@
 - **images 에는 여러 개가 올 수 있고 순서는 보장되지 않는다.** 롤아웃 중이면 옛 이미지와 새 이미지가 같이 온다.
   그래서 모든 태그로 검토를 찾고 가장 최근 검토(created_at)를 고른다. 첫 매칭을 쓰면 새 배포를 옛 검토에 기록한다
   (10/09 05:45:18 실제 사례).
-- 같은 알림이 여러 번 온다. 같은 (검토, kind, 이미지 태그)는 한 번만 기록한다.
+- 같은 알림이 여러 번 온다. 같은 (검토, 환경, kind, 이미지 태그)는 한 번만 기록한다.
+- 검토 한 건은 대상 환경 하나다(deploy.yaml). 같은 병합을 다른 환경(aws 검토의 local 배포)도 배포하는데,
+  그 env 로 찾은 검토가 없으면 env 를 보지 않고 같은 앱·병합 SHA 검토를 찾아 deploy_events 에 그 env 로 남긴다
+  (cross_env). 진행 화면의 환경별 카드용이다 — baseline·degraded 판단 사례는 검토 대상 환경에서만 남긴다.
 - baseline 은 앞으로만 간다. 같은 병합이면 다시 쓰지 않고(database_has_data 유지), 더 최근 검토의 baseline 은
   늦게 온 옛 알림으로 되돌리지 않는다.
 """
@@ -53,11 +56,14 @@ class ArgoCdEvent(BaseModel):
         return tags
 
 
-async def latest_matching_review(repo: ReviewRepository, event: ArgoCdEvent) -> tuple[dict[str, Any], str] | None:
-    """images 의 모든 태그로 검토를 찾아 가장 최근 검토와 그 태그. images 순서와 무관하다."""
+async def latest_matching_review(repo: ReviewRepository, event: ArgoCdEvent, *,
+                                 any_env: bool = False) -> tuple[dict[str, Any], str] | None:
+    """images 의 모든 태그로 검토를 찾아 가장 최근 검토와 그 태그. images 순서와 무관하다.
+
+    any_env=True 면 검토의 대상 환경을 보지 않는다 (다른 환경 배포 알림)."""
     found: dict[str, tuple[dict[str, Any], str]] = {}
     for tag in event.image_tags():
-        row = await repo.find_by_merge_sha(app=event.app, target_env=event.env, image_tag=tag)
+        row = await repo.find_by_merge_sha(app=event.app, target_env=None if any_env else event.env, image_tag=tag)
         if row is not None:
             found.setdefault(row["review_id"], (row, tag))
     if not found:
@@ -80,13 +86,18 @@ async def handle_deploy_event(repo: ReviewRepository, event: ArgoCdEvent) -> dic
     if kind is None:
         return {"ignored": f"health {event.health}"}
     match = await latest_matching_review(repo, event)
+    cross_env = match is None
+    if cross_env:
+        match = await latest_matching_review(repo, event, any_env=True)
     if match is None:
         return {"ignored": "이미지 태그와 맞는 병합 SHA 가 없다"}
     row, tag = match
-    if await repo.has_deploy_event(review_id=row["review_id"], kind=kind, image_tag=tag):
+    if await repo.has_deploy_event(review_id=row["review_id"], target_env=event.env, kind=kind, image_tag=tag):
         return {"review_id": row["review_id"], "duplicate": True}
     await repo.add_deploy_event(review_id=row["review_id"], app=event.app, target_env=event.env,
                                 kind=kind, image_tag=tag, payload=event.model_dump(mode="json"))
+    if cross_env:  # 검토 대상이 아닌 환경 — 기록만. baseline·사례는 그 환경의 검토가 생겼을 때 그 검토로
+        return {"review_id": row["review_id"], "recorded": kind, "cross_env": True}
     result: dict[str, Any] = {"review_id": row["review_id"], "recorded": kind}
     if kind == "healthy" and row.get("final_spec"):
         if await should_update_baseline(repo, row):

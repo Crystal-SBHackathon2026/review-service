@@ -128,7 +128,7 @@ class Deps:
     commit_overlay: CommitOverlay = commit_overlay_stub
     overlay_guard: OverlayGuard = no_overlay_guard
     ci_app_slug: str | None = "github-actions"  # 이 GitHub App 의 check suite 만 CI 로 본다. None 이면 전부
-    public_url: str | None = None  # REVIEW_API_PUBLIC_URL — 커밋 상태 링크 /reviews/{id} 의 앞부분
+    public_url: str | None = None  # REVIEW_API_PUBLIC_URL — 커밋 상태 링크 /ui/reviews/{id}(진행 화면)의 앞부분
     judge_max_retries: int = JUDGE_MAX_RETRIES
     retry_backoff_seconds: float = 1.0
 
@@ -185,7 +185,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         """PR head 에 커밋 상태 review-service/verify. 실패해도 검토는 계속한다 (경고만). 썼으면 True."""
         if not spec_ref:
             return False
-        url = f"{deps.public_url.rstrip('/')}/reviews/{review_id}" if deps.public_url else None
+        url = f"{deps.public_url.rstrip('/')}/ui/reviews/{review_id}" if deps.public_url else None
         for attempt in range(1, attempts + 1):
             try:
                 await github.create_commit_status(spec_ref["repository"], spec_ref["commit"], state=state,
