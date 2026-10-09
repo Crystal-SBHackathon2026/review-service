@@ -164,9 +164,18 @@ class GitHubClient:
     async def prepare_file_commit(self, repository: str, *, parent: str, path: str, content: str,
                                   message: str) -> str:
         """parent 위에 파일 하나를 바꾼 커밋을 만든다. 브랜치는 옮기지 않는다 — 새 커밋 SHA 만 돌려준다."""
+        return await self.prepare_files_commit(repository, parent=parent, files={path: content}, message=message)
+
+    async def prepare_files_commit(self, repository: str, *, parent: str, files: Mapping[str, str | None],
+                                   message: str) -> str:
+        """parent 위에 여러 파일을 바꾼(None 이면 지운) 커밋 하나를 만든다. 브랜치는 옮기지 않는다."""
+        if not files:
+            raise ValueError("커밋할 파일이 없다")
+        entries = [{"path": path.lstrip("/"), "mode": FILE_MODE, "type": "blob",
+                    **({"sha": None} if content is None else {"content": content})}
+                   for path, content in sorted(files.items())]
         base_tree = await self.commit_tree_sha(repository, parent)
-        tree = await self.create_tree(repository, base_tree, [
-            {"path": path.lstrip("/"), "mode": FILE_MODE, "type": "blob", "content": content}])
+        tree = await self.create_tree(repository, base_tree, entries)
         return await self.create_commit(repository, message=message, tree=tree, parents=[parent])
 
 

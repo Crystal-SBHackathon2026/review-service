@@ -19,7 +19,7 @@ import hashlib
 import hmac
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,10 +35,13 @@ from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.recommendations import resolve_human_decision
 from review_ai.spec.deploy_spec import REPOSITORY
+from review_ai.transform import TRANSFORM_MAX_TOKENS
+from review_ai.transform.prompt import TransformOutput
 from review_api.argocd import ArgoCdEvent
 from review_api.cases import record_degraded_case
 from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spec, open_intake, process_intake,
                                sweep_stale_intakes)
+from review_api.lockfile import regenerate_lockfile
 from review_common.github import GitHubError, SpecNotFound
 from review_common.ids import new_review_id
 from review_common.repository import ReviewRepository
@@ -72,6 +75,8 @@ class ApiDeps:
     public_url: str | None = None       # PR 커밋 상태 링크(/intakes/{id})의 앞부분
     intake_repositories: frozenset[str] = frozenset()  # baseline 이 없어도 deploy.yaml 없음을 intake 로 볼 레포
     repair_llm: LlmClient | None = None  # 형식 오류 명세 복구. None 이면 yaml_error·schema_error 는 REPAIR_UNAVAILABLE
+    transform_llm: LlmClient | None = None  # 새 앱 코드 패치(SQLite→Postgres·/metrics). None 이면 TRANSFORM_UNAVAILABLE
+    lockfile: Callable[[str, str], Awaitable[str]] = regenerate_lockfile  # 코드 패치가 바꾼 의존성의 잠금 파일
 
 
 class SpecRefIn(BaseModel):
@@ -315,6 +320,20 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
 REPAIR_CLIENT_OPTIONS: dict[str, Any] = {"timeout": 45.0, "max_retries": 1}
 
 
+# 파일 전체를 다시 쓰는 출력이라 1분 남짓 걸린다. 재시도 1번까지 STALE_AFTER(5분) 안에 끝나게
+TRANSFORM_CLIENT_OPTIONS: dict[str, Any] = {"timeout": 120.0, "max_retries": 1}
+
+
+def make_transform_llm() -> LlmClient | None:
+    """새 앱 코드 패치용 Claude. 출력 스키마만 TransformOutput."""
+    try:
+        return CachedLLM(ClaudeLLM(output=TransformOutput, client_options=TRANSFORM_CLIENT_OPTIONS,
+                                   max_tokens=TRANSFORM_MAX_TOKENS))
+    except LlmUnavailable as exc:
+        log.warning("코드 패치 LLM 없이 시작 — 코드 패치가 필요한 새 앱은 TRANSFORM_UNAVAILABLE 로 거절한다: %s", exc)
+        return None
+
+
 def make_repair_llm() -> LlmClient | None:
     """형식 오류 명세 복구용 Claude. 워커 judge 와 같은 키·모델, 출력 스키마만 RepairOutput."""
     try:
@@ -360,6 +379,7 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
         intake_repositories=frozenset(r.strip() for r in os.environ.get("INTAKE_REPOSITORIES", "").split(",")
                                       if r.strip()),
         repair_llm=make_repair_llm(),
+        transform_llm=make_transform_llm(),
     )
     sweep = asyncio.create_task(sweep_stale_intakes(app.state.deps))
     try:

@@ -94,7 +94,8 @@ class PreparedSpec:
         })
 
 
-def _app_name(repository: str) -> str:
+def app_name(repository: str) -> str:
+    """레포 이름 → DNS 라벨 앱 이름 (생성 명세 metadata.name 과 같은 값)."""
     original = repository.split("/", 1)[1].lower()
     name = re.sub(r"[^a-z0-9-]", "-", original).strip("-") or "app"
     if not name[0].isalpha():
@@ -139,7 +140,7 @@ def prepare_spec(
     caps = load_targets()[context.target.env]
     recommendations: list[Recommendation] = []
     verification: list[Verification] = []
-    name = context.name or (previous.metadata.name if previous else _app_name(context.repository))
+    name = context.name or (previous.metadata.name if previous else app_name(context.repository))
     values: dict[str, Any] = {}
     defaults: dict[str, Any] = {
         "image": Image(repository=f"ghcr.io/{context.repository.lower()}", platforms=tuple(sorted(caps.arch))),

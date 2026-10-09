@@ -1,6 +1,6 @@
 """LLM 클라이언트. judge 노드는 LlmClient 프로토콜만 알고, 실제 Claude·가짜 구현은 팩토리로 주입한다.
 
-명세 복구(review_ai.intake.repair)도 같은 클라이언트를 쓴다 — 출력 스키마만 다르다(ClaudeLLM(output=...)).
+명세 복구(review_ai.intake.repair)·코드 변환(review_ai.transform)도 같은 클라이언트를 쓴다 — 출력 스키마만 다르다(ClaudeLLM(output=...)).
 """
 
 from __future__ import annotations
@@ -69,7 +69,8 @@ class ClaudeLLM:
     """Claude API. structured outputs 로 output 스키마(기본 LlmReview)를 강제하고, 시스템 프롬프트는 캐시한다."""
 
     def __init__(self, client: Any = None, model: str = DEFAULT_MODEL,
-                 output: type[BaseModel] = LlmReview, client_options: dict[str, Any] | None = None) -> None:
+                 output: type[BaseModel] = LlmReview, client_options: dict[str, Any] | None = None,
+                 max_tokens: int = MAX_TOKENS) -> None:
         """client_options 는 키가 있을 때 만드는 AsyncAnthropic 인자(timeout·max_retries 등)."""
         import anthropic
 
@@ -80,6 +81,7 @@ class ClaudeLLM:
         self._anthropic = anthropic
         self._client = client
         self._schema = anthropic.transform_schema(output.model_json_schema())
+        self._max_tokens = max_tokens
         self.model = model
 
     async def complete(self, request: LlmRequest) -> LlmResponse:
@@ -87,7 +89,7 @@ class ClaudeLLM:
         try:
             msg = await self._client.messages.create(
                 model=self.model,
-                max_tokens=MAX_TOKENS,
+                max_tokens=self._max_tokens,
                 system=[{"type": "text", "text": request.system, "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content": request.user}],
                 output_config={"format": {"type": "json_schema", "schema": self._schema}},
