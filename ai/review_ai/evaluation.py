@@ -33,7 +33,7 @@ from review_ai.patching import apply_ops, parse_pointer
 from review_ai.preparation import GenerationContext
 from review_ai.recommendations import resolve_human_decision
 from review_ai.retrieval import Retriever
-from review_ai.spec.deploy_spec import DeploySpec, user_fields
+from review_ai.spec.deploy_spec import Baseline, DeploySpec, user_fields
 
 AI_ROOT = Path(__file__).resolve().parent.parent
 EVAL_CASES = AI_ROOT / "eval" / "cases.yaml"
@@ -134,19 +134,37 @@ def intake_answer(case: dict[str, Any]) -> dict[str, Any] | None:
     return yaml.safe_load((SAMPLES / sample).read_text(encoding="utf-8")) if sample else None
 
 
+def intake_baseline(case: dict[str, Any]) -> Baseline | None:
+    """배포 이력이 있는 레포 — baseline 샘플을 마지막 승인 명세로 둔다. 없으면 처음 배포하는 앱이다."""
+    sample = case["intake"].get("baseline")
+    if not sample:
+        return None
+    spec = yaml.safe_load((SAMPLES / sample).read_text(encoding="utf-8"))
+    return Baseline(spec_ref=f"eval/{sample}", spec={k: v for k, v in spec.items() if k != "baseline"})
+
+
 async def run_intake(case: dict[str, Any],
                      make_repair: Callable[[], RecordingLLM]) -> tuple[IntakeKind, IntakeOutcome, RecordingLLM | None]:
-    """복구 LLM 은 원문이 형식 오류일 때만 만든다 — 생성 케이스엔 정답 샘플이 없어도 된다."""
-    analysis = load_repo(case["intake"]["repo"])
+    """복구 LLM 은 원문이 형식 오류일 때만 만든다 — 생성 케이스엔 정답 샘플이 없어도 된다.
+
+    Review API 처럼 baseline 이 있으면 레포를 분석하지 않고 baseline 의 레포·대상 환경만 context 로 쓴다.
+    """
     text = intake_text(case)
     kind = intake_kind(text)
     if kind is None:
         raise ValueError(f"{case['id']}: intake 케이스의 원문이 정상 명세다 — edit 가 깨뜨리지 못했다")
+    baseline = intake_baseline(case)
+    if baseline is not None:
+        context = GenerationContext(repository=baseline.spec.metadata.repository, target=baseline.spec.target)
+        findings: Sequence[Any] = ()
+    else:
+        analysis = load_repo(case["intake"]["repo"])
+        context, findings = analysis.context, analysis.findings
     if kind not in ("yaml_error", "schema_error"):
-        return kind, prepare_intake(kind, context=analysis.context, findings=analysis.findings), None
+        return kind, prepare_intake(kind, context=context, baseline=baseline, findings=findings), None
     assert text is not None
     repair_llm = make_repair()
-    outcome = await repair_intake(kind, text, context=analysis.context, baseline=None, llm=repair_llm)
+    outcome = await repair_intake(kind, text, context=context, baseline=baseline, llm=repair_llm)
     return kind, outcome, repair_llm
 
 

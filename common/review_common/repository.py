@@ -114,7 +114,11 @@ class ReviewRepository(Protocol):
                                image_tag: str | None, payload: dict[str, Any]) -> None: ...
 
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
-        """그 레포(spec_ref.repository)의 가장 최근 baseline — 명세가 없을 때 앱·대상 환경을 거기서 찾는다."""
+        """그 레포(spec_ref.repository)의 가장 최근 baseline — 명세가 없을 때 앱·대상 환경을 거기서 찾는다.
+
+        배포 확인(Argo 웹훅) 전이라 baselines 가 비었으면 마지막으로 gitops 에 커밋한 검토의 final_spec 을
+        baselines 행 모양으로 돌려준다. 이미 배포된 앱을 새 앱으로 보고 ingress 등을 지운 사고(sample-app #11) 방지.
+        """
         ...
 
     # --- spec_intakes ---
@@ -280,7 +284,11 @@ class PostgresReviewRepository:
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
         return await self._fetchone(
             "SELECT * FROM baselines WHERE spec_ref->>'repository' = %s ORDER BY observed_at DESC NULLS LAST LIMIT 1",
-            (repository,))
+            (repository,)) or await self._fetchone(
+            "SELECT app, target_env, final_spec AS spec, spec_ref, merge_sha, NULL::boolean AS database_has_data,"
+            " NULL::timestamptz AS observed_at FROM reviews"
+            " WHERE spec_ref->>'repository' = %s AND status = 'committed' AND final_spec IS NOT NULL"
+            " ORDER BY updated_at DESC LIMIT 1", (repository,))
 
     async def insert_intake(self, **intake: Any) -> bool:
         _check_intake(intake, {})
@@ -448,7 +456,16 @@ class InMemoryReviewRepository:
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
         rows = [b for b in self.baselines.values() if b["spec_ref"].get("repository") == repository]
         rows.sort(key=lambda b: b["observed_at"] or datetime.min.replace(tzinfo=UTC))
-        return copy.deepcopy(rows[-1]) if rows else None
+        if rows:
+            return copy.deepcopy(rows[-1])
+        committed = [r for r in self.reviews.values() if r["spec_ref"].get("repository") == repository
+                     and r["status"] == "committed" and r["final_spec"] is not None]
+        if not committed:
+            return None
+        last = max(committed, key=lambda r: r["updated_at"])
+        return copy.deepcopy({"app": last["app"], "target_env": last["target_env"], "spec": last["final_spec"],
+                              "spec_ref": last["spec_ref"], "merge_sha": last["merge_sha"],
+                              "database_has_data": None, "observed_at": None})
 
     async def insert_intake(self, **intake: Any) -> bool:
         _check_intake(intake, {})

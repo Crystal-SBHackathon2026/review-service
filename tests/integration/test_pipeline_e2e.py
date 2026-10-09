@@ -205,6 +205,12 @@ async def test_spec_intakes_on_postgres(pool: Any) -> None:
     with pytest.raises(psycopg.errors.CheckViolation):
         await repo.insert_intake(**{**intake, "intake_id": "in_bad", "head_sha": "c" * 40, "kind": "nope"})
 
+    # 배포 확인 전(baselines 비어 있음)엔 gitops 에 커밋한 검토의 final_spec 이 baseline 을 대신한다
+    assert await repo.latest_baseline_for_repository(REPO) is None
+    await repo.update_review("rv_g", status="committed", final_spec={"v": 0}, merge_sha="m" * 40)
+    fallback = await repo.latest_baseline_for_repository(REPO)
+    assert (fallback["spec"], fallback["merge_sha"], fallback["observed_at"], fallback["database_has_data"]) == (
+        {"v": 0}, "m" * 40, None, None)
     await repo.upsert_baseline(app="sample-app", target_env="aws", spec={"v": 1},
                                spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
                                merge_sha="x", observed_at=datetime.now(UTC))
