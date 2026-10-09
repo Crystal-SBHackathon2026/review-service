@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from review_ai.retrieval.knowledge import Chunk
 from review_ai.state import Doc, Finding
@@ -16,8 +16,21 @@ MAX_EXACT_PER_RULE = 8
 Node = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
+class Scope(NamedTuple):
+    """검토 대상 — 판단 사례(review_cases)를 같은 앱·레포의 지난 검토로 한정할 때 쓴다. 규칙 문서 검색은 쓰지 않는다."""
+    app: str
+    repository: str
+
+
 class Retriever(Protocol):
-    async def search(self, findings: Sequence[Finding], target_env: str) -> list[Doc]: ...
+    async def search(self, findings: Sequence[Finding], target_env: str, scope: Scope | None = None) -> list[Doc]: ...
+
+
+def scope_of(state: dict[str, Any]) -> Scope | None:
+    """State → Scope. 레포를 모르면(평가셋·로컬 실행) None — 사례 검색기는 아무 사례도 붙이지 않는다."""
+    app = ((state.get("deploy_spec") or {}).get("metadata") or {}).get("name")
+    repository = (state.get("spec_ref") or {}).get("repository")
+    return Scope(app=app, repository=repository) if app and repository else None
 
 
 def to_doc(chunk: Chunk, *, rule_id: str | None, score: float, match: str) -> Doc:
@@ -65,6 +78,6 @@ def make_retrieve_evidence(retriever: Retriever) -> Node:
         findings = state.get("findings") or []
         if not findings:
             return {"retrieved_docs": []}
-        return {"retrieved_docs": await retriever.search(findings, state["target_env"])}
+        return {"retrieved_docs": await retriever.search(findings, state["target_env"], scope_of(state))}
 
     return retrieve_evidence

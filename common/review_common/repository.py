@@ -166,8 +166,11 @@ class ReviewRepository(Protocol):
         """사례를 넣는다 (review_ai.cases.build_case 결과). 같은 case_id 가 이미 있으면 넣지 않고 False."""
         ...
 
-    async def find_cases(self, rule_id: str, *, target_env: str, limit: int) -> list[dict[str, Any]]:
-        """rule_id 가 걸린 사례 limit 개 — 같은 대상 환경을 먼저, 그 안에서 최근 것부터."""
+    async def find_cases(self, rule_id: str, *, app: str, repository: str, target_env: str,
+                         outcomes: Sequence[str], limit: int) -> list[dict[str, Any]]:
+        """rule_id 가 걸린 같은 앱·레포 사례 중 outcomes 인 것 limit 개 — 같은 대상 환경을 먼저, 그 안에서 최근 것부터.
+
+        레포는 사례의 검토(reviews.spec_ref.repository)로 본다."""
         ...
 
 
@@ -351,10 +354,14 @@ class PostgresReviewRepository:
             f"INSERT INTO review_cases ({', '.join(columns)}) VALUES ({', '.join(['%s'] * len(columns))})"
             " ON CONFLICT (case_id) DO NOTHING", values) == 1
 
-    async def find_cases(self, rule_id: str, *, target_env: str, limit: int) -> list[dict[str, Any]]:
+    async def find_cases(self, rule_id: str, *, app: str, repository: str, target_env: str,
+                         outcomes: Sequence[str], limit: int) -> list[dict[str, Any]]:
         return await self._fetchall(
-            "SELECT * FROM review_cases WHERE rule_ids @> ARRAY[%s]::text[]"
-            " ORDER BY (target_env = %s) DESC, created_at DESC LIMIT %s", (rule_id, target_env, limit))
+            "SELECT c.* FROM review_cases c JOIN reviews r USING (review_id)"
+            " WHERE c.rule_ids @> ARRAY[%s]::text[] AND c.app = %s AND r.spec_ref->>'repository' = %s"
+            " AND c.outcome = ANY(%s)"
+            " ORDER BY (c.target_env = %s) DESC, c.created_at DESC LIMIT %s",
+            (rule_id, app, repository, list(outcomes), target_env, limit))
 
 
 class InMemoryReviewRepository:
@@ -529,8 +536,14 @@ class InMemoryReviewRepository:
         self.cases[case["case_id"]] = {**copy.deepcopy(case), "created_at": _now()}
         return True
 
-    async def find_cases(self, rule_id: str, *, target_env: str, limit: int) -> list[dict[str, Any]]:
-        rows = sorted((c for c in reversed(self.cases.values()) if rule_id in c["rule_ids"]),
+    async def find_cases(self, rule_id: str, *, app: str, repository: str, target_env: str,
+                         outcomes: Sequence[str], limit: int) -> list[dict[str, Any]]:
+        def matches(c: dict[str, Any]) -> bool:
+            review = self.reviews.get(c["review_id"]) or {}
+            return (rule_id in c["rule_ids"] and c["app"] == app and c["outcome"] in outcomes
+                    and (review.get("spec_ref") or {}).get("repository") == repository)
+
+        rows = sorted((c for c in reversed(self.cases.values()) if matches(c)),
                       key=lambda c: c["created_at"], reverse=True)  # 같은 시각이면 나중에 넣은 것이 앞
         rows.sort(key=lambda c: c["target_env"] != target_env)  # 안정 정렬 — 같은 환경 안에서는 최근 순서 유지
         return copy.deepcopy(rows[:limit])

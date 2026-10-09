@@ -14,7 +14,7 @@ from qdrant_client import AsyncQdrantClient, models
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from review_ai.errors import TransientError
-from review_ai.retrieval import dedupe, exact_first, to_doc
+from review_ai.retrieval import Scope, dedupe, exact_first, to_doc
 from review_ai.retrieval.embedding import Embedder
 from review_ai.retrieval.knowledge import Chunk
 from review_ai.state import Doc, Finding
@@ -113,7 +113,7 @@ class QdrantRetriever:
             for p in result.points
         ]
 
-    async def search(self, findings: Sequence[Finding], target_env: str) -> list[Doc]:
+    async def search(self, findings: Sequence[Finding], target_env: str, scope: Scope | None = None) -> list[Doc]:
         try:
             vectors = await self._embedder.embed([f"{f['title']} — {f['evidence']}" for f in findings])
             batches = await asyncio.gather(
