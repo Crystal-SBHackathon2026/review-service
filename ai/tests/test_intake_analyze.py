@@ -10,7 +10,9 @@ import yaml
 from review_ai.intake import prepare_intake
 from review_ai.intake.analyze import MAX_SOURCE_FILES, RepoAnalysis, analyze_repository, files_to_read
 from review_ai.preparation import GenerationContext
-from review_ai.spec.deploy_spec import BASE_RESOURCES, AppSpec, Database, Health, Image, Requirements, Runtime, Storage
+from review_ai.spec.deploy_spec import (
+    BASE_RESOURCES, AppSpec, Database, Health, Image, Requirements, Runtime, SecretRef, Storage,
+)
 
 REPO = "Crystal-SBHackathon2026/sample-app"
 BASE = GenerationContext(repository=REPO, target={"env": "aws", "region": "ap-northeast-2"})
@@ -296,3 +298,41 @@ def test_context_values_already_supplied_are_kept() -> None:
     analysis = analyze_repository(base, list(sample_files()), sample_files())
 
     assert analysis.context.runtime == runtime
+
+
+# --- 구조 분해 env · 생성 가능한 서명 키 · 소스 헬스 라우트 (sample-todo 같은 앱) -------------------------
+
+TODO_JS = """const { DATA_DIR, SESSION_SECRET: secret, PORT = '3000' } = process.env;
+app.get('/livez', live);
+app.get('/readyz', ready);
+"""
+
+
+def test_destructured_env_names_are_read() -> None:
+    analysis = analyze(sample_files(**{"src/app.js": TODO_JS}))
+    assert analysis.context.secrets == (SecretRef(name="SESSION_SECRET", source="generated"),)
+    assert "DATA_DIR, NODE_ENV, PORT, SESSION_SECRET" in reason(analysis, "/secrets")  # NODE_ENV 는 Dockerfile ENV
+
+
+def test_rest_destructuring_is_still_unknown() -> None:
+    analysis = analyze(sample_files(**{"src/app.js": "const { A, ...rest } = process.env;\n"}))
+    assert "/secrets" in analysis.unresolved
+
+
+@pytest.mark.parametrize("name", ["STRIPE_SECRET_KEY", "API_TOKEN", "DB_PASSWORD"])
+def test_external_secrets_still_need_a_source(name: str) -> None:
+    analysis = analyze(sample_files(**{"src/app.js": f"const k = process.env.{name}; const s = process.env.JWT_SECRET;\n"}))
+    assert name in analysis.unresolved["/secrets"].reason and "JWT_SECRET" not in analysis.unresolved["/secrets"].reason
+
+
+def test_probes_come_from_source_routes_without_healthcheck() -> None:
+    no_healthcheck = DOCKERFILE.replace("HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- "
+                                        "http://127.0.0.1:8080/healthz || exit 1\n", "")
+    analysis = analyze(sample_files(Dockerfile=no_healthcheck, **{"src/app.js": TODO_JS}))
+    assert analysis.context.runtime.health == Health(readiness="/readyz", liveness="/livez")  # type: ignore[union-attr]
+    assert "소스 라우트 readiness /readyz · liveness /livez" in reason(analysis, "/runtime")
+
+
+def test_healthcheck_wins_over_source_routes() -> None:
+    analysis = analyze(sample_files(**{"src/app.js": TODO_JS}))
+    assert analysis.context.runtime.health == Health(readiness="/healthz", liveness="/healthz")  # type: ignore[union-attr]
