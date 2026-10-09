@@ -24,6 +24,7 @@ SAMPLES = Path(__file__).resolve().parents[2] / "ai" / "samples"
 REPO = "Crystal-SBHackathon2026/sample-app"
 HEAD = "a" * 40
 SECRET = "webhook-secret"
+API_TOKEN = "api-token"
 
 
 class FakeSpecs:
@@ -51,8 +52,9 @@ class Env:
         self.specs = FakeSpecs()
         self.publisher = FakePublisher()
         self.app = create_app(ApiDeps(repo=self.repo, specs=self.specs, publisher=self.publisher,
-                                      github_webhook_secret=SECRET, argocd_webhook_token="argo-token"))
-        self.client = TestClient(self.app)
+                                      github_webhook_secret=SECRET, argocd_webhook_token="argo-token",
+                                      api_token=API_TOKEN))
+        self.client = TestClient(self.app, headers={"Authorization": f"Bearer {API_TOKEN}"})
 
     def put_spec(self, text: str, sha: str = HEAD) -> None:
         self.specs.files[(REPO, "deploy.yaml", sha)] = text
@@ -565,3 +567,50 @@ def test_fork_pr_is_skipped(env: Env, head_repo: str | None) -> None:
 
     assert (resp.status_code, resp.json()) == (202, {"skipped": "fork"})
     assert env.repo.reviews == {} and env.publisher.sent == []
+
+
+
+# --- 승인 API 토큰 인증 (P0-1) ---------------------------------------------------------------------------
+
+def _decision_target(env: Env) -> str:
+    env.put_spec(sample_text())
+    return env.client.post("/reviews", json={"spec_ref": {"repository": REPO, "commit": HEAD}, "requested_by": "x"}
+                           ).json()["review_id"]
+
+
+@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer wrong"}, {"Authorization": API_TOKEN}])
+async def test_post_routes_need_token(env: Env, headers: dict[str, str]) -> None:
+    """토큰 없음·틀림·Bearer 빠짐은 401 — 아무것도 바뀌지 않는다."""
+    rid = _decision_target(env)
+    await env.set_status(rid, status="needs_human", final_spec=yaml.safe_load(sample_text()))
+    anon = TestClient(env.app, headers=headers)
+    sent = len(env.publisher.sent)
+
+    review = anon.post("/reviews", json={"spec_ref": {"repository": REPO, "commit": HEAD}, "requested_by": "x"})
+    decision = anon.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "intruder"})
+
+    assert (review.status_code, decision.status_code) == (401, 401)
+    assert len(env.publisher.sent) == sent and len(env.repo.reviews) == 1
+
+
+async def test_right_token_is_accepted(env: Env) -> None:
+    rid = _decision_target(env)
+    await env.set_status(rid, status="needs_human", final_spec=yaml.safe_load(sample_text()))
+    resp = env.client.post(f"/reviews/{rid}/decision", json={"decision": "rejected", "approver": "hyeyeon"})
+
+    assert resp.status_code == 202
+
+
+def test_routes_fail_closed_without_configured_tokens() -> None:
+    """토큰 환경변수가 비어 있으면 검사를 건너뛰지 않고 503. GET·헬스체크는 그대로."""
+    app = create_app(ApiDeps(repo=InMemoryReviewRepository(), specs=FakeSpecs(), publisher=FakePublisher(),
+                             github_webhook_secret=SECRET))
+    client = TestClient(app, headers={"Authorization": "Bearer anything"})
+
+    assert client.post("/reviews", json={"spec_ref": {"repository": REPO, "commit": HEAD},
+                                         "requested_by": "x"}).status_code == 503
+    assert client.post("/reviews/rv_x/decision", json={"decision": "approved", "approver": "x"}).status_code == 503
+    assert client.post("/webhooks/argocd", json={"app": "sample-app", "env": "aws", "health": "Healthy",
+                                                 "images": []}).status_code == 503
+    assert client.get("/healthz").status_code == 200
+    assert client.get("/reviews/rv_x").status_code == 404

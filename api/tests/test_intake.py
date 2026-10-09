@@ -87,7 +87,8 @@ class IntakeEnv:
             repo=self.repo, specs=self.specs, publisher=self.publisher, github_webhook_secret=SECRET,
             github=self.github, default_target=default_target, public_url="https://review.example/",
             intake_repositories=intake_repositories, repair_llm=repair_llm, transform_llm=transform_llm,
-            **({"lockfile": lockfile} if lockfile else {}))))
+            api_token="api-token", **({"lockfile": lockfile} if lockfile else {}))),
+            headers={"Authorization": "Bearer api-token"})
 
     def put(self, text: str, sha: str = HEAD) -> None:
         self.specs.files[(REPO, "deploy.yaml", sha)] = text

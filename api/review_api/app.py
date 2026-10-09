@@ -1,15 +1,18 @@
 """Review API — 검토 요청을 받아 review.requested 를 발행하고, 사람 결정·CI·배포 결과를 받아 검토를 이어 간다.
 
-    POST /reviews                       deploy.yaml 검토 요청 → 202 {review_id}
+    POST /reviews                       deploy.yaml 검토 요청 → 202 {review_id}  [Bearer REVIEW_API_TOKEN]
     GET  /reviews/{review_id}           상태·verdict·사유·rounds·deploy_result
     GET  /verify?sha=<PR head SHA>      그 SHA 의 검토가 통과했는지 (CI 용). 명세가 없거나 깨진 SHA 는 intake 상태
     GET  /intakes/{intake_id}           명세 없음·빈 명세·형식 오류 처리 기록 (PR 커밋 상태의 링크)
-    POST /reviews/{review_id}/decision  needs_human 검토에 사람 결정 → review.resumed(human_decision)
+    POST /reviews/{review_id}/decision  needs_human 검토에 사람 결정 → review.resumed(human_decision)  [Bearer REVIEW_API_TOKEN]
     POST /webhooks/github               pull_request opened·synchronize·reopened → 검토 시작
                                         (deploy.yaml 없음·빈 파일·형식 오류 → spec_intakes, review_api.intake)
                                         check_suite completed → review.resumed(ci_completed)
     POST /webhooks/argocd               배포 Healthy·Degraded 기록, Healthy 면 baselines 갱신, Degraded 면 판단 사례
+                                        [Bearer ARGOCD_WEBHOOK_TOKEN]
     GET  /healthz
+
+토큰이 설정되지 않은 [Bearer] 경로는 503 으로 거절한다 (fail-closed). GET 경로와 /webhooks/github(서명 검증)는 그대로.
 """
 
 from __future__ import annotations
@@ -69,6 +72,7 @@ class ApiDeps:
     publisher: Publisher
     github_webhook_secret: str | None = None
     argocd_webhook_token: str | None = None
+    api_token: str | None = None  # REVIEW_API_TOKEN — POST /reviews·/decision. 비어 있으면 두 경로를 503 으로 거절
     ci_app_slug: str | None = "github-actions"  # 이 GitHub App 의 check_suite 만 CI 결과로 본다. None 이면 전부
     github: IntakeGitHub | None = None  # 명세 생성 커밋·PR 커밋 상태. None 이면 intake 는 기록만 하고 거절
     default_target: str | None = None   # "aws/ap-northeast-2" — baseline 없는 레포의 명세를 만들 대상
@@ -94,6 +98,17 @@ class ReviewIn(BaseModel):
     requested_by: str = Field(min_length=1)
 
 
+def require_bearer(authorization: str, token: str | None, name: str) -> None:
+    """Authorization: Bearer <token> 확인. 토큰이 설정되지 않았으면 503 — 비어 있다고 검사를 건너뛰지 않는다(fail-closed).
+
+    플랫폼 ALB 가 HTTP 로 열려 있어서, 토큰이 없으면 인터넷 누구나 needs_human 검토를 승인할 수 있다.
+    """
+    if not token:
+        raise HTTPException(503, f"{name} 이 설정되지 않았다")
+    if not hmac.compare_digest(authorization.encode(), f"Bearer {token}".encode()):
+        raise HTTPException(401, "토큰이 맞지 않다")
+
+
 def create_app(deps: ApiDeps | None = None) -> FastAPI:
     lifespan = None if deps is not None else _real_lifespan
     app = FastAPI(title="review-service", lifespan=lifespan)
@@ -108,7 +123,9 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/reviews", status_code=202)
-    async def create_review(body: ReviewIn, request: Request) -> dict[str, str]:
+    async def create_review(body: ReviewIn, request: Request,
+                            authorization: str = Header(default="")) -> dict[str, str]:
+        require_bearer(authorization, d(request).api_token, "REVIEW_API_TOKEN")
         try:
             review_id = await start_review(d(request), body.spec_ref.model_dump(), body.requested_by)
         except SpecNotFound as exc:
@@ -151,8 +168,10 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         return {k: row.get(k) for k in keys}
 
     @app.post("/reviews/{review_id}/decision", status_code=202)
-    async def decide(review_id: str, body: HumanDecisionModel, request: Request) -> dict[str, str]:
+    async def decide(review_id: str, body: HumanDecisionModel, request: Request,
+                     authorization: str = Header(default="")) -> dict[str, str]:
         deps_ = d(request)
+        require_bearer(authorization, deps_.api_token, "REVIEW_API_TOKEN")
         row = await deps_.repo.get_review(review_id)
         if row is None:
             raise HTTPException(404, "검토가 없다")
@@ -212,9 +231,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
     async def argocd_webhook(event: ArgoCdEvent, request: Request,
                              authorization: str = Header(default="")) -> dict[str, Any]:
         deps_ = d(request)
-        if deps_.argocd_webhook_token and not hmac.compare_digest(authorization,
-                                                                  f"Bearer {deps_.argocd_webhook_token}"):
-            raise HTTPException(401, "토큰이 맞지 않다")
+        require_bearer(authorization, deps_.argocd_webhook_token, "ARGOCD_WEBHOOK_TOKEN")
         return await handle_deploy_event(deps_.repo, event)
 
     return app
@@ -376,6 +393,7 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
         publisher=KafkaPublisher(),
         github_webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET"),
         argocd_webhook_token=os.environ.get("ARGOCD_WEBHOOK_TOKEN") or None,
+        api_token=os.environ.get("REVIEW_API_TOKEN") or None,
         ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None,
         github=github,
         default_target=os.environ.get("DEFAULT_TARGET") or None,

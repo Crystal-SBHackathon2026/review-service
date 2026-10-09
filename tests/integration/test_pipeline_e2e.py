@@ -345,9 +345,11 @@ async def test_api_to_kafka_to_worker(pool: Any) -> None:
         raise AssertionError(f"{review_id} 가 {status} 가 되지 않았다: {row and row['status']}")
 
     secret = "it-secret"
-    app = create_app(ApiDeps(repo=repo, specs=github, publisher=Publisher(), github_webhook_secret=secret))
+    app = create_app(ApiDeps(repo=repo, specs=github, publisher=Publisher(), github_webhook_secret=secret,
+                             api_token="it-api-token", argocd_webhook_token="it-argo-token"))
     try:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api",
+                                     headers={"Authorization": "Bearer it-api-token"}) as client:
             resp = await client.post("/reviews", json={
                 "spec_ref": {"repository": REPO, "commit": HEAD, "path": "deploy.yaml"}, "requested_by": "it"})
             assert resp.status_code == 202, resp.text
@@ -364,7 +366,7 @@ async def test_api_to_kafka_to_worker(pool: Any) -> None:
             assert resp.json() == {"resumed": [rid]}
             await drain_until(rid, "blocked")
 
-            resp = await client.post("/webhooks/argocd", json={
+            resp = await client.post("/webhooks/argocd", headers={"Authorization": "Bearer it-argo-token"}, json={
                 "app": "sample-app", "env": "aws", "health": "Healthy",
                 "images": [f"ghcr.io/crystal-sbhackathon2026/sample-app:{MERGE_SHA}"]})
             assert resp.json() == {"review_id": rid, "recorded": "healthy", "baseline": "updated"}
