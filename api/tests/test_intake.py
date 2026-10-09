@@ -456,6 +456,80 @@ async def test_finished_intake_is_not_processed_twice(ienv: IntakeEnv) -> None:
     assert len(ienv.github.parents) == 1 and len(ienv.github.statuses) == 2
 
 
+async def _insert_new_app_intake(ienv: IntakeEnv, intake_id: str) -> None:
+    ienv.github.tree = dict(SAMPLE_TREE)  # baseline 없는 새 앱 → 레포 분석(GitHub 읽기 수십 번)
+    await ienv.repo.insert_intake(intake_id=intake_id, repository=REPO, head_repository=REPO, pr_number=5,
+                                  head_sha=HEAD, head_ref="feature", path="deploy.yaml", kind="missing",
+                                  errors=[], requested_by="octo-dev")
+
+
+async def test_intake_swept_while_still_processing_commits_once(ienv: IntakeEnv) -> None:
+    """처리가 STALE_AFTER 를 넘기는 사이 다른 파드의 sweep 이 같은 행을 끝냈다 → 늦은 쪽은 커밋하지 않는다."""
+    from review_api import intake as intake_mod
+
+    await _insert_new_app_intake(ienv, "in_slow")
+    deps = ienv.client.app.state.deps
+    real_list = ienv.github.list_files
+    swept: list[list[str]] = []
+
+    async def slow_list(repository: str, ref: str) -> list[str]:
+        if not swept:  # 첫 처리가 GitHub 읽기에서 멈춘 동안 sweep 이 돈다
+            swept.append([])
+            ienv.repo.intakes["in_slow"]["updated_at"] -= STALE_AFTER + timedelta(seconds=1)
+            swept[0] = await intake_mod.resume_stale_intakes(deps)
+        return await real_list(repository, ref)
+
+    ienv.github.list_files = slow_list  # type: ignore[method-assign]
+    await intake_mod.process_intake(deps, "in_slow")
+
+    row = ienv.repo.intakes["in_slow"]
+    assert swept == [["in_slow"]]
+    assert (row["status"], len(ienv.github.parents)) == ("generated", 1)
+    assert row["result_commit_sha"] == ienv.github.branch  # 생성 커밋 웹훅·LOOP_GUARD 가 이 SHA 로 행을 찾는다
+    assert ienv.states() == [(HEAD, "pending"), (HEAD, "pending"), (HEAD, "success")]
+
+
+async def test_link_intake_keeps_the_first_commit(ienv: IntakeEnv) -> None:
+    """두 곳이 동시에 커밋을 만들어도 행에는 먼저 이은 커밋이 남고, 둘 다 그 커밋으로 브랜치를 옮긴다."""
+    await _insert_new_app_intake(ienv, "in_x")
+    first, late = "a" * 40, "b" * 40
+
+    assert await ienv.repo.link_intake("in_x", result_commit_sha=first) == first
+    assert await ienv.repo.link_intake("in_x", result_commit_sha=late) == first
+    assert await ienv.repo.link_intake("in_x", review_id="rv_1") == first
+    assert ienv.repo.intakes["in_x"]["result_commit_sha"] == first
+
+
+async def test_processing_intake_heartbeat_keeps_sweep_away(ienv: IntakeEnv,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """처리가 길어져도 살아 있는 동안 updated_at 을 갱신한다 → sweep 은 죽은 파드의 행만 가져간다."""
+    import asyncio
+
+    from review_api import intake as intake_mod
+
+    monkeypatch.setattr(intake_mod, "HEARTBEAT_EVERY", timedelta(milliseconds=5))
+    await _insert_new_app_intake(ienv, "in_slow")
+    deps = ienv.client.app.state.deps
+    real_list = ienv.github.list_files
+    claimed: list[list[dict[str, Any]]] = []
+
+    async def slow_list(repository: str, ref: str) -> list[str]:
+        ienv.repo.intakes["in_slow"]["updated_at"] -= STALE_AFTER + timedelta(seconds=1)
+        await asyncio.sleep(0.05)  # GitHub 읽기가 STALE_AFTER 를 넘긴 셈
+        claimed.append(await ienv.repo.claim_stale_intakes(STALE_AFTER))
+        return await real_list(repository, ref)
+
+    ienv.github.list_files = slow_list  # type: ignore[method-assign]
+    await intake_mod.process_intake(deps, "in_slow")
+
+    row = ienv.repo.intakes["in_slow"]
+    assert claimed == [[]]
+    assert (row["status"], row["result_commit_sha"], len(ienv.github.parents)) == (
+        "generated", ienv.github.branch, 1)
+    await asyncio.sleep(0)
+    assert asyncio.all_tasks() == {asyncio.current_task()}  # 끝나면 heartbeat 도 멈춘다
+
+
 # --- 조회·직접 요청 --------------------------------------------------------------------------------
 
 def test_unknown_intake_is_404(ienv: IntakeEnv) -> None:

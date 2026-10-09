@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import signal
+from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -29,11 +30,14 @@ from review_worker.handler import ReviewHandler
 
 log = logging.getLogger("review_worker")
 GROUP_ID = "review-worker"
+# SDK 기본값(10분·재시도 2번)이면 그래프 재시도(JUDGE_MAX_RETRIES)와 곱해져 한 검토가 judge 에서 최대 12×10분 멈춘다.
+# 재시도는 그래프 한 곳에서만 한다. 120초면 보통 판단 출력(수천 토큰)은 끝난다
+JUDGE_CLIENT_OPTIONS: dict[str, Any] = {"timeout": 120.0, "max_retries": 0}
 
 
 def make_llm() -> CachedLLM | None:
     try:
-        return CachedLLM(ClaudeLLM())
+        return CachedLLM(ClaudeLLM(client_options=JUDGE_CLIENT_OPTIONS))
     except LlmUnavailable as exc:
         log.warning("LLM 없이 시작 — 판단이 필요한 검토는 LLM_UNAVAILABLE 로 사람에게 간다: %s", exc)
         return None

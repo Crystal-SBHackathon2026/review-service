@@ -22,6 +22,9 @@
           검토는 pass 여도 needs_human(GENERATED_SPEC_UNVERIFIED) — app.on_pull_request
     PR 표시: 커밋 상태 review-service/intake. 토큰에 권한이 없으면 로그만 남기고 기록은 그대로 둔다.
     파드가 처리 중에 죽으면 processing 행이 남는다 → resume_stale_intakes 가 STALE_AFTER 뒤에 다시 처리한다.
+        처리 중에는 HEARTBEAT_EVERY 마다 updated_at 을 찍는다 — 레포 분석·LLM 이 STALE_AFTER 를 넘겨도 살아 있는
+        처리를 sweep 이 가져가지 않게. 그래도 두 곳이 겹치면(heartbeat 가 DB 오류로 빠짐 등) 커밋 직전에 행을 다시 읽어
+        끝난 행이면 멈추고, 커밋은 행에 먼저 이어진 것 하나만 쓴다 (link_intake 는 result_commit_sha 를 덮지 않는다).
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ log = logging.getLogger(__name__)
 STATUS_CONTEXT = "review-service/intake"
 STALE_AFTER = timedelta(minutes=5)  # LLM 복구(수십 초)·코드 패치(파일 전체 재작성, 1~2분)·npm 잠금 파일보다 넉넉하게
 SWEEP_EVERY_SECONDS = 60.0
+HEARTBEAT_EVERY = STALE_AFTER / 4  # DB 가 한두 번 실패해도 STALE_AFTER 안에 다시 찍는다
 REPAIRABLE = ("yaml_error", "schema_error")
 READ_CONCURRENCY = 8  # 레포 분석 파일 읽기 — GitHub 은 동시 요청이 많으면 secondary rate limit 을 건다
 # 코드 패치가 풀 수 있는 미해결 항목 — 다른 항목이 남으면 어차피 생성하지 못하니 LLM 을 부르지 않는다
@@ -226,7 +230,8 @@ def _message(outcome: IntakeOutcome, transform: TransformOutcome | None) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
+async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any] | None:
+    """처리 결과(finish_intake 필드). 그사이 다른 곳이 이 행을 끝냈으면 None."""
     repository, head_sha = row["repository"], row["head_sha"]
     if await deps.repo.find_intake_by_result_commit(repository, head_sha) is not None:
         return _done("rejected", "LOOP_GUARD", "review-service 가 만든 커밋인데 다시 명세가 필요하다 — 자동 생성을 멈춘다")
@@ -255,11 +260,17 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
         if transform is not None and transform.action == "rejected":  # 코드 패치가 막힌 이유가 더 정확하다
             return _done("rejected", transform.reason, transform.message, transform.details)
         return _done("rejected", outcome.reason, outcome.message, outcome.details)
+    # 분석·LLM 이 길었다 — 그사이 sweep 이 가져가 끝냈으면 두 번째 커밋을 만들지 않는다
+    current = await deps.repo.get_intake(row["intake_id"])
+    if current is None or current["status"] != "processing":
+        return None
     # 다시 처리하는 행이면 이미 만든 커밋을 쓴다 — 같은 커밋으로 ref 를 옮기는 건 몇 번 해도 같다
-    commit = row["result_commit_sha"] or await deps.github.prepare_files_commit(
+    commit = current["result_commit_sha"] or await deps.github.prepare_files_commit(
         repository, parent=head_sha, files=_commit_files(outcome, row["path"], transform),
         message=_message(outcome, transform))
-    await deps.repo.link_intake(row["intake_id"], result_commit_sha=commit, baseline_used=baseline is not None)
+    # 동시에 만든 커밋이 먼저 이어졌으면 그 커밋으로 옮긴다 — 행의 SHA 와 브랜치가 어긋나면 생성 커밋 웹훅이 끊긴다
+    commit = await deps.repo.link_intake(row["intake_id"], result_commit_sha=commit,
+                                         baseline_used=baseline is not None) or commit
     try:
         await deps.github.update_branch(repository, row["head_ref"], commit)
     except RefConflict:
@@ -278,6 +289,7 @@ async def process_intake(deps: ApiDeps, intake_id: str) -> None:
     if row is None or row["status"] != "processing":
         return
     await _post_status(deps, row, "pending", f"{KIND_LABELS[row['kind']]} — 처리 중")
+    heartbeat = asyncio.create_task(_heartbeat(deps, intake_id))
     try:
         fields = await _decide(deps, row)
     except Exception as exc:  # 행을 processing 으로 두지 않는다 — 원인은 로그에
@@ -285,9 +297,24 @@ async def process_intake(deps: ApiDeps, intake_id: str) -> None:
         transient = isinstance(exc, TransientError) or isinstance(exc, GitHubError) and exc.transient
         fields = _done("failed", "ERROR", f"{KIND_LABELS[row['kind']]} — 처리 중 오류({type(exc).__name__})"
                        + (". 새 커밋을 올리면 다시 처리한다" if transient else ""))
+    finally:
+        heartbeat.cancel()
+    if fields is None:
+        log.info("intake %s: 다른 곳이 먼저 끝냈다", intake_id)
+        return
     if await deps.repo.finish_intake(intake_id, **fields):
         state = {"generated": "success", "repaired": "success", "failed": "error"}.get(fields["status"], "failure")
         await _post_status(deps, row, state, fields["message"])
+
+
+async def _heartbeat(deps: ApiDeps, intake_id: str) -> None:
+    """처리가 끝날 때까지 updated_at 을 찍는다 (process_intake 가 취소한다)."""
+    while True:
+        await asyncio.sleep(HEARTBEAT_EVERY.total_seconds())
+        try:
+            await deps.repo.touch_intake(intake_id)
+        except Exception:  # 한 번 빠져도 다음 박자에 다시 찍는다 — 처리는 계속한다
+            log.warning("intake %s: heartbeat 실패", intake_id, exc_info=True)
 
 
 async def _post_status(deps: ApiDeps, row: dict[str, Any], state: str, description: str) -> None:

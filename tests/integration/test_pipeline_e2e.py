@@ -180,12 +180,17 @@ async def test_spec_intakes_on_postgres(pool: Any) -> None:
     assert not await repo.claim_stale_intakes(timedelta(seconds=30))  # 방금 가져간 행은 다른 곳이 못 가져간다
 
     assert await repo.unverified_generation_for_pr(REPO, 7) is None  # 아직 커밋 전
-    await repo.link_intake("in_1", result_commit_sha="b" * 40)
+    assert await repo.link_intake("in_1", result_commit_sha="b" * 40) == "b" * 40
+    assert await repo.link_intake("in_1", result_commit_sha="d" * 40) == "b" * 40  # 늦게 만든 커밋은 덮지 않는다
     assert (await repo.find_intake_by_result_commit(REPO, "b" * 40))["intake_id"] == "in_1"
     assert (await repo.unverified_generation_for_pr(REPO, 7))["intake_id"] == "in_1"  # baseline_used NULL → 모름
     await repo.link_intake("in_1", baseline_used=False)
     assert (await repo.unverified_generation_for_pr(REPO, 7))["baseline_used"] is False
     assert await repo.unverified_generation_for_pr(REPO, 8) is None
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE spec_intakes SET updated_at = now() - interval '10 minutes' WHERE intake_id = 'in_1'")
+    await repo.touch_intake("in_1")  # 처리 중 heartbeat
+    assert not await repo.claim_stale_intakes(timedelta(minutes=5))
     assert await repo.finish_intake("in_1", status="generated", reason="GENERATED", message="m",
                                     details=[{"path": "/runtime"}], result_commit_sha="b" * 40)
     assert not await repo.finish_intake("in_1", status="failed", reason="ERROR", message="late")
