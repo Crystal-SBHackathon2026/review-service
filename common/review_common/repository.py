@@ -142,10 +142,16 @@ class ReviewRepository(Protocol):
         ...
 
     async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
-                          review_id: str | None = None, baseline_used: bool | None = None) -> None:
+                          review_id: str | None = None, baseline_used: bool | None = None) -> str | None:
         """만든 커밋·그 커밋의 검토·baseline 으로 만들었는지를 잇는다. None 인 값은 그대로 둔다.
+        행에 남은 result_commit_sha 를 돌려준다.
 
-        baseline_used 는 처음 기록한 값을 지킨다 — 다시 처리하는 행은 처음 만든 커밋을 그대로 쓰기 때문이다."""
+        result_commit_sha 는 이미 있으면 덮지 않는다 — 두 곳이 같은 행을 처리해도 먼저 이은 커밋 하나로 브랜치를 옮긴다.
+        baseline_used 도 처음 기록한 값을 지킨다 — 다시 처리하는 행은 처음 만든 커밋을 그대로 쓰기 때문이다."""
+        ...
+
+    async def touch_intake(self, intake_id: str) -> None:
+        """processing 인 행의 updated_at 을 새로 찍는다 — 처리 중이라는 heartbeat. sweep 이 가져가지 않게."""
         ...
 
     async def unverified_generation_for_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
@@ -324,12 +330,17 @@ class PostgresReviewRepository:
             " WHERE intake_id = %s AND status = 'processing'", (*values, intake_id)) == 1
 
     async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
-                          review_id: str | None = None, baseline_used: bool | None = None) -> None:
-        await self._execute(
-            "UPDATE spec_intakes SET result_commit_sha = COALESCE(%s, result_commit_sha),"
+                          review_id: str | None = None, baseline_used: bool | None = None) -> str | None:
+        row = await self._fetchone(
+            "UPDATE spec_intakes SET result_commit_sha = COALESCE(result_commit_sha, %s),"
             " review_id = COALESCE(%s, review_id), baseline_used = COALESCE(baseline_used, %s),"
-            " updated_at = now() WHERE intake_id = %s",
+            " updated_at = now() WHERE intake_id = %s RETURNING result_commit_sha",
             (result_commit_sha, review_id, baseline_used, intake_id))
+        return row["result_commit_sha"] if row else None
+
+    async def touch_intake(self, intake_id: str) -> None:
+        await self._execute("UPDATE spec_intakes SET updated_at = now() WHERE intake_id = %s AND status = 'processing'",
+                            (intake_id,))
 
     async def unverified_generation_for_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
         return await self._fetchone(
@@ -501,13 +512,19 @@ class InMemoryReviewRepository:
         return True
 
     async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
-                          review_id: str | None = None, baseline_used: bool | None = None) -> None:
+                          review_id: str | None = None, baseline_used: bool | None = None) -> str | None:
         row = self.intakes.get(intake_id)
         if row is None:
-            return
-        links = {"result_commit_sha": result_commit_sha, "review_id": review_id,
+            return None
+        links = {"result_commit_sha": row["result_commit_sha"] or result_commit_sha, "review_id": review_id,
                  "baseline_used": baseline_used if row["baseline_used"] is None else None}
         row.update({k: v for k, v in links.items() if v is not None}, updated_at=_now())
+        return row["result_commit_sha"]
+
+    async def touch_intake(self, intake_id: str) -> None:
+        row = self.intakes.get(intake_id)
+        if row is not None and row["status"] == "processing":
+            row["updated_at"] = _now()
 
     async def unverified_generation_for_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
         return self._latest(r for r in self.intakes.values()
