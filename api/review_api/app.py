@@ -273,7 +273,25 @@ async def submit_review(deps: ApiDeps, loaded: dict[str, Any], spec_ref: dict[st
         log.exception("review %s: review.requested 발행 실패", review_id)
         await deps.repo.update_review(review_id, status="failed", error=f"publish: {exc}"[:2000])
         raise HTTPException(503, "검토 요청을 큐에 넣지 못했다") from exc
+    await post_verify_status(deps, spec_ref, review_id, "pending", "AI 검토 중")
     return review_id
+
+
+VERIFY_CONTEXT = "review-service/verify"  # 검토 결과 커밋 상태. 이후 상태(success·failure)는 워커가 쓴다
+
+
+async def post_verify_status(deps: ApiDeps, spec_ref: dict[str, str], review_id: str, state: str,
+                             description: str) -> None:
+    """PR head 에 커밋 상태 review-service/verify. 실패해도(권한·네트워크) 검토는 그대로 진행한다."""
+    if deps.github is None:
+        return
+    target_url = f"{deps.public_url.rstrip('/')}/reviews/{review_id}" if deps.public_url else None
+    try:
+        await deps.github.create_commit_status(spec_ref["repository"], spec_ref["commit"], state=state,
+                                               context=VERIFY_CONTEXT, description=description,
+                                               target_url=target_url)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("review %s: 커밋 상태(%s) 기록 실패 — %s", review_id, state, exc)
 
 
 def is_fork(pull_request: dict[str, Any]) -> bool:

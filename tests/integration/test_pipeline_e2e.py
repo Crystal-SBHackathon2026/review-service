@@ -68,6 +68,7 @@ class FakeGitHub:
     def __init__(self, spec_text: str) -> None:
         self.spec_text = spec_text
         self.merged: list[int] = []
+        self.statuses: list[tuple[str, str]] = []
         self.suites: list[dict[str, Any]] = []
 
     async def check_suites(self, repository: str, sha: str) -> list[dict[str, Any]]:
@@ -90,6 +91,10 @@ class FakeGitHub:
     async def merge_pull(self, repository: str, number: int, *, head_sha: str) -> str:
         self.merged.append(number)
         return MERGE_SHA
+
+    async def create_commit_status(self, repository: str, sha: str, *, state: str, context: str, description: str,
+                                   target_url: str | None = None) -> None:
+        self.statuses.append((context, state))
 
 
 class NullPublisher:

@@ -744,3 +744,81 @@ async def test_fork_pr_reaching_merge_is_not_merged(harness: Harness, head_repo:
     row = harness.row()
     assert row["status"] == "failed" and "fork PR" in row["error"]
     assert harness.github.merged == []
+
+
+# --- 커밋 상태 review-service/verify (⑤) ----------------------------------------------------------------
+
+async def test_pass_writes_success_before_merge(harness: Harness) -> None:
+    await harness.request(load_sample(SAMPLE_01))
+    assert harness.github.states() == ["success"]  # CI 대기로 넘어갈 때
+
+    await _finish_ci(harness)
+    events = harness.github.events
+    assert events.index("merge") > max(i for i, e in enumerate(events) if e == "status:success")
+    assert harness.github.merged  # (테스트 기본 commit_overlay 는 스텁이라 그 뒤는 blocked)
+
+
+async def test_needs_human_writes_failure_then_success_after_approval(harness: Harness) -> None:
+    sample = load_sample(SAMPLE_04)
+    await _seed_baseline(harness, sample)
+    await harness.request(sample)
+
+    [(sha, state, description)] = harness.github.statuses
+    assert (state, description) == ("failure", "사람 확인 필요: IRREVERSIBLE")
+
+    await harness.resume({"review_id": RID, "kind": "human_decision", "human_decision": {
+        "decision": "approved", "approver": "hyeyeon", "edited_ops": [], "use_recommendations": False}})
+    assert harness.github.statuses[-1][1:] == ("success", "사람이 승인")
+
+
+async def test_fix_commit_review_starts_pending_on_new_sha(harness: Harness) -> None:
+    """수정 커밋으로 넘긴 검토 — 옛 SHA 상태는 그대로, 새 SHA 는 pending 부터."""
+    await harness.request(load_sample(SAMPLE_05))
+
+    assert harness.row()["status"] == "superseded"
+    assert harness.github.states(HEAD) == []  # 옛 SHA 는 손대지 않는다
+    assert harness.github.states(FIX_SHA) == ["pending"]
+
+
+async def test_rejected_writes_failure(harness: Harness) -> None:
+    sample = load_sample(SAMPLE_04)
+    await _seed_baseline(harness, sample)
+    await harness.request(sample)
+    await harness.human(RID, "rejected")
+
+    assert harness.github.statuses[-1][1:] == ("failure", "사람이 거절 (hyeyeon)")
+
+
+async def test_status_errors_do_not_stop_review(harness: Harness) -> None:
+    """권한·네트워크로 상태를 못 써도 검토는 진행한다 (경고만)."""
+    harness.github.status_error = GitHubError("커밋 상태 기록 실패 403", 403)
+    sample = load_sample(SAMPLE_04)
+    await _seed_baseline(harness, sample)
+    await harness.request(sample)
+
+    assert harness.row()["status"] == "needs_human"
+
+
+async def test_merge_needs_success_status(harness: Harness) -> None:
+    """병합 직전 success 는 필수 — 3번 시도해도 못 쓰면 병합하지 않고 failed."""
+    await harness.request(load_sample(SAMPLE_01))
+    harness.github.status_error = GitHubError("커밋 상태 기록 실패 403", 403)
+    await _finish_ci(harness)
+
+    row = harness.row()
+    assert row["status"] == "failed" and "review-service/verify" in row["error"]
+    assert harness.github.merged == []
+
+
+async def test_status_links_to_review_when_public_url_set() -> None:
+    h = Harness(public_url="http://alb.example/")
+    seen: list[str | None] = []
+
+    async def record(repository: str, sha: str, *, state: str, context: str, description: str,
+                     target_url: str | None = None) -> None:
+        seen.append(target_url)
+
+    h.github.create_commit_status = record  # type: ignore[method-assign]
+    await h.request(load_sample(SAMPLE_01))
+
+    assert seen == [f"http://alb.example/reviews/{RID}"]

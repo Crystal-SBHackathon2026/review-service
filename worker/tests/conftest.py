@@ -40,6 +40,9 @@ class FakeGitHub:
         self.suites: dict[str, list[dict[str, Any]]] = {}
         self.suite_error: GitHubError | None = None
         self.branch_error: GitHubError | None = None
+        self.status_error: GitHubError | None = None  # 커밋 상태 쓰기가 계속 실패 (권한 없음 등)
+        self.statuses: list[tuple[str, str, str]] = []  # (sha, state, description) — review-service/verify
+        self.events: list[str] = []  # 상태·병합 순서 확인용
         self.merged: list[tuple[str, int, str]] = []
         self.commits: list[dict[str, Any]] = []  # 브랜치에 실제로 올라간 커밋
         self.prepared: dict[str, dict[str, Any]] = {}  # 만들었지만 브랜치를 아직 안 옮긴 커밋
@@ -77,7 +80,19 @@ class FakeGitHub:
 
     async def merge_pull(self, repository: str, number: int, *, head_sha: str) -> str:
         self.merged.append((repository, number, head_sha))
+        self.events.append("merge")
         return MERGE_SHA
+
+    async def create_commit_status(self, repository: str, sha: str, *, state: str, context: str, description: str,
+                                   target_url: str | None = None) -> None:
+        if self.status_error:
+            raise self.status_error
+        assert context == "review-service/verify"
+        self.statuses.append((sha, state, description))
+        self.events.append(f"status:{state}")
+
+    def states(self, sha: str = "a" * 40) -> list[str]:
+        return [state for s, state, _ in self.statuses if s == sha]
 
 
 class FakePublisher:

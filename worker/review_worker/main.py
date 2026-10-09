@@ -78,7 +78,8 @@ async def run() -> None:
         gitops = GitHubGitClient(github)  # gitops 레포: GITOPS_REPO
         deps = Deps(repo=repo, github=github, publisher=KafkaPublisher(), llm=make_llm(), retriever=retriever,
                     commit_overlay=make_commit_overlay(gitops), overlay_guard=make_overlay_guard(gitops),
-                    ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None)
+                    ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None,
+                    public_url=os.environ.get("REVIEW_API_PUBLIC_URL") or None)
         graph = build_graph(deps, checkpointer)
         handler = ReviewHandler(repo, graph, files=github)
         await consumer.start()

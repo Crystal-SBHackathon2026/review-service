@@ -634,3 +634,27 @@ async def test_github_client_get_file_stops_at_max_bytes() -> None:
     assert too_large.value.status_code == 413 and not too_large.value.transient
     with pytest.raises(SpecNotFound):
         await client.get_file(REPO, "missing.yaml", HEAD)
+
+
+# --- 커밋 상태 review-service/verify (⑤) ----------------------------------------------------------------
+
+def _verify_statuses(ienv: IntakeEnv) -> list[dict[str, Any]]:
+    return [s for s in ienv.github.statuses if s["context"] == "review-service/verify"]
+
+
+async def test_new_review_writes_pending_with_link(ienv: IntakeEnv) -> None:
+    ienv.put(sample_text())
+    rid = send_pr(ienv, pr_event("opened")).json()["review_id"]
+
+    [status] = _verify_statuses(ienv)
+    assert (status["sha"], status["state"], status["description"]) == (HEAD, "pending", "AI 검토 중")
+    assert status["target_url"] == f"https://review.example/reviews/{rid}"
+
+
+async def test_status_error_does_not_block_review(ienv: IntakeEnv) -> None:
+    ienv.github.status_error = GitHubError("커밋 상태 기록 실패 403", 403)
+    ienv.put(sample_text())
+    resp = send_pr(ienv, pr_event("opened"))
+
+    assert "review_id" in resp.json()
+    assert ienv.repo.reviews[resp.json()["review_id"]]["status"] == "received"
