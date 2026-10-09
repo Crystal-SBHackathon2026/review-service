@@ -62,6 +62,10 @@ class ReviewRequested(BaseModel):
         AppSpec.model_validate(self.deploy_spec)
         return self
 
+    def encode(self) -> bytes:
+        """Kafka 값. generated_spec 이 False 면 빼고 보낸다 — 배포 중 남은 이전 워커(extra=forbid, 필드 모름)도 읽는다."""
+        return self.model_dump_json(exclude=None if self.generated_spec else {"generated_spec"}).encode()
+
 
 def spec_sha256(spec: dict[str, Any]) -> str:
     canonical = json.dumps(spec, sort_keys=True, ensure_ascii=False, separators=(",", ":"))

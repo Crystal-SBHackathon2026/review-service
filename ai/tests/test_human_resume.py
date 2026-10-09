@@ -196,3 +196,20 @@ async def test_generated_spec_flows_from_kafka_message() -> None:
     final = await run_graph(state, llm=FAKES["oracle"](), retriever=FileRetriever())
 
     assert final["decision"]["reasons"] == ["GENERATED_SPEC_UNVERIFIED"]
+
+
+def test_message_without_generated_spec_is_readable_by_previous_workers() -> None:
+    """generated_spec 을 모르는 이전 워커(extra=forbid)가 배포 중 메시지를 버리지 않게, False 면 싣지 않는다."""
+    import json
+    from datetime import UTC, datetime
+
+    from review_ai.messages import ReviewRequested, build_review_requested
+
+    spec = load_sample_dict("01-pass-sample-app-aws.yaml")
+    kw = {"review_id": "r", "spec_ref": {"repository": "r", "commit": "c"}, "requested_by": "hyeyeon",
+          "requested_at": datetime.now(UTC)}
+    plain = build_review_requested(spec, **kw).encode()
+    assert "generated_spec" not in json.loads(plain)
+    assert ReviewRequested.model_validate_json(plain).generated_spec is False
+    flagged = build_review_requested(spec, **kw, generated_spec=True).encode()
+    assert ReviewRequested.model_validate_json(flagged).generated_spec is True

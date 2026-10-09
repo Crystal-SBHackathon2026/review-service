@@ -268,7 +268,7 @@ async def submit_review(deps: ApiDeps, loaded: dict[str, Any], spec_ref: dict[st
                                   repo_id=message.repo_id, spec_ref=spec_ref, pr_head_sha=commit,
                                   requested_by=requested_by, pr_number=pr_number)
     try:
-        await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.model_dump_json().encode())
+        await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
     except Exception as exc:
         log.exception("review %s: review.requested 발행 실패", review_id)
         await deps.repo.update_review(review_id, status="failed", error=f"publish: {exc}"[:2000])

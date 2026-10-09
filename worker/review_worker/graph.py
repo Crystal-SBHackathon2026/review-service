@@ -274,7 +274,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         except GitHubError as exc:  # 그사이 사람이 푸시했다 — 이 수정은 버린다
             await repo.update_review(new_rid, status="failed", error=f"브랜치 갱신 실패: {exc}"[:2000])
             return await _fail(rid, f"commit_fix: {exc}")
-        await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.model_dump_json().encode())
+        await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
         await repo.update_review(rid, status="superseded", superseded_by=new_rid)
         await _record_case(state)
         log.info("review %s: 수정 %d건을 %s 로 커밋 → 재검토 %s", rid, len(ops), new_sha, new_rid)
