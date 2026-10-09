@@ -49,7 +49,7 @@ class Finding(TypedDict):
 class Doc(TypedDict):
     chunk_id: str
     rule_id: str | None  # incidents·guides 는 None 가능
-    doc_type: Literal["rule", "incident", "guide"]
+    doc_type: Literal["rule", "incident", "guide", "case"]  # case: 업무 DB review_cases (지난 검토의 판단)
     provider: Literal["aws", "gcp", "local", "any"]
     score: float
     match: Literal["exact_rule", "semantic"]

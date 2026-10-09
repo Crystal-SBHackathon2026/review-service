@@ -1,4 +1,4 @@
-"""업무 DB 저장소 — reviews·baselines·deploy_events·spec_intakes.
+"""업무 DB 저장소 — reviews·baselines·deploy_events·spec_intakes·review_cases.
 
 ReviewRepository 프로토콜 하나에 Postgres 구현과 메모리 구현(테스트·DB 없는 로컬 실행)을 둔다.
 상태 전이는 claim() 의 조건부 UPDATE 로 한다 — Kafka 재전송·중복 웹훅이 와도 한 번만 진행된다.
@@ -30,6 +30,8 @@ INTAKE_FIELDS = ("intake_id", "repository", "head_repository", "pr_number", "hea
                  "errors", "requested_by")
 INTAKE_FINISH = frozenset({"status", "reason", "message", "details", "result_commit_sha"})
 
+CASE_FIELDS = ("case_id", "review_id", "app", "target_env", "rule_ids", "outcome", "summary", "ops")
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -47,6 +49,11 @@ def _check_intake(intake: dict[str, Any], finish: dict[str, Any]) -> None:
     unknown = set(finish) - INTAKE_FINISH
     if unknown or finish.get("status") == "processing":
         raise ValueError(f"spec_intakes 를 끝낼 수 없는 필드·상태: {sorted(unknown) or finish['status']}")
+
+
+def _check_case(case: dict[str, Any]) -> None:
+    if set(case) != set(CASE_FIELDS):
+        raise ValueError(f"review_cases 필드가 맞지 않다: {sorted(set(case) ^ set(CASE_FIELDS))}")
 
 
 def baseline_for(row: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -138,6 +145,16 @@ class ReviewRepository(Protocol):
         """older_than 보다 오래 processing 인 행(처리 중 파드가 죽은 것)을 가져가며 updated_at 을 새로 찍는다.
 
         API 가 여러 개여도 한 행은 한 곳만 가져간다."""
+        ...
+
+    # --- review_cases ---
+
+    async def insert_case(self, **case: Any) -> bool:
+        """사례를 넣는다 (review_ai.cases.build_case 결과). 같은 case_id 가 이미 있으면 넣지 않고 False."""
+        ...
+
+    async def find_cases(self, rule_id: str, *, target_env: str, limit: int) -> list[dict[str, Any]]:
+        """rule_id 가 걸린 사례 limit 개 — 같은 대상 환경을 먼저, 그 안에서 최근 것부터."""
         ...
 
 
@@ -302,6 +319,19 @@ class PostgresReviewRepository:
             " RETURNING *", (older_than,))
         return sorted(rows, key=lambda r: r["created_at"])
 
+    async def insert_case(self, **case: Any) -> bool:
+        _check_case(case)
+        columns = list(CASE_FIELDS)
+        values = [Jsonb(case[c]) if c == "ops" else case[c] for c in columns]
+        return await self._execute(
+            f"INSERT INTO review_cases ({', '.join(columns)}) VALUES ({', '.join(['%s'] * len(columns))})"
+            " ON CONFLICT (case_id) DO NOTHING", values) == 1
+
+    async def find_cases(self, rule_id: str, *, target_env: str, limit: int) -> list[dict[str, Any]]:
+        return await self._fetchall(
+            "SELECT * FROM review_cases WHERE rule_ids @> ARRAY[%s]::text[]"
+            " ORDER BY (target_env = %s) DESC, created_at DESC LIMIT %s", (rule_id, target_env, limit))
+
 
 class InMemoryReviewRepository:
     """테스트·DB 없는 로컬 실행용. Postgres 구현과 같은 규칙으로 동작한다."""
@@ -311,6 +341,7 @@ class InMemoryReviewRepository:
         self.baselines: dict[tuple[str, str], dict[str, Any]] = {}
         self.deploy_events: list[dict[str, Any]] = []
         self.intakes: dict[str, dict[str, Any]] = {}
+        self.cases: dict[str, dict[str, Any]] = {}
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
@@ -450,6 +481,19 @@ class InMemoryReviewRepository:
         for r in rows:
             r["updated_at"] = now
         return copy.deepcopy(sorted(rows, key=lambda r: r["created_at"]))
+
+    async def insert_case(self, **case: Any) -> bool:
+        _check_case(case)
+        if case["case_id"] in self.cases:
+            return False
+        self.cases[case["case_id"]] = {**copy.deepcopy(case), "created_at": _now()}
+        return True
+
+    async def find_cases(self, rule_id: str, *, target_env: str, limit: int) -> list[dict[str, Any]]:
+        rows = sorted((c for c in reversed(self.cases.values()) if rule_id in c["rule_ids"]),
+                      key=lambda c: c["created_at"], reverse=True)  # 같은 시각이면 나중에 넣은 것이 앞
+        rows.sort(key=lambda c: c["target_env"] != target_env)  # 안정 정렬 — 같은 환경 안에서는 최근 순서 유지
+        return copy.deepcopy(rows[:limit])
 
 
 def make_pool(conninfo: str, *, min_size: int = 1, max_size: int = 5) -> AsyncConnectionPool:

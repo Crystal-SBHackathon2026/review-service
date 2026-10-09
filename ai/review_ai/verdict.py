@@ -43,7 +43,8 @@ def _counted(findings: Sequence[Finding]) -> list[Finding]:
 
 
 def _low_score(findings: Sequence[Finding], docs: Sequence[Doc]) -> bool:
-    exact = {d["rule_id"] for d in docs if d["match"] == "exact_rule"}
+    # 지난 검토 사례(doc_type case)는 규칙 문서를 대신하지 않는다 — 문서 없는 규칙이 사례만으로 근거를 갖추면 안 된다
+    exact = {d["rule_id"] for d in docs if d["match"] == "exact_rule" and d["doc_type"] != "case"}
     best_semantic = max((d["score"] for d in docs if d["match"] == "semantic"), default=0.0)
     return any(f["rule_id"] not in exact for f in findings) and best_semantic < LOW_SCORE_THRESHOLD
 

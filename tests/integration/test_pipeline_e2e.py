@@ -105,7 +105,7 @@ def worker_graph(repo: PostgresReviewRepository, github: FakeGitHub, checkpointe
 
 async def test_migrate_is_idempotent(conninfo: str) -> None:
     assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql", "0003_pr_number.sql",
-                                       "0004_spec_intakes.sql"]
+                                       "0004_spec_intakes.sql", "0005_review_cases.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -198,6 +198,33 @@ async def test_spec_intakes_on_postgres(pool: Any) -> None:
                                merge_sha="x", observed_at=datetime.now(UTC))
     assert (await repo.latest_baseline_for_repository(REPO))["spec"] == {"v": 1}
     assert await repo.latest_baseline_for_repository("other/repo") is None
+
+async def test_review_cases_on_postgres(pool: Any) -> None:
+    """판단 사례 — case_id 로 한 번만, rule_id 배열 매칭, 같은 대상 환경 먼저·그 안에서 최근 순."""
+    repo = PostgresReviewRepository(pool)
+    for rid in ("rv_1", "rv_2", "rv_3"):
+        await repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=REPO,
+                                 spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
+                                 pr_head_sha=HEAD, requested_by="it")
+
+    def case(rid: str, env: str, rules: list[str]) -> dict[str, Any]:
+        return {"case_id": f"{rid}.rejected", "review_id": rid, "app": "sample-app", "target_env": env,
+                "rule_ids": rules, "outcome": "rejected", "summary": f"지난 검토 {rid}",
+                "ops": [{"op": "replace", "path": "/database/engine", "value": "postgres"}]}
+
+    assert await repo.insert_case(**case("rv_1", "aws", ["DB-001", "STO-005"]))
+    assert await repo.insert_case(**case("rv_2", "gcp", ["DB-001"]))
+    assert await repo.insert_case(**case("rv_3", "aws", ["DB-001"]))
+    assert not await repo.insert_case(**case("rv_3", "aws", ["DB-001"]))
+
+    found = await repo.find_cases("DB-001", target_env="aws", limit=3)
+    assert [c["case_id"] for c in found] == ["rv_3.rejected", "rv_1.rejected", "rv_2.rejected"]
+    assert found[0]["ops"] == [{"op": "replace", "path": "/database/engine", "value": "postgres"}]
+    assert [c["case_id"] for c in await repo.find_cases("STO-005", target_env="gcp", limit=3)] == ["rv_1.rejected"]
+    assert len(await repo.find_cases("DB-001", target_env="gcp", limit=2)) == 2
+    with pytest.raises(psycopg.errors.CheckViolation):
+        await repo.insert_case(**{**case("rv_1", "aws", ["DB-001"]), "case_id": "rv_1.x", "outcome": "merged"})
+
 
 async def test_checkpoint_survives_worker_restart(pool: Any) -> None:
     """waiting_ci 에서 멈춘 검토를 새 워커(새 그래프·같은 DB 체크포인트)가 CI 결과로 이어 간다."""

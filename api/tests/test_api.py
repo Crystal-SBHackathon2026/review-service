@@ -399,6 +399,59 @@ async def test_argocd_degraded_records_event_only(env: Env) -> None:
 
     assert [e["kind"] for e in env.repo.deploy_events] == ["degraded"]
     assert env.repo.baselines == {}
+    assert env.repo.cases == {}  # 판단이 필요했던 finding 이 없던 검토 — 남길 사례가 없다
+
+
+DB_FINDING = {"finding_id": "DB-001:abc", "rule_id": "DB-001", "severity": "high", "title": "DB 엔진 변경",
+              "location": {"spec_path": "/database/engine"}, "evidence": "mysql"}
+
+
+async def test_argocd_degraded_records_case_of_decided_review(env: Env) -> None:
+    rid = await _merged_review(env)
+    await env.set_status(rid, findings=[DB_FINDING], decision={"reasons": ["IRREVERSIBLE"]})
+    for _ in range(2):  # Argo CD 는 같은 상태를 여러 번 보낸다
+        env.client.post("/webhooks/argocd", json=argo("Degraded", MERGE[:7]),
+                        headers={"Authorization": "Bearer argo-token"})
+
+    [case] = env.repo.cases.values()
+    assert (case["case_id"], case["rule_ids"], case["outcome"]) == (f"{rid}.deploy_degraded", ["DB-001"],
+                                                                     "deploy_degraded")
+    assert "Degraded" in case["summary"]
+
+
+async def test_argocd_degraded_autofix_review_records_original_review(env: Env) -> None:
+    """병합된 건 AI 수정 커밋의 재검토(finding 없음) — 판단은 원래 검토에 있다."""
+    env.put_spec(sample_text())
+    original = env.request_review().json()["review_id"]
+    fix_round = {"findings": [DB_FINDING], "reasons": [],
+                 "patch": {"ops": [{"op": "replace", "path": "/database/engine", "value": "postgres"}]}}
+    await env.set_status(original, status="superseded", rounds=[fix_round])
+    await env.repo.insert_review(review_id="rv_autofix", app="sample-app", target_env="aws", repo_id=REPO,
+                                 spec_ref={"repository": REPO, "commit": MERGE, "path": "deploy.yaml"},
+                                 pr_head_sha=MERGE, requested_by=f"autofix:{original}")
+    await env.set_status("rv_autofix", status="committed", merge_sha=MERGE)
+
+    resp = env.client.post("/webhooks/argocd", json=argo("Degraded", MERGE[:7]),
+                           headers={"Authorization": "Bearer argo-token"})
+
+    assert resp.json() == {"review_id": "rv_autofix", "recorded": "degraded"}
+    case = env.repo.cases[f"{original}.deploy_degraded"]
+    assert case["ops"] == [{"op": "replace", "path": "/database/engine", "value": "postgres"}]
+
+
+async def test_argocd_degraded_case_failure_keeps_event(env: Env) -> None:
+    rid = await _merged_review(env)
+    await env.set_status(rid, findings=[DB_FINDING])
+
+    async def broken(**_: Any) -> bool:
+        raise RuntimeError("db down")
+
+    env.repo.insert_case = broken  # type: ignore[method-assign]
+    resp = env.client.post("/webhooks/argocd", json=argo("Degraded", MERGE[:7]),
+                           headers={"Authorization": "Bearer argo-token"})
+
+    assert resp.json() == {"review_id": rid, "recorded": "degraded"}
+    assert [e["kind"] for e in env.repo.deploy_events] == ["degraded"]
 
 
 async def test_argocd_requires_token(env: Env) -> None:
