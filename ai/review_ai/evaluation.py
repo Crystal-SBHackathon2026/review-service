@@ -198,6 +198,13 @@ def _pointer_value(doc: Any, pointer: str) -> Any:
     return doc
 
 
+def _effective(raw: Any) -> DeploySpec:
+    """배포 결과로 비교할 명세 — namespace 생략은 metadata.name 과 같다 (overlay 렌더러와 같은 규칙)."""
+    spec = DeploySpec.model_validate(raw)
+    target = spec.target.model_copy(update={"namespace": spec.target.namespace or spec.metadata.name})
+    return spec.model_copy(update={"target": target})
+
+
 def _check_intake(case: dict[str, Any], run: _Run) -> list[str]:
     exp, outcome, failures = case["expect"], run.outcome, []
     if outcome is None:
@@ -213,7 +220,7 @@ def _check_intake(case: dict[str, Any], run: _Run) -> list[str]:
         answer = intake_answer(case)
         if outcome.content is None or answer is None:
             failures.append("비교할 복구 결과나 정답 샘플이 없다")
-        elif DeploySpec.model_validate(yaml.safe_load(outcome.content)) != DeploySpec.model_validate(answer):
+        elif _effective(yaml.safe_load(outcome.content)) != _effective(answer):
             failures.append("복구한 명세가 원래 샘플과 다르다")
     return failures
 
