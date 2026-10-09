@@ -43,12 +43,12 @@ from review_ai.intake import KIND_LABELS, IntakeOutcome, commit_message, prepare
 from review_ai.errors import TransientError
 from review_ai.intake.analyze import Finding, analyze_repository, files_to_read
 from review_ai.catalog import load_targets
-from review_ai.intake.repair import repair_intake
+from review_ai.intake.repair import MAX_RAW_CHARS, repair_intake
 from review_ai.preparation import GenerationContext, app_name
 from review_ai.transform import TransformOutcome, apply_to_context, plan_transform, transform_repository
 from review_api.lockfile import LockfileUnavailable
 from review_ai.spec.deploy_spec import Baseline, DeploySpec, Target
-from review_common.github import GitHubError, RefConflict
+from review_common.github import FileTooLarge, GitHubError, RefConflict
 from review_common.ids import new_intake_id
 from review_common.repository import baseline_for
 
@@ -66,12 +66,14 @@ READ_CONCURRENCY = 8  # 레포 분석 파일 읽기 — GitHub 은 동시 요청
 # 코드 패치가 풀 수 있는 미해결 항목 — 다른 항목이 남으면 어차피 생성하지 못하니 LLM 을 부르지 않는다
 TRANSFORM_RESOLVES = frozenset({"/database", "/requirements"})
 OTHER_LOCKFILES = ("yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json")
+MAX_READ_BYTES = 256 * 1024  # 레포 분석 파일 하나 — 넘으면 읽지 않은 파일로 둔다('없음' 결론을 막는다)
+MAX_SPEC_BYTES = 4 * MAX_RAW_CHARS  # 복구할 deploy.yaml — 글자 수 상한은 repair 가 다시 본다 (UTF-8 한 글자 ≤ 4바이트)
 
 
 class IntakeGitHub(Protocol):
     async def list_files(self, repository: str, ref: str) -> list[str]: ...
 
-    async def get_file(self, repository: str, path: str, ref: str) -> str: ...
+    async def get_file(self, repository: str, path: str, ref: str, *, max_bytes: int | None = None) -> str: ...
 
     async def prepare_file_commit(self, repository: str, *, parent: str, path: str, content: str,
                                   message: str) -> str: ...
@@ -173,12 +175,16 @@ async def _context(deps: ApiDeps, github: IntakeGitHub, repository: str, head_sh
     paths = files_to_read(tree)
     limit = asyncio.Semaphore(READ_CONCURRENCY)
 
-    async def read(path: str) -> str:
+    async def read(path: str) -> str | None:
         async with limit:
-            return await github.get_file(repository, path, head_sha)
+            try:
+                return await github.get_file(repository, path, head_sha, max_bytes=MAX_READ_BYTES)
+            except FileTooLarge:
+                log.info("%s@%s: %s 가 커서 분석에서 뺀다", repository, head_sha, path)
+                return None
 
     texts = await asyncio.gather(*map(read, paths))
-    files = dict(zip(paths, texts, strict=True))
+    files = {p: text for p, text in zip(paths, texts, strict=True) if text is not None}
     analysis = analyze_repository(base, tree, files)
     return analysis.context, None, analysis.findings, RepoFiles(tuple(tree), files)
 
@@ -248,7 +254,12 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any] | None:
     context, baseline, findings, repo = found
     transform: TransformOutcome | None = None
     if row["kind"] in REPAIRABLE:
-        raw = await deps.github.get_file(repository, row["path"], head_sha)
+        try:
+            raw = await deps.github.get_file(repository, row["path"], head_sha, max_bytes=MAX_SPEC_BYTES)
+        except FileTooLarge:
+            return _done("rejected", "REPAIR_REJECTED",
+                         f"{KIND_LABELS[row['kind']]} — 파일이 커서 자동 복구하지 않았다. 직접 고쳐라",
+                         [{"code": "TOO_LARGE", "path": "", "message": f"{MAX_RAW_CHARS}자까지만 자동 복구한다"}])
         outcome = await repair_intake(row["kind"], raw, context=context, baseline=baseline, llm=deps.repair_llm)
     else:
         if repo is not None:  # 다시 처리하는 행도 같은 판단을 다시 한다 (커밋은 아래에서 이미 만든 것을 쓴다)

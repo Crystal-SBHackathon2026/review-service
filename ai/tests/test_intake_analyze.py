@@ -207,6 +207,16 @@ def test_too_many_sources_keeps_absence_claims_unverified() -> None:
     assert analysis.context.runtime is not None and analysis.context.image is not None
 
 
+def test_unread_large_source_keeps_absence_claims_unverified() -> None:
+    files = sample_files()
+    tree = [*files, "src/huge.js"]
+    read = {p: files[p] for p in files_to_read(tree) if p in files}  # src/huge.js 는 크기 상한으로 읽지 않았다
+    analysis = analyze_repository(BASE, tree, read)
+
+    assert set(analysis.unresolved) == {"/database", "/storage", "/secrets", "/requirements"}
+    assert "큰 파일은 읽지 않는다" in analysis.unresolved["/database"].reason
+
+
 @pytest.mark.parametrize(("extra", "why"), [
     ({"src/main/java/App.java": 'String pw = System.getenv("DB_PASSWORD");'}, "src/main/java/App.java"),
     ({"docker-entrypoint.sh": "exec node src/server.js\n"}, "docker-entrypoint.sh"),

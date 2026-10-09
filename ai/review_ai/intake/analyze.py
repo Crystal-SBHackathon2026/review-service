@@ -465,7 +465,8 @@ def _gap(tree: Sequence[str], expected: Sequence[str], sources: Mapping[str, str
         more = f" 외 {len(unscanned) - 3}개" if len(unscanned) > 3 else ""
         return f"분석하지 않는 파일이 있다({', '.join(unscanned[:3])}{more})"
     if len(sources) < len(expected):
-        return f"소스가 {len(expected)}개라 다 읽지 못했다(최대 {MAX_SOURCE_FILES}개)"
+        why = f"최대 {MAX_SOURCE_FILES}개" if len(expected) > MAX_SOURCE_FILES else "큰 파일은 읽지 않는다"
+        return f"소스 {len(expected)}개 중 {len(sources)}개만 읽었다({why})"
     return None
 
 

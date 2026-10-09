@@ -41,6 +41,13 @@ class SpecNotFound(GitHubError):
     pass
 
 
+class FileTooLarge(GitHubError):
+    """get_file 의 max_bytes 를 넘는 파일 — 끝까지 받지 않고 멈췄다. 다시 해도 같다."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, 413)
+
+
 class RefConflict(GitHubError):
     """ref 갱신이 fast-forward 가 아니다 — 그사이 다른 커밋이 브랜치에 들어갔다."""
 
@@ -77,15 +84,26 @@ class GitHubClient:
 
     # --- 앱 레포: 읽기·CI·PR ---------------------------------------------------------------------
 
-    async def get_file(self, repository: str, path: str, ref: str) -> str:
-        """그 커밋의 파일 원문. GET /repos/{owner}/{repo}/contents/{path}?ref=<sha>"""
-        resp = await self._request("GET", f"/repos/{repository}/contents/{path.lstrip('/')}",
-                                   params={"ref": ref}, headers={"Accept": "application/vnd.github.raw+json"})
-        if resp.status_code == 404:
-            raise SpecNotFound(f"{repository}@{ref} 에 {path} 가 없다", 404)
-        if resp.status_code != 200:
-            raise GitHubError(f"GitHub contents API {resp.status_code}", resp.status_code)
-        return resp.text
+    async def get_file(self, repository: str, path: str, ref: str, *, max_bytes: int | None = None) -> str:
+        """그 커밋의 파일 원문. GET /repos/{owner}/{repo}/contents/{path}?ref=<sha>
+
+        raw 미디어 타입은 100MB 까지 준다. max_bytes 를 주면 그만큼만 받고 넘으면 FileTooLarge (메모리에 다 올리지 않는다)."""
+        url = f"/repos/{repository}/contents/{path.lstrip('/')}"
+        try:
+            async with self._client.stream("GET", url, params={"ref": ref},
+                                           headers={"Accept": "application/vnd.github.raw+json"}) as resp:
+                if resp.status_code == 404:
+                    raise SpecNotFound(f"{repository}@{ref} 에 {path} 가 없다", 404)
+                if resp.status_code != 200:
+                    raise GitHubError(f"GitHub contents API {resp.status_code}", resp.status_code)
+                body = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    body += chunk
+                    if max_bytes is not None and len(body) > max_bytes:
+                        raise FileTooLarge(f"{repository}@{ref} 의 {path} 가 {max_bytes}바이트를 넘는다")
+        except httpx.HTTPError as exc:
+            raise GitHubError(f"GitHub 요청 실패: {type(exc).__name__}") from exc
+        return body.decode("utf-8", errors="replace")
 
     async def list_files(self, repository: str, ref: str) -> list[str]:
         """그 커밋의 모든 파일 경로 — 레포 분석이 읽을 파일을 고른다."""
