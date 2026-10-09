@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
+from review_api import metrics
 from review_api.intake import SpecProblem, load_spec
 from review_common.github import SpecNotFound
 from review_common.repository import RECOVERABLE
@@ -55,6 +56,7 @@ async def recover_stale_reviews(deps: ApiDeps, older_than: timedelta | None = No
     older_than = older_than or stale_after()
     done = []
     while (row := await deps.repo.claim_stale_review(older_than, RECOVERABLE)) is not None:
+        metrics.safe(lambda: metrics.SWEEP_RECOVERED.labels(row["status"]).inc())
         try:
             action = await recover_review(deps, row)
         except Exception:  # 한 행이 실패해도 나머지는 회수한다 — 이 행은 다음 sweep 이 다시 가져간다
@@ -69,7 +71,10 @@ async def recover_stale_reviews(deps: ApiDeps, older_than: timedelta | None = No
 async def recover_review(deps: ApiDeps, row: dict[str, Any]) -> str:
     rid, status = row["review_id"], row["status"]
     if row["recover_count"] > MAX_RECOVERIES:
-        return await _give_up(deps, row, f"멈춘 검토를 {MAX_RECOVERIES}번 회수해도 끝나지 않았다 (마지막 상태 {status})")
+        action = await _give_up(deps, row, f"멈춘 검토를 {MAX_RECOVERIES}번 회수해도 끝나지 않았다 (마지막 상태 {status})")
+        if action == "failed":
+            metrics.safe(metrics.SWEEP_FAILED.inc)
+        return action
     if status == "received":
         return await _republish(deps, row)
     if status == "reviewing":

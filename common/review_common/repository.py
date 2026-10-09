@@ -27,7 +27,9 @@ HEAD_REUSABLE: tuple[str, ...] = ("failed", "superseded")
 RECOVERABLE: tuple[str, ...] = ("received", "reviewing", "merging")
 
 JSON_COLUMNS = frozenset({"spec_ref", "decision", "findings", "rounds", "human_decision", "deploy_result", "final_spec"})
-UPDATABLE = JSON_COLUMNS | {"status", "verdict", "reasons", "merge_sha", "gitops_commit_sha", "error", "superseded_by"}
+STAGE_TIMES = frozenset({"judged_at", "human_decided_at", "merged_at", "gitops_committed_at"})  # 0009, 커밋 타임라인
+UPDATABLE = JSON_COLUMNS | STAGE_TIMES | {"status", "verdict", "reasons", "merge_sha", "gitops_commit_sha", "error",
+                                         "superseded_by"}
 
 INTAKE_JSON_COLUMNS = frozenset({"errors", "details"})
 INTAKE_FIELDS = ("intake_id", "repository", "head_repository", "pr_number", "head_sha", "head_ref", "path", "kind",
@@ -117,6 +119,14 @@ class ReviewRepository(Protocol):
         ...
 
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]: ...
+
+    async def status_counts(self, since: timedelta) -> list[dict[str, Any]]:
+        """updated_at 이 since 안인 검토의 (app, target_env, status) 별 개수 — /metrics 게이지 review_reviews."""
+        ...
+
+    async def needs_human_oldest(self) -> list[dict[str, Any]]:
+        """(app, target_env) 별 가장 오래 기다린 needs_human 검토의 대기 초 (updated_at 기준)."""
+        ...
 
     async def claim_stale_review(self, older_than: timedelta, statuses: Sequence[str]) -> dict[str, Any] | None:
         """status 가 statuses 중 하나이고 updated_at 이 older_than 보다 오래된 검토 하나를 가져간다.
@@ -310,6 +320,16 @@ class PostgresReviewRepository:
         return await self._fetchall(
             "SELECT * FROM reviews WHERE pr_head_sha = %s AND status = 'waiting_ci' ORDER BY created_at", (sha,))
 
+    async def status_counts(self, since: timedelta) -> list[dict[str, Any]]:
+        return await self._fetchall(
+            "SELECT app, target_env, status, count(*) AS count FROM reviews WHERE updated_at > now() - %s"
+            " GROUP BY 1, 2, 3", (since,))
+
+    async def needs_human_oldest(self) -> list[dict[str, Any]]:
+        return await self._fetchall(
+            "SELECT app, target_env, extract(epoch FROM now() - min(updated_at))::float8 AS seconds FROM reviews"
+            " WHERE status = 'needs_human' GROUP BY 1, 2", ())
+
     async def claim_stale_review(self, older_than: timedelta, statuses: Sequence[str]) -> dict[str, Any] | None:
         return await self._fetchone(
             "UPDATE reviews SET recover_count = recover_count + 1, updated_at = now() WHERE review_id = ("
@@ -468,7 +488,8 @@ class InMemoryReviewRepository:
             "status": "received", "verdict": None, "reasons": [], "decision": None, "findings": None,
             "rounds": None, "human_decision": None, "deploy_result": None, "gitops_commit_sha": None,
             "final_spec": None, "error": None, "superseded_by": None, "requested_by": requested_by,
-            "pr_number": pr_number, "recover_count": 0, "created_at": now, "updated_at": now,
+            "pr_number": pr_number, "recover_count": 0, **dict.fromkeys(STAGE_TIMES), "created_at": now,
+            "updated_at": now,
         }
         return review_id
 
@@ -525,6 +546,23 @@ class InMemoryReviewRepository:
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]:
         rows = [r for r in self.reviews.values() if r["pr_head_sha"] == sha and r["status"] == "waiting_ci"]
         return copy.deepcopy(sorted(rows, key=lambda r: r["created_at"]))
+
+    async def status_counts(self, since: timedelta) -> list[dict[str, Any]]:
+        counts: dict[tuple[str, str, str], int] = {}
+        for r in self.reviews.values():
+            if r["updated_at"] > _now() - since:
+                key = (r["app"], r["target_env"], r["status"])
+                counts[key] = counts.get(key, 0) + 1
+        return [{"app": a, "target_env": e, "status": st, "count": n} for (a, e, st), n in counts.items()]
+
+    async def needs_human_oldest(self) -> list[dict[str, Any]]:
+        oldest: dict[tuple[str, str], datetime] = {}
+        for r in self.reviews.values():
+            if r["status"] == "needs_human":
+                key = (r["app"], r["target_env"])
+                oldest[key] = min(oldest.get(key, r["updated_at"]), r["updated_at"])
+        now = _now()
+        return [{"app": a, "target_env": e, "seconds": (now - t).total_seconds()} for (a, e), t in oldest.items()]
 
     async def claim_stale_review(self, older_than: timedelta, statuses: Sequence[str]) -> dict[str, Any] | None:
         now = _now()

@@ -6,6 +6,8 @@ DB 연결 같은 처리 밖 예외는 커밋하지 않고 프로세스를 내린
 livenessProbe: 메인 루프가 poll 할 때마다(메시지가 없어도 1초마다) WORKER_ALIVE_FILE(/tmp/worker-alive) 시각을 갱신한다.
 메시지 하나를 처리하는 동안(judge 재시도로 몇 분)에도 ALIVE_TOUCH_SECONDS 마다 갱신하되, Kafka 가 consumer 를 그룹에서
 빼는 max_poll_interval 을 넘으면 멈춘다 — 그 뒤엔 probe(파일이 2분 넘게 그대로)가 파드를 재시작한다.
+
+지표: METRICS_PORT(기본 9100) 의 /metrics (review_worker.metrics). consumer lag 는 30초마다 워커 안에서 계산한다.
 """
 
 from __future__ import annotations
@@ -14,12 +16,14 @@ import asyncio
 import logging
 import os
 import signal
+import time
 from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, Protocol
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from prometheus_client import start_http_server
 
 from review_ai.judge.llm import CachedLLM, ClaudeLLM, LlmUnavailable
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
@@ -34,6 +38,7 @@ from review_common.settings import db_conninfo, kafka_bootstrap
 from review_worker.commit_overlay import make_commit_overlay, make_overlay_guard
 from review_worker.graph import Deps, build_graph
 from review_worker.handler import ReviewHandler
+from review_worker.metrics import DEFAULT_METRICS_PORT, LAST_HEARTBEAT, MeteredLLM, report_lag, safe
 
 log = logging.getLogger("review_worker")
 GROUP_ID = "review-worker"
@@ -46,7 +51,7 @@ ALIVE_TOUCH_SECONDS = 30.0  # 처리 중 갱신 주기 — probe 기준(2분)보
 
 def make_llm() -> CachedLLM | None:
     try:
-        return CachedLLM(ClaudeLLM(client_options=JUDGE_CLIENT_OPTIONS))
+        return CachedLLM(MeteredLLM(ClaudeLLM(client_options=JUDGE_CLIENT_OPTIONS), purpose="judge"))
     except LlmUnavailable as exc:
         log.warning("LLM 없이 시작 — 판단이 필요한 검토는 LLM_UNAVAILABLE 로 사람에게 간다: %s", exc)
         return None
@@ -61,6 +66,8 @@ class AliveFile:
             self.path.touch()
         except OSError as exc:  # 파일 하나 못 써서 검토를 멈추지 않는다 — probe 가 재시작한다
             log.warning("alive 파일 %s 갱신 실패: %s", self.path, exc)
+            return
+        safe(lambda: LAST_HEARTBEAT.set(time.time()))
 
 
 async def keep_alive_while(alive: AliveFile, work: Awaitable[Any], limit_seconds: float) -> Any:
@@ -94,6 +101,7 @@ async def consume(consumer: Consumer, handler: ReviewHandler, stop: asyncio.Even
 
 
 async def run() -> None:
+    start_http_server(int(os.environ.get("METRICS_PORT") or DEFAULT_METRICS_PORT))
     conninfo = db_conninfo()
     await migrate(conninfo)
     pool = make_pool(conninfo)
@@ -133,7 +141,11 @@ async def run() -> None:
         await consumer.start()
         log.info("review-worker 시작: %s", consumer.subscription())
         alive = AliveFile(os.environ.get("WORKER_ALIVE_FILE") or ALIVE_FILE)
-        await consume(consumer, handler, stop, alive, max_poll_interval_ms / 1000)
+        lag = asyncio.create_task(report_lag(consumer))
+        try:
+            await consume(consumer, handler, stop, alive, max_poll_interval_ms / 1000)
+        finally:
+            lag.cancel()
     finally:
         await consumer.stop()
         await producer.stop()

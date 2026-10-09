@@ -74,6 +74,7 @@ async def test_requested_again_while_waiting_human_goes_back_to_needs_human() ->
     assert (await _state(h))["_next"] == ("wait_human",)
     await h.human(RID, "rejected")
     assert h.row()["status"] == "rejected"
+    assert h.row()["human_decided_at"] >= h.row()["judged_at"]
 
 
 async def test_ci_completed_off_interrupt_rechecks_ci(harness: Harness) -> None:

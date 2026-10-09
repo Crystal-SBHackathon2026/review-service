@@ -25,6 +25,7 @@ from review_ai.messages import ReviewRequested
 from review_common.repository import ReviewRepository, baseline_for
 from review_common.resumed import TOPIC as RESUMED_TOPIC
 from review_common.resumed import CiCompletedResumed, HumanDecisionResumed, RetryOverlayResumed, parse_review_resumed
+from review_worker import metrics
 from review_worker.graph import RECURSION_LIMIT
 from review_worker.observe import RepoFiles, observe_migrations
 
@@ -52,35 +53,46 @@ class ReviewHandler:
         self._files = files
 
     async def handle(self, topic: str, value: bytes) -> None:
+        """지표 review_worker_messages_total{topic,kind,result} — result: processed·skipped·invalid·error."""
+        kind, result = "unknown", "error"
         try:
             if topic == REQUESTED_TOPIC:
-                await self.on_requested(ReviewRequested.model_validate_json(value))
+                kind = "requested"
+                processed = await self.on_requested(ReviewRequested.model_validate_json(value))
             elif topic == RESUMED_TOPIC:
-                await self.on_resumed(parse_review_resumed(value))
+                msg = parse_review_resumed(value)
+                kind = msg.kind
+                processed = await self.on_resumed(msg)
             else:
                 log.warning("모르는 토픽 %s — 건너뜀", topic)
+                processed = False
+            result = "processed" if processed else "skipped"
         except ValidationError as exc:
             log.error("%s 메시지 형식 오류 — 건너뜀: %s", topic, exc)
+            result = "invalid"
+        finally:
+            metrics.safe(lambda: metrics.MESSAGES.labels(topic, kind, result).inc())
 
-    async def on_requested(self, msg: ReviewRequested) -> None:
+    async def on_requested(self, msg: ReviewRequested) -> bool:
+        """처리했으면 True, 건너뛰었으면(claim 실패) False."""
         rid = msg.review_id
         if not await self._repo.claim(rid, from_statuses=["received"], to_status="reviewing"):
             log.info("review %s: 이미 처리 중이거나 끝남 — 건너뜀", rid)
-            return
+            return False
         snapshot = await self._graph.aget_state(_config(rid))
         waiting = pending_interrupt(snapshot)
         if waiting == "human_decision":  # 사람 결정을 받아 재개하다 멈췄다 — 결정은 다시 받는다
             log.info("review %s: 사람 결정 대기로 되돌린다 (회수)", rid)
             await self._repo.claim(rid, from_statuses=["reviewing"], to_status="needs_human")
-            return
+            return True
         if waiting == "ci_completed":  # wait_ci 는 웹훅 결론을 쓰지 않고 GitHub 에서 다시 조회한다
             log.info("review %s: CI 대기에서 이어서 CI 를 다시 확인한다 (회수)", rid)
             await self._run(rid, Command(resume={"head_sha": msg.spec_ref.commit, "conclusion": "unknown"}))
-            return
+            return True
         if snapshot.next:
             log.info("review %s: 체크포인트 %s 에서 이어서 한다 (회수)", rid, snapshot.next)
             await self._run(rid, None)
-            return
+            return True
         spec = dict(msg.deploy_spec)
         row = await self._repo.get_baseline(msg.app, msg.target_env)
         baseline = baseline_for(row)
@@ -92,12 +104,12 @@ class ReviewHandler:
                 spec["observed"] = observed
         await self._run(rid, initial_state(spec, review_id=rid, spec_ref=msg.spec_ref.model_dump(),
                                            autofix_commit=msg.autofix_commit, generated_spec=msg.generated_spec))
+        return True
 
-    async def on_resumed(self, msg: HumanDecisionResumed | CiCompletedResumed | RetryOverlayResumed) -> None:
+    async def on_resumed(self, msg: HumanDecisionResumed | CiCompletedResumed | RetryOverlayResumed) -> bool:
         rid = msg.review_id
         if isinstance(msg, RetryOverlayResumed):
-            await self.on_retry_overlay(rid)
-            return
+            return await self.on_retry_overlay(rid)
         if isinstance(msg, CiCompletedResumed):
             claimed = await self._repo.claim(rid, from_statuses=["waiting_ci"], to_status="merging",
                                              pr_head_sha=msg.ci.head_sha)
@@ -107,7 +119,7 @@ class ReviewHandler:
             value = msg.human_decision.model_dump(mode="json")
         if not claimed:
             log.info("review %s: %s 재개 대상 상태가 아님 — 건너뜀", rid, msg.kind)
-            return
+            return False
         graph_input: Any = Command(resume=value)
         if isinstance(msg, CiCompletedResumed):
             snapshot = await self._graph.aget_state(_config(rid))
@@ -116,23 +128,24 @@ class ReviewHandler:
                 log.info("review %s: CI 대기 지점이 아니다 (%s) — CI 확인부터 다시 한다", rid, snapshot.next)
                 graph_input = Command(goto="await_ci")
             elif waiting != "ci_completed":
-                await self._repo.update_review(rid, status="failed", error=f"CI 재개할 체크포인트가 없다 ({waiting})")
-                return
+                await self._fail(rid, f"CI 재개할 체크포인트가 없다 ({waiting})")
+                return True
         await self._run(rid, graph_input)
+        return True
 
-    async def on_retry_overlay(self, rid: str) -> None:
+    async def on_retry_overlay(self, rid: str) -> bool:
         """병합은 됐는데 gitops 커밋이 없는 검토 — 체크포인트의 State 로 commit_overlay 노드만 다시 돌린다."""
         row = await self._repo.get_review(rid)
         if row is None or row["status"] != "merging" or not row["merge_sha"] or row["gitops_commit_sha"]:
             log.info("review %s: retry_overlay 대상이 아님 — 건너뜀", rid)
-            return
+            return False
         snapshot = await self._graph.aget_state(_config(rid))
         if not snapshot.values:
-            await self._repo.update_review(rid, status="failed",
-                                           error="병합은 됐지만 체크포인트가 없어 gitops 커밋을 다시 할 수 없다")
-            return
+            await self._fail(rid, "병합은 됐지만 체크포인트가 없어 gitops 커밋을 다시 할 수 없다")
+            return True
         log.info("review %s: commit_overlay 다시 (병합 %s)", rid, row["merge_sha"])
         await self._run(rid, Command(goto="commit_overlay"))
+        return True
 
     async def _run(self, review_id: str, graph_input: Any) -> None:
         try:
@@ -145,4 +158,10 @@ class ReviewHandler:
                 # main 에는 이미 병합됐다 — failed 로 끝내면 배포가 영영 안 된다. sweep 이 retry_overlay 를 보낸다
                 await self._repo.update_review(review_id, error=error)
                 return
-            await self._repo.update_review(review_id, status="failed", error=error)
+            await self._fail(review_id, error, row)
+
+    async def _fail(self, review_id: str, error: str, row: dict[str, Any] | None = None) -> None:
+        await self._repo.update_review(review_id, status="failed", error=error)
+        row = row or await self._repo.get_review(review_id)
+        if row:
+            metrics.finished(row["app"], row["target_env"], "failed")
