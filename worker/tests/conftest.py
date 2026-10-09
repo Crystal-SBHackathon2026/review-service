@@ -127,7 +127,7 @@ class Harness:
         self.github.files.setdefault(HEAD, yaml.safe_dump(spec, sort_keys=False))
         if HEAD not in self.github.pulls:
             self.github.open_pr(repository, HEAD)
-        raw = msg.model_dump_json().encode()
+        raw = self.last_requested = msg.model_dump_json().encode()  # 처리 중 예외가 나도 다시 넣을 수 있게
         await self.handler.handle("review.requested", raw)
         return raw
 

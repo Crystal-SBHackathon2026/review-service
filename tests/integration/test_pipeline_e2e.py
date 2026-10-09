@@ -111,7 +111,7 @@ def worker_graph(repo: PostgresReviewRepository, github: FakeGitHub, checkpointe
 async def test_migrate_is_idempotent(conninfo: str) -> None:
     assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql", "0003_pr_number.sql",
                                        "0004_spec_intakes.sql", "0005_review_cases.sql",
-                                       "0006_generated_spec_unverified.sql"]
+                                       "0006_generated_spec_unverified.sql", "0007_review_recovery.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -172,8 +172,10 @@ async def test_repository_on_postgres(pool: Any) -> None:
     assert (await repo.get_review("rv_a"))["superseded_by"] == "rv_2"
     assert (await repo.get_review("rv_b"))["status"] == "committed"
     assert (await repo.get_review("rv_c"))["status"] == "waiting_ci"
-    assert await repo.supersede_open(repository=REPO, pr_number=10, superseded_by=None) == ["rv_c"]  # intake 로 간 커밋
-    assert (await repo.get_review("rv_c"))["superseded_by"] is None
+    assert await repo.supersede_open(repository=REPO, pr_number=10, superseded_by=None,
+                                     error="PR closed") == ["rv_c"]  # 병합 없이 닫힌 PR
+    assert ((await repo.get_review("rv_c"))["superseded_by"], (await repo.get_review("rv_c"))["error"]) == (
+        None, "PR closed")
 
     # 승인 화면 목록: 상태 필터, 최신순, limit, 목록 필드만
     listed = await repo.list_reviews(["committed", "received"], 10)
@@ -181,6 +183,10 @@ async def test_repository_on_postgres(pool: Any) -> None:
     assert set(listed[0]) == set(LIST_FIELDS) and listed[0]["pr_number"] == 9
     assert [r["review_id"] for r in await repo.list_reviews(["committed", "received"], 1)] == ["rv_b"]
     assert [r["review_id"] for r in await repo.list_reviews([], 2)] == ["rv_c", "rv_b"]
+
+    # failed 는 같은 SHA 가 다시 오면 새로 검토한다 — find_by_head 가 찾지 않는다
+    await repo.update_review("rv_b", status="failed")
+    assert await repo.find_by_head(REPO, "2" * 40) is None
 
 
 async def test_spec_intakes_on_postgres(pool: Any) -> None:

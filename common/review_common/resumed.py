@@ -4,6 +4,9 @@
      "human_decision": {"decision": "approved", "approver": "...", "edited_ops": []}, "resumed_at": "..."}
     {"schema_version": "review.resumed/v1", "review_id": "...", "kind": "ci_completed",
      "ci": {"head_sha": "...", "conclusion": "success"}, "resumed_at": "..."}
+    {"schema_version": "review.resumed/v1", "review_id": "...", "kind": "retry_overlay", "resumed_at": "..."}
+
+retry_overlay 는 review sweep 이 보낸다 — PR 은 병합됐는데(merge_sha) gitops 커밋이 없는 검토의 commit_overlay 만 다시 한다.
 
 메시지 키는 review_id.
 """
@@ -74,9 +77,16 @@ class CiCompletedResumed(_Frozen):
     resumed_at: datetime
 
 
-ReviewResumed = Annotated[HumanDecisionResumed | CiCompletedResumed, Field(discriminator="kind")]
+class RetryOverlayResumed(_Frozen):
+    schema_version: Literal["review.resumed/v1"] = "review.resumed/v1"
+    review_id: str = Field(min_length=1)
+    kind: Literal["retry_overlay"] = "retry_overlay"
+    resumed_at: datetime
+
+
+ReviewResumed = Annotated[HumanDecisionResumed | CiCompletedResumed | RetryOverlayResumed, Field(discriminator="kind")]
 REVIEW_RESUMED = TypeAdapter(ReviewResumed)
 
 
-def parse_review_resumed(raw: bytes | str) -> HumanDecisionResumed | CiCompletedResumed:
+def parse_review_resumed(raw: bytes | str) -> HumanDecisionResumed | CiCompletedResumed | RetryOverlayResumed:
     return REVIEW_RESUMED.validate_json(raw)

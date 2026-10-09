@@ -507,6 +507,20 @@ async def test_judge_transient_retries_then_llm_unavailable() -> None:
 
 
 async def test_graph_exception_marks_failed() -> None:
+    async def boom(state: dict[str, Any]) -> str | None:
+        raise RuntimeError("gitops 읽기 실패")
+
+    h = Harness(overlay_guard=boom)
+    await h.request(load_sample(SAMPLE_01))
+    await _finish_ci(h)
+
+    assert h.row()["status"] == "failed"
+    assert "gitops 읽기 실패" in h.row()["error"]
+    assert h.github.merged == []
+
+
+async def test_overlay_exception_after_merge_stays_merging() -> None:
+    """병합 뒤 gitops 커밋 예외 — failed 로 끝내지 않는다. review sweep 이 retry_overlay 로 commit_overlay 만 다시 한다."""
     async def boom(state: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("gitops push 실패")
 
@@ -514,8 +528,9 @@ async def test_graph_exception_marks_failed() -> None:
     await h.request(load_sample(SAMPLE_01))
     await _finish_ci(h)
 
-    assert h.row()["status"] == "failed"
-    assert "gitops push 실패" in h.row()["error"]
+    row = h.row()
+    assert (row["status"], row["merge_sha"], row["gitops_commit_sha"]) == ("merging", MERGE_SHA, None)
+    assert "gitops push 실패" in row["error"]
 
 
 # --- commit_overlay 연결 (성진님 make_commit_overlay + GitClient) ------------------------------------

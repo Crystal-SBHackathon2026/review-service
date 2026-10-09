@@ -14,6 +14,10 @@
 ⏸ 는 LangGraph interrupt. review.resumed 가 오면 같은 thread_id(review_id) 로 Command(resume=...) 재개한다.
 interrupt 노드는 재개 때 처음부터 다시 실행되므로 상태 기록(await_*)과 대기(wait_*)를 다른 노드로 나눴다.
 
+멈춘 검토는 Review API 의 review sweep 이 회수한다 (review_worker.handler). 병합 뒤 gitops 커밋이 실패한 검토는
+review.resumed(retry_overlay) 로 Command(goto="commit_overlay") — commit_overlay 만 다시 한다. 같은 내용이면
+GitHubGitClient 가 새 커밋을 만들지 않으니 두 번 와도 된다.
+
 CI 를 기다리기 전에 이미 끝났는지 먼저 본다 (gitops#9). 검토가 CI 보다 늦게 끝나면 check_suite 웹훅은 이미 지나가 있다.
 check_ci 는 DB 를 waiting_ci 로 바꾼 **뒤에** 조회하므로, 그 뒤에 끝난 CI 는 웹훅이 waiting_ci 검토를 찾아 재개한다.
 CI 결론은 언제나 GitHub check-suites 조회로 정한다 — 웹훅 한 건의 conclusion 으로는 병합하지 않는다 (P1-5).
@@ -321,9 +325,12 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         except GitHubError as exc:  # 그사이 사람이 푸시했다 — 이 수정은 버린다
             await repo.update_review(new_rid, status="failed", error=f"브랜치 갱신 실패: {exc}"[:2000])
             return await _fail(rid, f"commit_fix: {exc}")
-        await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
-        await _verify_status(new_rid, new_ref, "pending", "AI 검토 중 (수정 커밋)")  # 옛 SHA 상태는 그대로 둔다
         await repo.update_review(rid, status="superseded", superseded_by=new_rid)
+        try:
+            await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
+        except Exception as exc:  # noqa: BLE001 — 브랜치는 이미 옮겼다. 새 검토는 received 로 남고 review sweep 이 다시 발행한다
+            log.warning("review %s: 재검토 %s 발행 실패 — review sweep 이 다시 발행한다: %s", rid, new_rid, exc)
+        await _verify_status(new_rid, new_ref, "pending", "AI 검토 중 (수정 커밋)")  # 옛 SHA 상태는 그대로 둔다
         await _record_case(state)
         log.info("review %s: 수정 %d건을 %s 로 커밋 → 재검토 %s", rid, len(ops), new_sha, new_rid)
         return Command(goto=END)

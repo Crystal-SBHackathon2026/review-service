@@ -50,6 +50,7 @@ from review_api.argocd import ArgoCdEvent, handle_deploy_event
 from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spec, open_intake, process_intake,
                                sweep_stale_intakes)
 from review_api.lockfile import regenerate_lockfile
+from review_api.recovery import sweep_stale_reviews
 from review_common.github import GitHubError, SpecNotFound
 from review_common.ids import new_review_id
 from review_common.repository import ReviewDbStatus, ReviewRepository
@@ -477,11 +478,13 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
         repair_llm=make_repair_llm(),
         transform_llm=make_transform_llm(),
     )
-    sweep = asyncio.create_task(sweep_stale_intakes(app.state.deps))
+    sweeps = [asyncio.create_task(sweep_stale_intakes(app.state.deps)),
+              asyncio.create_task(sweep_stale_reviews(app.state.deps))]  # 멈춘 intake·검토 회수
     try:
         yield
     finally:
-        sweep.cancel()
+        for sweep in sweeps:
+            sweep.cancel()
         await producer.stop()
         await github.aclose()
         await pool.close()
