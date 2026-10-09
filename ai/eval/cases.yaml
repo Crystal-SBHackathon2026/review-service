@@ -251,6 +251,23 @@ cases:
     llm: reviewer
     expect: {verdict: needs_human, reasons_include: [IRREVERSIBLE], findings: [DB-001, DB-009], rounds: 0}
 
+  - id: plan-migration-declared-expand-but-sql-drops
+    sample: 04-human-engine-change-with-data.yaml
+    mutate:
+      - {op: replace, path: /database, value: {engine: postgres, version: "16", placement: managed,
+                                               migration: {command: [npm, run, migrate], change: expand}}}
+      - {op: add, path: /observed, value: {schema_change: contract, migrations: [migrations/0002_drop_legacy.sql]}}
+    llm: reviewer
+    expect: {verdict: pass, findings: [RUN-008], rounds: 1, values: {/database/migration/change: contract}}
+  - id: plan-migration-sql-is-breaking
+    sample: 04-human-engine-change-with-data.yaml
+    mutate:
+      - {op: replace, path: /database, value: {engine: postgres, version: "16", placement: managed,
+                                               migration: {command: [npm, run, migrate], change: expand}}}
+      - {op: add, path: /observed, value: {schema_change: breaking, migrations: [migrations/0002_rename.sql]}}
+    llm: reviewer
+    expect: {verdict: needs_human, reasons_include: [AUTOFIX_FORBIDDEN], findings: [RUN-006, RUN-007, RUN-008], rounds: 0}
+
   # ── 엣지케이스: 명세 없음·형식 오류·값 없는 승인 (plan 4-a) ──────────────────────
   - id: e01-missing
     intake: {repo: sample-app, file: missing}

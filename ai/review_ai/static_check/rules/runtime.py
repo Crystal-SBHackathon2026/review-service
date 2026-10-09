@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from review_ai.deploy_plan import mixed_versions_unsafe
+from review_ai.deploy_plan import is_breaking, mixed_versions_unsafe
 from review_ai.static_check.context import CheckContext, Hit
 
 
@@ -37,10 +37,11 @@ def missing_resource_limits(ctx: CheckContext) -> list[Hit]:
 
 def breaking_schema_change(ctx: CheckContext) -> list[Hit]:
     """RUN-006 — 옛 코드와 새 코드가 함께 돌 수 없는 스키마 변경을 한 번에 배포한다."""
-    migration = ctx.spec.database.migration
-    if migration is None or migration.change != "breaking":
+    if not is_breaking(ctx.spec):
         return []
-    return [Hit("/database/migration/change", f"breaking · 명령 {' '.join(migration.command)}")]
+    observed = ctx.spec.observed
+    source = f"새 SQL {', '.join(observed.migrations[:3])}" if observed and observed.schema_change == "breaking" else "선언"
+    return [Hit("/database/migration/change", f"breaking · {source}")]
 
 
 def canary_with_incompatible_versions(ctx: CheckContext) -> list[Hit]:
@@ -52,3 +53,22 @@ def canary_with_incompatible_versions(ctx: CheckContext) -> list[Hit]:
         return []  # 데이터가 있는 엔진 변경은 DB-001 이 사람에게 넘긴다 — 이전 계획을 정할 때 전략도 같이 정한다
     reason = mixed_versions_unsafe(ctx.spec, ctx.previous)
     return [Hit("/rollout/strategy", f"canary · {reason}")] if reason else []
+
+
+def migration_change_mismatch(ctx: CheckContext) -> list[Hit]:
+    """RUN-008 — 새 마이그레이션 SQL 의 실제 변경과 선언(database.migration.change)이 다르다.
+
+    선언이 breaking 이면 가장 보수적이라 맞춘다고 본다. 마이그레이션 명령이 없는데 SQL 이 늘었으면 실행할 Job 이 없다.
+    """
+    observed = ctx.spec.observed
+    if observed is None or observed.schema_change == "none":
+        return []
+    migration = ctx.spec.database.migration
+    files = ", ".join(observed.migrations[:3]) + (" …" if len(observed.migrations) > 3 else "")
+    if migration is None:
+        if ctx.spec.database.engine not in ("postgres", "mysql"):
+            return []  # SQLite 는 앱이 시작할 때 마이그레이션한다
+        return [Hit("/database/migration", f"새 SQL({files}) 이 {observed.schema_change} 인데 실행 명령이 없다")]
+    if migration.change in (observed.schema_change, "breaking"):
+        return []
+    return [Hit("/database/migration/change", f"선언 {migration.change} · SQL {observed.schema_change} ({files})")]

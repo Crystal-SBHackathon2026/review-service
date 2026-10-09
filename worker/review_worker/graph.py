@@ -49,7 +49,7 @@ from review_ai.messages import build_review_requested
 from review_ai.patching import apply_ops
 from review_ai.recommendations import resolve_human_decision
 from review_ai.retrieval import Retriever, make_retrieve_evidence
-from review_ai.spec.deploy_spec import DeploySpec
+from review_ai.spec.deploy_spec import DeploySpec, user_fields
 from review_ai.state import DeployResult, ReviewState
 from review_ai.static_check import make_static_check
 from review_ai.verdict import MAX_PATCH_ROUNDS, applied_ops
@@ -109,8 +109,8 @@ class Deps:
 
 
 def app_spec(spec: dict[str, Any]) -> dict[str, Any]:
-    """baseline 을 뺀 명세 — 업무 DB final_spec 과 다음 배포의 baseline.spec 으로 쓴다."""
-    return {k: v for k, v in spec.items() if k != "baseline"}
+    """파이프라인 필드(baseline·observed)를 뺀 명세 — 업무 DB final_spec 과 다음 배포의 baseline.spec 으로 쓴다."""
+    return user_fields(spec)
 
 
 def ci_conclusion(suites: list[dict[str, Any]], app_slug: str | None) -> str | None:

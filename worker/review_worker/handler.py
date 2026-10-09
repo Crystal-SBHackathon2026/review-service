@@ -19,14 +19,17 @@ from review_common.repository import ReviewRepository, baseline_for
 from review_common.resumed import TOPIC as RESUMED_TOPIC
 from review_common.resumed import CiCompletedResumed, parse_review_resumed
 from review_worker.graph import RECURSION_LIMIT
+from review_worker.observe import RepoFiles, observe_migrations
 
 log = logging.getLogger(__name__)
 
 
 class ReviewHandler:
-    def __init__(self, repo: ReviewRepository, graph: Any) -> None:
+    def __init__(self, repo: ReviewRepository, graph: Any, files: RepoFiles | None = None) -> None:
+        """files 가 있으면 검토 전에 새 마이그레이션 SQL 을 판정해 deploy_spec.observed 에 넣는다(RUN-008)."""
         self._repo = repo
         self._graph = graph
+        self._files = files
 
     async def handle(self, topic: str, value: bytes) -> None:
         try:
@@ -45,9 +48,14 @@ class ReviewHandler:
             log.info("review %s: 이미 처리 중이거나 끝남 — 건너뜀", rid)
             return
         spec = dict(msg.deploy_spec)
-        baseline = baseline_for(await self._repo.get_baseline(msg.app, msg.target_env))
+        row = await self._repo.get_baseline(msg.app, msg.target_env)
+        baseline = baseline_for(row)
         if baseline is not None:
             spec["baseline"] = baseline
+        if self._files is not None:
+            observed = await observe_migrations(self._files, msg.spec_ref.repository, msg.spec_ref.commit, row)
+            if observed is not None:
+                spec["observed"] = observed
         await self._run(rid, initial_state(spec, review_id=rid, spec_ref=msg.spec_ref.model_dump(),
                                            autofix_commit=msg.autofix_commit))
 

@@ -542,6 +542,43 @@
       "title": "Network",
       "type": "object"
     },
+    "Observed": {
+      "additionalProperties": false,
+      "description": "파이프라인이 이번 커밋에서 관측한 사실 — 배포된 커밋 이후 새로 생긴 마이그레이션 SQL 의 판정 (review_ai.migrations).",
+      "properties": {
+        "schema_change": {
+          "enum": [
+            "none",
+            "expand",
+            "contract",
+            "breaking"
+          ],
+          "title": "Schema Change",
+          "type": "string"
+        },
+        "migrations": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Migrations",
+          "type": "array"
+        },
+        "evidence": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_change"
+      ],
+      "title": "Observed",
+      "type": "object"
+    },
     "Requirements": {
       "additionalProperties": false,
       "properties": {
@@ -836,7 +873,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "State.deploy_spec 에 들어가는 전체. baseline 은 파이프라인이 채운다.",
+  "description": "State.deploy_spec 에 들어가는 전체. baseline·observed 는 파이프라인이 채운다.",
   "properties": {
     "api_version": {
       "const": "crystal.review/v1alpha1",
@@ -924,6 +961,17 @@
       "anyOf": [
         {
           "$ref": "#/$defs/Baseline"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "observed": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Observed"
         },
         {
           "type": "null"

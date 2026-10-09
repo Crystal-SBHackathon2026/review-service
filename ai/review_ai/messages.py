@@ -14,7 +14,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from review_ai.masking import mask_spec
-from review_ai.spec.deploy_spec import AppSpec
+from review_ai.spec.deploy_spec import PIPELINE_FIELDS, AppSpec, user_fields
 
 SCHEMA_VERSION = "review.requested/v1"
 TOPIC = "review.requested"
@@ -48,8 +48,8 @@ class ReviewRequested(BaseModel):
 
     @model_validator(mode="after")
     def _safe_payload(self) -> ReviewRequested:
-        if "baseline" in self.deploy_spec:
-            raise ValueError("baseline 은 메시지에 싣지 않는다 — 워커가 처리 시점에 채운다")
+        if pipeline := [k for k in PIPELINE_FIELDS if k in self.deploy_spec]:
+            raise ValueError(f"{', '.join(pipeline)} 은 메시지에 싣지 않는다 — 워커가 처리 시점에 채운다")
         if mask_spec(self.deploy_spec) != self.deploy_spec:
             raise ValueError("deploy_spec 에 가리지 않은 비밀 값이 있다 — mask_spec() 을 거쳐야 한다")
         if spec_sha256(self.deploy_spec) != self.spec_sha256:
@@ -72,7 +72,7 @@ def build_review_requested(
     requested_at: datetime,
     autofix_commit: bool = False,
 ) -> ReviewRequested:
-    body = mask_spec({k: v for k, v in spec.items() if k != "baseline"})
+    body = mask_spec(user_fields(spec))
     return ReviewRequested(
         review_id=review_id,
         repo_id=body["metadata"]["repository"],

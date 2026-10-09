@@ -33,7 +33,7 @@ from review_ai.patching import apply_ops, parse_pointer
 from review_ai.preparation import GenerationContext
 from review_ai.recommendations import resolve_human_decision
 from review_ai.retrieval import Retriever
-from review_ai.spec.deploy_spec import DeploySpec
+from review_ai.spec.deploy_spec import DeploySpec, user_fields
 
 AI_ROOT = Path(__file__).resolve().parent.parent
 EVAL_CASES = AI_ROOT / "eval" / "cases.yaml"
@@ -85,7 +85,7 @@ def build_spec(case: dict[str, Any]) -> dict[str, Any]:
     for op in ops:
         value = op.get("value")
         if isinstance(value, dict) and value.get("spec") == "SELF":
-            value["spec"] = {k: v for k, v in spec.items() if k != "baseline"}
+            value["spec"] = user_fields(spec)
     return apply_ops(spec, ops)
 
 

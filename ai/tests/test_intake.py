@@ -19,7 +19,7 @@ def bare_context(spec: dict) -> GenerationContext:
 
 def same_settings(a: AppSpec, b: AppSpec) -> bool:
     """metadata.commit(자기 커밋)은 생성 파일이 모른다 — 나머지 설정이 같은지."""
-    skip = {"metadata": {"commit"}, "baseline": True}
+    skip = {"metadata": {"commit"}, "baseline": True, "observed": True}
     return a.model_dump(exclude=skip) == b.model_dump(exclude=skip)
 
 

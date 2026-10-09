@@ -27,7 +27,7 @@ from review_ai.judge.validate import overlay_files
 from review_ai.patching import PatchError, apply_ops, parse_pointer
 from review_ai.recommendations import resolve_human_decision
 from review_ai.retrieval import Retriever, make_retrieve_evidence
-from review_ai.spec.deploy_spec import DeploySpec
+from review_ai.spec.deploy_spec import PIPELINE_FIELDS, DeploySpec
 from review_ai.state import Patch, ReviewState
 from review_ai.static_check import make_static_check
 from review_ai.verdict import MAX_PATCH_ROUNDS, applied_ops, round_snapshot
@@ -81,12 +81,13 @@ def check_edited_ops(deploy_spec: dict[str, Any], ops: list[Any]) -> dict[str, A
     """사람이 고친 ops 를 적용한 명세. 경로가 없거나 명세 형식을 깨면 ValueError(PatchError·ValidationError).
 
     승인 API 가 review.resumed 를 보내기 전에 불러 422 로 돌려주면, 워커가 재개 중에 실패하지 않는다.
-    /baseline 은 고칠 수 없다 — 파이프라인이 관측한 사실(데이터 유무 등)이라 바꾸면 DB-001 같은 검사를 우회하고,
+    /baseline·/observed 는 고칠 수 없다 — 파이프라인이 관측한 사실(데이터 유무·마이그레이션 판정)이라 바꾸면 DB-001 같은 검사를 우회하고,
     앱 레포 원본에는 baseline 이 없어 커밋 단계에서 applied_ops 를 적용하지 못한다.
     """
     for op in ops:
-        if parse_pointer(op["path"])[0] == "baseline":
-            raise PatchError(f"baseline 은 사람이 고칠 수 없다 — 파이프라인이 채우는 관측 사실이다: {op['path']}")
+        if parse_pointer(op["path"])[0] in PIPELINE_FIELDS:
+            raise PatchError(f"{parse_pointer(op['path'])[0]} 은 사람이 고칠 수 없다 — 파이프라인이 채우는 관측 사실이다: "
+                             f"{op['path']}")
     edited = apply_ops(deploy_spec, ops)
     DeploySpec.model_validate(edited)
     return edited
