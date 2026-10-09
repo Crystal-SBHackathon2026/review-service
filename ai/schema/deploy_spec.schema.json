@@ -72,6 +72,18 @@
           "default": {
             "strategy": "canary"
           }
+        },
+        "smoke": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Smoke"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "앱 레포에 테스트가 없으면 생성기가 확인 경로를 채운다"
         }
       },
       "required": [
@@ -662,6 +674,26 @@
       "title": "SecretRef",
       "type": "object"
     },
+    "Smoke": {
+      "additionalProperties": false,
+      "description": "배포가 끝난 뒤 클러스터 안에서 Service 로 GET 해 볼 경로. 하나라도 2xx·3xx 가 아니면 동기화가 실패로 끝난다.",
+      "properties": {
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 10,
+          "minItems": 1,
+          "title": "Paths",
+          "type": "array"
+        }
+      },
+      "required": [
+        "paths"
+      ],
+      "title": "Smoke",
+      "type": "object"
+    },
     "Storage": {
       "additionalProperties": false,
       "properties": {
@@ -837,6 +869,18 @@
       "default": {
         "strategy": "canary"
       }
+    },
+    "smoke": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Smoke"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "앱 레포에 테스트가 없으면 생성기가 확인 경로를 채운다"
     },
     "baseline": {
       "anyOf": [

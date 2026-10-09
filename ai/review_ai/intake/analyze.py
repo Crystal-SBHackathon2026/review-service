@@ -13,6 +13,7 @@
 | secrets | 소스가 읽는 환경변수 이름 — 비밀로 보이는 이름이 있으면 어디서 읽을지 몰라 비워 둔다 |
 | storage | Dockerfile VOLUME, 파일 쓰기 호출, 업로드·오브젝트 스토리지 의존성 |
 | requirements | DB 없음 + 저장소 없음일 때만 persistence=false |
+| smoke | 테스트 파일이 하나도 없을 때만 — readiness 경로 + 소스의 헬스·정보성 고정 GET 라우트 (Express·FastAPI·Flask·net/http·gin) |
 """
 
 from __future__ import annotations
@@ -27,7 +28,9 @@ from typing import Any
 
 from review_ai.preparation import GenerationContext
 from review_ai.secrets_pattern import is_secret_name
-from review_ai.spec.deploy_spec import BASE_RESOURCES, Database, Health, Image, Requirements, Runtime, Storage
+from review_ai.spec.deploy_spec import (
+    BASE_RESOURCES, Database, Health, Image, Requirements, Runtime, Smoke, Storage,
+)
 
 MANIFESTS = ("package.json", "requirements.txt", "pyproject.toml", "go.mod")
 SOURCE_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".ts", ".mts", ".py", ".go"})
@@ -104,6 +107,19 @@ IMAGE_PATH = re.compile(r"ghcr\.io(?:/[a-z0-9._-]+){2,}")
 PLATFORM_LINE = re.compile(r"(?:platforms?:|--platform[= ])([^\n]+)")
 LINUX_ARCH = re.compile(r"linux/(amd64|arm64)")
 RUNS_ON = re.compile(r"runs-on:\s*([^\n]+)")
+TEST_DIRS = frozenset({"test", "tests", "__tests__", "spec"})
+# 고정 경로의 GET 라우트만 — :id·{id}·* 처럼 값이 들어가는 경로는 문자 집합에서 빠진다
+_ROUTE_PATH = r"(/[A-Za-z0-9._~/-]*)"
+GET_ROUTES = (
+    re.compile(rf"\b(?:app|router|server)\.get\(\s*['\"`]{_ROUTE_PATH}['\"`]"),  # Express
+    re.compile(rf"@(?:app|router|api)\.get\(\s*['\"]{_ROUTE_PATH}['\"]"),  # FastAPI
+    re.compile(rf"@(?:app|bp|blueprint)\.route\(\s*['\"]{_ROUTE_PATH}['\"]\s*\)"),  # Flask (GET 기본)
+    re.compile(rf"\bHandleFunc\(\s*\"(?:GET\s+)?{_ROUTE_PATH}\""),  # net/http
+    re.compile(rf"\.GET\(\s*\"{_ROUTE_PATH}\""),  # gin·echo
+)
+# 확인용으로 GET 해도 되는 경로 — 로그인·입력이 필요한 업무 경로(/api/todos 등)는 401·400 이라 확인에 쓰지 않는다
+PROBE_LIKE = re.compile(r"(?:^|/)(?:healthz?|livez?|liveness|readyz?|readiness|ping|status|version|info)$")
+MAX_SMOKE_PATHS = 5
 
 
 @dataclass(frozen=True)
@@ -371,6 +387,27 @@ def _secrets(docker: _Docker | None, deps: _Deps, sources: Mapping[str, str], ga
     return (), Finding(path, f"소스 {len(sources)}개", f"읽는 환경변수({read}) 중 비밀로 보이는 이름이 없다", True)
 
 
+def _test_files(tree: Iterable[str]) -> list[str]:
+    return sorted(p for p in tree
+                  if TEST_NAME.search(PurePosixPath(p).name) or TEST_DIRS.intersection(PurePosixPath(p).parts[:-1]))
+
+
+def _smoke(tree: Sequence[str], runtime: Runtime | None, sources: Mapping[str, str]) -> Decision:
+    """테스트가 없는 앱에만 배포 뒤 확인할 경로를 만든다. 테스트가 있으면 그 테스트가 CI 에서 동작을 확인한다."""
+    path = "/smoke"
+    if tests := _test_files(tree):
+        more = f" 외 {len(tests) - 2}개" if len(tests) > 2 else ""
+        return None, Finding(path, ", ".join(tests[:2]) + more, "테스트가 있어 배포 뒤 확인 경로를 만들지 않는다", True)
+    readiness = runtime.health.readiness if runtime else None
+    routes = sorted({m.group(1) for text in sources.values() for pattern in GET_ROUTES for m in pattern.finditer(text)
+                     if PROBE_LIKE.search(m.group(1))})
+    paths = list(dict.fromkeys([*([readiness] if readiness else []), *routes]))[:MAX_SMOKE_PATHS]
+    if not paths:
+        return None, Finding(path, f"소스 {len(sources)}개", "테스트도, 확인할 GET 경로도 찾지 못했다", False)
+    return (Smoke(paths=tuple(paths)),
+            Finding(path, f"소스 {len(sources)}개", f"테스트가 없어 배포 뒤 {', '.join(paths)} 를 확인한다", True))
+
+
 def _requirements(database: Database | None, storage: Storage | None) -> Decision:
     path = "/requirements"
     if database is None or storage is None:
@@ -409,8 +446,9 @@ def analyze_repository(base: GenerationContext, tree: Iterable[str], files: Mapp
     storage, f_storage = _storage(docker, deps, sources, gap)
     secrets, f_secrets = _secrets(docker, deps, sources, gap)
     requirements, f_requirements = _requirements(database, storage)
+    smoke, f_smoke = _smoke(tree, runtime or base.runtime, sources)
     values = {"image": image, "runtime": runtime, "database": database, "storage": storage, "secrets": secrets,
-              "requirements": requirements}
+              "requirements": requirements, "smoke": smoke}
     context = base.model_copy(update={k: v for k, v in values.items() if v is not None and getattr(base, k) is None})
     return RepoAnalysis(context=context,
-                        findings=(f_image, f_runtime, f_requirements, f_database, f_secrets, f_storage))
+                        findings=(f_image, f_runtime, f_requirements, f_database, f_secrets, f_storage, f_smoke))

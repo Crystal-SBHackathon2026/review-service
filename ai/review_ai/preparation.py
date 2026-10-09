@@ -28,7 +28,7 @@ from review_ai.retrieval import Retriever
 from review_ai.secrets_pattern import MASK
 from review_ai.spec.deploy_spec import (
     API_VERSION, BASE_RESOURCES, DNS_LABEL, REPOSITORY, AppSpec, Baseline, Database, DeploySpec, Image,
-    Metadata, Network, Requirements, Rollout, Runtime, SecretRef, Storage, Target,
+    Metadata, Network, Requirements, Rollout, Runtime, SecretRef, Smoke, Storage, Target,
 )
 
 PRESET = "container-http/v1"
@@ -49,6 +49,7 @@ class GenerationContext(BaseModel):
     secrets: tuple[SecretRef, ...] | None = None
     network: Network | None = None
     storage: Storage | None = None
+    smoke: Smoke | None = None
 
 
 @dataclass(frozen=True)
@@ -177,8 +178,11 @@ def prepare_spec(
         }
         verification.extend(Verification(code, f"/{field}", message)
                             for field, (code, message) in checks.items() if getattr(context, field) is None)
+    # 확인 경로는 선택 항목이라 확인 항목(verification)이 아니다 — 근거가 있을 때만 넣는다
+    smoke = context.smoke or (previous.smoke if previous else None)
     spec = AppSpec(api_version=API_VERSION, kind="DeploySpec",
-                   metadata=Metadata(name=name, repository=context.repository), target=context.target, **values)
+                   metadata=Metadata(name=name, repository=context.repository), target=context.target,
+                   smoke=smoke, **values)
     strategy = choose_strategy(spec, previous)
     spec = spec.model_copy(update={"rollout": Rollout(strategy=strategy)})
     recommendations.append(Recommendation("/rollout", "rule", STRATEGY_REASON[strategy]))

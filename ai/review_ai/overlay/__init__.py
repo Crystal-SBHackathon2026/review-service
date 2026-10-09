@@ -15,7 +15,7 @@ from typing import Any
 
 from review_ai.catalog import TargetCaps, load_targets
 from review_ai.overlay.ingress import render_ingress
-from review_ai.overlay.plan import image_replacements, migration_job, preview_service, strategy_ops
+from review_ai.overlay.plan import image_replacements, migration_job, preview_service, smoke_job, strategy_ops
 from review_ai.overlay.warnings import RenderWarning
 from review_ai.overlay.workload import pvc, rollout_ops, secret_name, service_ops
 from review_ai.overlay.yaml_io import dump, dump_with_header
@@ -90,10 +90,10 @@ def render_overlay(spec: AppSpec, *, apps_root: str = "apps") -> RenderedOverlay
     if spec.rollout.strategy == "bluegreen":
         files["service-preview.yaml"] = dump_with_header(preview_service(spec), HEADER)
         resources.append("service-preview.yaml")
-    job = migration_job(spec)
-    if job is not None:
-        files["job-migrate.yaml"] = dump_with_header(job, HEADER)
-        resources.append("job-migrate.yaml")
+    for filename, job in (("job-migrate.yaml", migration_job(spec)), ("job-smoke.yaml", smoke_job(spec))):
+        if job is not None:
+            files[filename] = dump_with_header(job, HEADER)
+            resources.append(filename)
     kustomization: dict[str, Any] = {
         "apiVersion": "kustomize.config.k8s.io/v1beta1",
         "kind": "Kustomization",
