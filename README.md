@@ -52,12 +52,15 @@ docker compose --profile app up -d --build
 | `WORKER_ALIVE_FILE` | 워커 | livenessProbe 가 보는 파일. 기본 `/tmp/worker-alive` |
 | `METRICS_PORT` | 워커 | Prometheus `/metrics` 포트. 기본 `9100` (API 는 `8080/metrics`) |
 | `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기와 명세 생성 커밋(PR 브랜치 Contents 쓰기)·PR 커밋 상태(**Commit statuses 쓰기**, 없으면 표시만 빠진다). 워커는 CI 상태 조회·AI 수정 커밋·PR 병합·gitops overlay 커밋이라 앱 레포·gitops Contents·Pull requests **쓰기** 권한이 필요하다 (`oneaction/gitops-token`) |
-| `GITOPS_REPO` | 워커 | overlay 를 커밋할 gitops 레포. 기본 `Crystal-SBHackathon2026/gitops` |
+| `GITOPS_REPO` | 워커·API | overlay 를 커밋할 gitops 레포. 기본 `Crystal-SBHackathon2026/gitops`. API 는 진행 화면의 gitops 커밋 링크에만 쓴다 |
 | `GITHUB_WEBHOOK_SECRET` | API | `/webhooks/github` HMAC 검증. 없으면 웹훅을 503 으로 거절 |
 | `GITHUB_CI_APP_SLUG` | API·워커 | 이 GitHub App 의 `check_suite` 만 CI 결과로 본다. 기본 `github-actions`, 빈 값이면 전부 |
 | `DEFAULT_TARGET` | API | baseline 이 없는 레포에 명세를 만들 대상 `env/region` (예 `aws/ap-northeast-2`). 없으면 그런 레포는 `NO_TARGET` |
 | `INTAKE_REPOSITORIES` | API | `owner/repo,…` — baseline 이 없어도 `deploy.yaml` 없음을 intake 로 볼 레포(새 앱). 웹훅이 조직 단위라 목록·baseline 에 없는 레포는 예전처럼 skip |
-| `REVIEW_API_PUBLIC_URL` | API | PR 커밋 상태의 링크(`/intakes/{id}`) 앞부분. 없으면 링크 없이 표시 |
+| `REVIEW_API_PUBLIC_URL` | API·워커 | PR 커밋 상태의 링크 앞부분 — `review-service/verify` 는 진행 화면 `/ui/reviews/{id}`, `review-service/intake` 는 `/intakes/{id}`. 없으면 링크 없이 표시 |
+| `DEPLOY_ENVS` | API | 진행 화면의 실제 환경 카드(배포 알림이 오는 환경), 쉼표 구분. 기본 `aws,local` |
+| `PLANNED_ENVS` | API | 진행 화면에 "계획"으로만 보이는 환경. 기본 `gcp`, 빈 값이면 없음 |
+| `APP_URLS` | API | 진행 화면의 앱 주소 JSON `{"sample-app": {"aws": "http://…", "local": "http://…"}}`. http(s) 만 받는다. 없으면 주소 없이 표시 |
 | `ARGOCD_WEBHOOK_TOKEN` | API | `/webhooks/argocd` 의 `Authorization: Bearer <토큰>`. **비어 있으면 503** (fail-closed) |
 | `REVIEW_API_TOKEN` | API | `POST /reviews`·`POST /reviews/{id}/decision` 의 `Authorization: Bearer <토큰>`. **비어 있으면 503** (fail-closed) |
 | `ANTHROPIC_API_KEY` `REVIEW_LLM_MODEL` | 워커·API | 워커: judge LLM. 키가 없으면 판단이 필요한 검토는 `LLM_UNAVAILABLE` 로 사람에게 간다. API: 형식 오류 명세 복구. 키가 없으면 `REPAIR_UNAVAILABLE` |
@@ -109,7 +112,49 @@ docker compose --profile app up -d --build
 | needs_human · rejected · blocked · failed | `failure` + 사유 |
 
 상태 쓰기가 실패해도 검토는 진행한다. 단 병합 직전 `success` 는 3번 시도해도 못 쓰면 병합하지 않고 `failed`.
-토큰에 **Commit statuses: write** 권한이 필요하다.
+토큰에 **Commit statuses: write** 권한이 필요하다. PR 체크 목록의 **Details** 는 진행 화면(`/ui/reviews/{id}`)을 연다.
+
+## 배포 진행 화면 (`/ui/reviews/{id}`, `api/review_api/static/progress.html`)
+
+PR 에서 들어가서 보는 **읽기 전용** 화면이다 (토큰 입력 없음, 승인은 `/ui`). `GET /ui/reviews` 는 최근 검토 20개(superseded 제외) 목록 — PR 링크가 없을 때 데모용 입구.
+
+- `GET /reviews/{id}/progress` 하나만 3초마다 폴링, `final` 이면 30초. 요청한 검토가 superseded 면 `latest_review_id` 로 주소를 바꿔 이어서 본다
+- 단계: 명세 생성(intake 가 있을 때) → AI 검토 → 사람 확인(needs_human 이었을 때) → CI 확인 → 병합 → overlay 커밋 → 배포.
+  `rejected`·`failed`·`blocked` 는 그 단계에서 `failed` 로 멈추고 뒤는 `skipped`. 배포는 실제 환경 중 하나라도 Healthy 면 완료, Degraded 면 실패
+- 단계 시각(`at`)은 아는 것만 — 끝난 단계는 0009 열(`judged_at`·`human_decided_at`·`merged_at`·`gitops_committed_at`), 지금·멈춘 단계는 `updated_at`, 배포는 `deploy_events.received_at`. 0009 전 행과 CI 는 null
+- 환경 카드: 대상 환경(deploy.yaml)은 렌더 결과·gitops 커밋·배포 상태, 다른 실제 환경은 배포 상태만(알림이 없으면 "알림 대기"), 계획 환경은 점선 "계획"
+- **다른 환경 배포 알림** — 검토 한 건은 대상 환경 하나다. aws 검토의 같은 병합을 로컬 Argo CD 가 배포하면 `/webhooks/argocd` 가 env 로는 검토를 못 찾으므로,
+  같은 앱·병합 SHA 검토를 env 와 무관하게 찾아 `deploy_events` 에 그 env 로 남긴다(`{"review_id", "recorded", "cross_env": true}`).
+  baseline 갱신·Degraded 판단 사례는 검토 대상 환경일 때만. 같은 알림 중복 판단은 (검토, env, kind, 이미지 태그)
+
+```jsonc
+// GET /reviews/rv_20261009_53c71e3c/progress (줄임)
+{
+  "review": { /* GET /reviews/{id} 와 같은 필드 + reason_messages */ },
+  "chain": [{"review_id": "rv_…a1", "status": "superseded", "verdict": "pass", "created_at": "…", "autofix": false},
+            {"review_id": "rv_…53c71e3c", "status": "committed", "verdict": "pass", "created_at": "…", "autofix": true}],
+  "latest_review_id": null,          // 요청한 검토가 superseded 면 체인 끝 검토
+  "intake": null,                    // {intake_id, kind, status, reason, result_commit_sha, created_at}
+  "steps": [
+    {"key": "review", "label": "AI 검토", "state": "done", "detail": "판정 pass · 자동 수정 커밋 1회", "at": "…"},
+    {"key": "ci", "label": "CI 확인", "state": "done", "detail": "CI 통과", "at": null},
+    {"key": "merge", "label": "병합", "state": "done", "detail": "병합 3c7ad2e", "at": "…"},
+    {"key": "gitops", "label": "overlay 커밋", "state": "done", "detail": "overlay 커밋 0f94208", "at": "…"},
+    {"key": "deploy", "label": "배포", "state": "done", "detail": "aws Healthy · local 알림 대기", "at": "…"}
+  ],
+  "envs": [
+    {"env": "aws", "is_target": true, "app_url": "http://…",
+     "render": {"status": "committed", "reason": null, "gitops_commit_sha": "0f94208…"},
+     "deploy": {"kind": "healthy", "image_tag": "3c7ad2e", "received_at": "…"}},
+    {"env": "local", "is_target": false, "app_url": "http://…", "deploy": null},
+    {"env": "gcp", "planned": true}
+  ],
+  "links": {"pr": "https://github.com/…/pull/12", "merge_commit": "https://github.com/…/commit/…",
+            "gitops_commit": "https://github.com/Crystal-SBHackathon2026/gitops/commit/…"},
+  "findings": [], "decision": {}, "rounds": [],   // 검토 보고서용 — /reviews/{id} 와 같은 수준
+  "final": true                                   // 화면이 폴링을 30초로 늦춘다
+}
+```
 
 ## 멈춘 검토 회수 (review sweep, `api/review_api/recovery.py`)
 
