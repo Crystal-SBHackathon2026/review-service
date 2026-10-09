@@ -9,9 +9,12 @@ from typing import Any
 
 from review_ai.patching import PatchError, apply_ops, parse_pointer, path_under
 from review_ai.secrets_pattern import MASK
-from review_ai.spec.deploy_spec import DeploySpec
+from review_ai.spec.deploy_spec import BASE_RESOURCES, DeploySpec, Volume
 from review_ai.state import Finding, Patch
 from review_ai.static_check import run_static_check
+
+
+BASE_LIMITS = {"cpu_limit": BASE_RESOURCES.cpu_limit, "memory_limit": BASE_RESOURCES.memory_limit}
 
 
 def _overlaps(a: str, b: str) -> bool:
@@ -30,6 +33,15 @@ def _check_recommended_path(doc: Any, path: str) -> None:
             node = node[int(token)]
         else:
             raise PatchError(f"권장값에 없는 경로: {path}")
+
+
+def _resource_limit_ops(spec: dict[str, Any], before: DeploySpec) -> list[dict[str, Any]]:
+    """비어 있는 상한만 base 값으로 채운다. 원문에 resources 가 없으면 객체째 넣는다 (요청값은 기본값 그대로)."""
+    missing = {field: value for field, value in BASE_LIMITS.items()
+               if getattr(before.runtime.resources, field) is None}
+    if "resources" not in spec["runtime"]:
+        return [{"op": "add", "path": "/runtime/resources", "value": missing}]
+    return [{"op": "add", "path": f"/runtime/resources/{field}", "value": value} for field, value in missing.items()]
 
 
 def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
@@ -51,6 +63,7 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
         before.metadata.name, before.metadata.repository, before.target
     ):
         previous = None
+    removed: list[tuple[str, Volume]] = []
     for finding in findings:
         if finding["finding_id"] in covered:
             continue
@@ -60,9 +73,21 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
         if rule == "DB-003":
             ops = [{"op": "add", "path": "/runtime/replicas", "value": 1}]
             why = "SQLite 파일 공유를 피하도록 replica를 1로 설정"
+        elif rule == "STO-002":
+            ops = [{"op": "add", "path": "/runtime/replicas", "value": 1}]
+            why = "ReadWriteOnce 볼륨을 한 Pod만 쓰도록 replica를 1로 설정"
         elif rule == "STO-003":
             ops = [{"op": "replace", "path": path, "value": False}]
             why = "버킷 공개를 끄고 비공개로 유지"
+        elif rule == "DB-006":
+            ops = [{"op": "replace", "path": path, "value": False}]
+            why = "관리형 DB를 인터넷에 공개하지 않음"
+        elif rule == "SEC-004":
+            ops = [{"op": "remove", "path": path}]
+            why = "쓰이지 않는 runtime.env 항목을 지우고 시크릿 값만 남김"
+        elif rule == "RUN-005":
+            ops = _resource_limit_ops(spec, before)
+            why = "gitops base 와 같은 리소스 상한(250m / 128Mi)을 채움"
         elif rule in {"DB-001", "DB-008"} and previous:
             old, current = previous.database, before.database
             for field in ("engine", "version", "placement", "volume"):
@@ -76,8 +101,17 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
             if old_volume:
                 ops = [{"op": "replace", "path": path, "value": old_volume.size}]
                 source, why = "baseline", "볼륨을 축소하지 않고 이전 승인 명세의 크기를 유지"
+        elif rule == "STO-006" and previous:
+            removed.append((finding["finding_id"], previous.storage.volumes[int(parse_pointer(path)[4])]))
         if ops:
             candidates.append({"finding_ids": [finding["finding_id"]], "source": source, "why": why, "ops": ops})
+    if removed:
+        # 지운 볼륨을 한 op 로 되살린다 — storage·volumes 키가 없어도 되고, 여럿이어도 서로 덮지 않는다
+        storage = spec.get("storage") or {}
+        volumes = [*storage.get("volumes", []), *(v.model_dump(mode="json") for _, v in removed)]
+        candidates.append({"finding_ids": [fid for fid, _ in removed], "source": "baseline",
+                           "why": "데이터를 유지하도록 이전 승인 명세의 볼륨을 되살림",
+                           "ops": [{"op": "add", "path": "/storage", "value": {**storage, "volumes": volumes}}]})
 
     accepted: list[dict[str, Any]] = []
     current_spec = copy.deepcopy(spec)

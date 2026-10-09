@@ -16,3 +16,19 @@ def arch_mismatch(ctx: CheckContext) -> list[Hit]:
     if platforms & ctx.caps.arch:
         return []
     return [Hit("/image/platforms", f"이미지 {sorted(platforms)} · 노드 {sorted(ctx.caps.arch)}")]
+
+
+def missing_liveness(ctx: CheckContext) -> list[Hit]:
+    """RUN-002 — liveness 경로가 없다. 멈춘 프로세스를 kubelet 이 재시작하지 못한다."""
+    if ctx.spec.runtime.health.liveness:
+        return []
+    return [Hit("/runtime/health/liveness", "liveness 없음")]
+
+
+def missing_resource_limits(ctx: CheckContext) -> list[Hit]:
+    """RUN-005 — cpu_limit·memory_limit 중 비어 있는 것이 있다."""
+    resources = ctx.spec.runtime.resources
+    missing = [name for name in ("cpu_limit", "memory_limit") if getattr(resources, name) is None]
+    if not missing:
+        return []
+    return [Hit("/runtime/resources", f"{' · '.join(missing)} 없음")]

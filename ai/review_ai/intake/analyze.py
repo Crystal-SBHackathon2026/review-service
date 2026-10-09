@@ -27,7 +27,7 @@ from typing import Any
 
 from review_ai.preparation import GenerationContext
 from review_ai.secrets_pattern import is_secret_name
-from review_ai.spec.deploy_spec import Database, Health, Image, Requirements, Runtime, Storage
+from review_ai.spec.deploy_spec import BASE_RESOURCES, Database, Health, Image, Requirements, Runtime, Storage
 
 MANIFESTS = ("package.json", "requirements.txt", "pyproject.toml", "go.mod")
 SOURCE_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".ts", ".mts", ".py", ".go"})
@@ -313,9 +313,9 @@ def _runtime(docker: _Docker | None) -> Decision:
     url = LOCAL_URL.search(docker.healthcheck or "")
     if url is None or int(url.group(1) or 80) != port:
         note = "HEALTHCHECK 에 이 포트의 HTTP 경로가 없어 probe 는 비워 둔다"
-        return Runtime(port=port), Finding(path, "Dockerfile", f"EXPOSE {port} — {note}", True)
+        return Runtime(port=port, resources=BASE_RESOURCES), Finding(path, "Dockerfile", f"EXPOSE {port} — {note}", True)
     probe = url.group(2) or "/"
-    return (Runtime(port=port, health=Health(readiness=probe, liveness=probe)),
+    return (Runtime(port=port, health=Health(readiness=probe, liveness=probe), resources=BASE_RESOURCES),
             Finding(path, "Dockerfile", f"EXPOSE {port}, HEALTHCHECK {probe}", True))
 
 

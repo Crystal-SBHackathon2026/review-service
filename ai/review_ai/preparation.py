@@ -26,7 +26,7 @@ from review_ai.patching import apply_ops
 from review_ai.retrieval import Retriever
 from review_ai.secrets_pattern import MASK
 from review_ai.spec.deploy_spec import (
-    API_VERSION, DNS_LABEL, REPOSITORY, AppSpec, Baseline, Database, DeploySpec, Image,
+    API_VERSION, BASE_RESOURCES, DNS_LABEL, REPOSITORY, AppSpec, Baseline, Database, DeploySpec, Image,
     Metadata, Network, Requirements, Runtime, SecretRef, Storage, Target,
 )
 
@@ -141,13 +141,13 @@ def prepare_spec(
     values: dict[str, Any] = {}
     defaults: dict[str, Any] = {
         "image": Image(repository=f"ghcr.io/{context.repository.lower()}", platforms=tuple(sorted(caps.arch))),
-        "runtime": Runtime(port=8080),  # 존재하지 않는 readiness 경로를 만들어 내지 않는다
+        "runtime": Runtime(port=8080, resources=BASE_RESOURCES),  # 존재하지 않는 readiness 경로를 만들어 내지 않는다
         "requirements": Requirements(), "database": Database(), "secrets": (),
         "network": Network(), "storage": Storage(),
     }
     reasons = {
         "image": "GHCR 경로와 대상 아키텍처를 빌드 후보로 제안한다. 실제 이미지 정보를 확인해야 한다",
-        "runtime": "HTTP 시작 프리셋: port 8080, replicas 1, CPU 50m, memory 64Mi. probe 경로는 추측하지 않는다",
+        "runtime": "HTTP 시작 프리셋: port 8080, replicas 1, CPU 50m/상한 250m, memory 64Mi/상한 128Mi. probe 경로는 추측하지 않는다",
         "requirements": "영속성 미선언의 후보값이다. 데이터 보존 불필요를 확인한 사실은 아니다",
         "database": "DB 미선언의 후보값이다. 앱이 DB 를 쓰지 않는다는 관측은 아니다",
         "secrets": "시크릿 값은 생성하거나 추측하지 않는다. 앱이 요구하는 참조를 확인해야 한다",

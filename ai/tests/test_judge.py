@@ -140,6 +140,34 @@ async def test_patch_cannot_fix_by_removing_or_weakening(sample: str, ops: list[
     assert patch is None and validation["patch_scope_ok"] is False
 
 
+async def _shadowed_env_state() -> dict[str, Any]:
+    state = await prepared("01-pass-sample-app-aws.yaml")
+    state["deploy_spec"]["runtime"]["env"]["UPSTREAM_URL"] = "https://old.example.com"
+    state["deploy_spec"]["secrets"] = [{"name": "UPSTREAM_URL", "source": "k8s-secret", "key": "upstream"}]
+    state["findings"] = run_static_check(DeploySpec.model_validate(state["deploy_spec"]))
+    state["retrieved_docs"] = await FileRetriever().search(state["findings"], "aws")
+    return state
+
+
+@pytest.mark.parametrize(
+    ("ops", "ok"),
+    [
+        ([{"op": "remove", "path": "/runtime/env/UPSTREAM_URL"}], True),
+        ([{"op": "replace", "path": "/runtime/env/UPSTREAM_URL", "value_json": '"https://new.example.com"'}], False),
+        ([{"op": "remove", "path": "/runtime/env/UPSTREAM_URL"},
+          {"op": "replace", "path": "/runtime/env/DEPLOY_ENV", "value_json": '"prod"'}], False),
+        ([{"op": "remove", "path": "/runtime/env/UPSTREAM_URL"}, {"op": "remove", "path": "/runtime/env/DEPLOY_ENV"}], False),
+    ],
+    ids=["drop-shadowed", "rewrite-instead-of-drop", "also-changes-other-env", "also-drops-other-env"],
+)
+async def test_sec004_patch_may_only_drop_the_shadowed_env(ops: list[dict[str, Any]], ok: bool) -> None:
+    """'/runtime/env/*' 허용 필드로 다른 env 를 바꾸면 버린다 — env 는 원래 어떤 규칙으로도 못 바꾸는 필드다."""
+    state = await _shadowed_env_state()
+    _, validation, patch = validate_output(_with_patch(state, ops), state["findings"], state["retrieved_docs"],
+                                           state["deploy_spec"])
+    assert (patch is not None, validation["patch_scope_ok"]) == (ok, ok)
+
+
 async def test_whole_object_replace_passes_when_only_allowed_field_changes() -> None:
     state = await prepared("07-fix-public-bucket.yaml")
     ops = [{"op": "replace", "path": "/storage/buckets/0", "value_json":

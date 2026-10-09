@@ -9,7 +9,9 @@ import pytest
 from review_ai.graph import initial_state, route_start, run_graph
 from review_ai.judge.fake_llm import FAKES
 from review_ai.patching import PatchError, apply_ops
-from review_ai.recommendations import resolve_human_decision
+from review_ai.recommendations import build_recommendations, resolve_human_decision
+from review_ai.spec.deploy_spec import DeploySpec
+from review_ai.static_check import run_static_check
 from review_ai.retrieval.file_retriever import FileRetriever
 from tests.conftest import load_sample_dict
 
@@ -226,3 +228,53 @@ async def test_explicit_opt_out_preserves_previous_approval_behavior() -> None:
                                             "use_recommendations": False})
     assert not resolved["edited_ops"]
     assert state == original
+
+
+# ── P1 규칙 권장값: 규칙·baseline 으로 확정할 수 있는 값만 ──────────────────
+
+
+def recommend(spec: dict) -> list[dict]:
+    return build_recommendations(spec, run_static_check(DeploySpec.model_validate(spec)))
+
+
+def test_rule_recommendations_for_p1_rules() -> None:
+    spec = load_sample_dict("01-pass-sample-app-aws.yaml")
+    spec["database"] = {"engine": "postgres", "version": "16", "placement": "managed", "publicly_accessible": True}
+    spec["secrets"] = [{"name": "DATABASE_URL", "source": "aws-secrets-manager", "key": "app/db"}]
+    spec["runtime"]["env"]["DATABASE_URL"] = "postgres://db:5432/app"
+    del spec["runtime"]["resources"]
+
+    ops = {op["path"]: op for rec in recommend(spec) for op in rec["ops"]}
+
+    assert ops["/database/publicly_accessible"]["value"] is False
+    assert ops["/runtime/env/DATABASE_URL"] == {"op": "remove", "path": "/runtime/env/DATABASE_URL"}
+    assert ops["/runtime/resources"]["value"] == {"cpu_limit": "250m", "memory_limit": "128Mi"}  # 원문에 resources 가 없다
+
+
+def test_removed_volumes_are_restored_from_baseline_in_one_candidate() -> None:
+    spec = load_sample_dict("02-pass-local-sqlite.yaml")
+    uploads = {"name": "uploads", "mount_path": "/uploads", "size": "2Gi", "persistent": True, "access_mode": "ReadWriteOnce"}
+    cache = {**uploads, "name": "cache", "mount_path": "/cache"}
+    prev = copy.deepcopy(spec)
+    prev["storage"]["volumes"] += [uploads, cache]
+    spec["baseline"] = {"spec_ref": "prev", "spec": prev}
+
+    [rec] = recommend(spec)
+
+    assert (rec["source"], len(rec["finding_ids"])) == ("baseline", 2)
+    restored = apply_ops(spec, rec["ops"])["storage"]["volumes"]
+    assert [v["name"] for v in restored] == ["data", "uploads", "cache"]
+
+
+async def test_sto006_unanswered_approval_restores_the_volume() -> None:
+    spec = load_sample_dict("02-pass-local-sqlite.yaml")
+    prev = copy.deepcopy(spec)
+    prev["storage"]["volumes"].append({"name": "uploads", "mount_path": "/uploads", "size": "2Gi"})
+    spec["baseline"] = {"spec_ref": "prev", "spec": prev}
+    state = await run_graph(initial_state(spec, review_id="sto006"), llm=FAKES["oracle"](), retriever=FileRetriever())
+    assert (state["status"], state["decision"]["reasons"]) == ("needs_human", ["IRREVERSIBLE"])
+
+    final = await resume(state)
+
+    assert final["status"] == "pass"
+    assert [v["name"] for v in final["deploy_spec"]["storage"]["volumes"]] == ["data", "uploads"]

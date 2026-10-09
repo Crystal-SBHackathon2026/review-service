@@ -110,6 +110,63 @@ cases:
     llm: patch_out_of_scope
     expect: {verdict: needs_human, reasons_include: [PATCH_OUT_OF_SCOPE], rounds: 0}
 
+  # ── P1 규칙: 자동 수정은 게이트를 통과해 끝나고, 사람 확인은 권장값으로 재개된다 ──────────
+  - id: p1-db006-public-managed-db
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: add, path: /database, value: {engine: postgres, version: "16", placement: managed, publicly_accessible: true}}
+      - {op: add, path: /secrets, value: [{name: DATABASE_URL, source: aws-secrets-manager, key: app/db}]}
+    llm: reviewer
+    expect: {verdict: pass, findings: [DB-006, NET-001], rounds: 1, values: {/database/publicly_accessible: false}}
+  - id: p1-sec004-env-and-secret
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: add, path: /runtime/env/UPSTREAM_URL, value: "https://old-upstream.example.com"}
+      - {op: add, path: /secrets, value: [{name: UPSTREAM_URL, source: k8s-secret, key: upstream}]}
+    llm: reviewer
+    expect: {verdict: pass, findings: [NET-001, SEC-004], rounds: 1}
+  - id: p1-sto002-rwo-replicas
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: replace, path: /target, value: {env: gcp, region: asia-northeast3, namespace: sample-app}}
+      - {op: add, path: /storage, value: {volumes: [{name: uploads, mount_path: /uploads, size: 1Gi}]}}
+    llm: reviewer
+    expect: {verdict: pass, findings: [NET-001, STO-002], rounds: 1, values: {/runtime/replicas: 1}}
+  - id: p1-sto006-volume-removed
+    sample: 02-pass-local-sqlite.yaml
+    mutate:
+      - {op: add, path: /baseline, value: {spec_ref: prev, spec: SELF}}
+      - {op: add, path: /baseline/spec/storage/volumes/-, value: {name: uploads, mount_path: /uploads, size: 2Gi}}
+    llm: reviewer
+    expect: {verdict: needs_human, reasons_include: [IRREVERSIBLE], findings: [STO-006], rounds: 0}
+  - id: p1-sto006-no-answer      # 값 없이 승인하면 baseline 의 볼륨이 되살아난다
+    sample: 02-pass-local-sqlite.yaml
+    mutate:
+      - {op: add, path: /baseline, value: {spec_ref: prev, spec: SELF}}
+      - {op: add, path: /baseline/spec/storage/volumes/-, value: {name: uploads, mount_path: /uploads, size: 2Gi}}
+    resume: {edited_ops: []}
+    llm: reviewer
+    expect: {verdict: pass, values: {/storage/volumes/1/name: uploads, /storage/volumes/1/size: 2Gi}}
+  - id: p1-db004-persistence-without-store
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: add, path: /requirements, value: {persistence: true}}
+    llm: reviewer
+    expect: {verdict: needs_human, reasons_include: [AUTOFIX_FORBIDDEN], findings: [DB-004, NET-001], rounds: 0}
+  - id: p1-low-only              # liveness·상한 없음은 low — LLM 없이 pass
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: replace, path: /runtime/health, value: {readiness: /healthz}}
+      - {op: remove, path: /runtime/resources/cpu_limit}
+    llm: reviewer
+    expect: {verdict: pass, findings: [NET-001, RUN-002, RUN-005], llm_calls: 0, rounds: 0}
+  - id: p1-run005-with-fix       # 다른 문제를 고치는 김에 low 인 상한도 base 값으로 채운다
+    sample: 07-fix-public-bucket.yaml
+    mutate:
+      - {op: remove, path: /runtime/resources/memory_limit}
+    llm: reviewer
+    expect: {verdict: pass, findings: [RUN-005, STO-003], rounds: 1, values: {/runtime/resources/memory_limit: 128Mi}}
+
   # ── 엣지케이스: 명세 없음·형식 오류·값 없는 승인 (plan 4-a) ──────────────────────
   - id: e01-missing
     intake: {repo: sample-app, file: missing}
