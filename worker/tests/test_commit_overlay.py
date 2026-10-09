@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 
 import pytest
 import yaml
 
 from review_ai.errors import TransientError
-from review_worker.commit_overlay import commit_message, make_commit_overlay
+from review_common.github import ProtectedFileRemoval
+from review_worker.commit_overlay import PROTECTED_OVERLAY_FILES, commit_message, make_commit_overlay
 
 SAMPLES = Path(__file__).resolve().parents[2] / "ai" / "samples"
 REPO = "Crystal-SBHackathon2026/sample-app"
@@ -27,6 +28,7 @@ class FakeGit:
         self.commits: list[tuple[str, dict[str, str], str]] = []
         self.reads: list[tuple[str, str, str]] = []
         self.existing: list[str] = []  # gitops 에 지금 있는 overlay 파일 (기본: 새 앱)
+        self.existing_at_commit: list[str] | None = None  # 커밋할 때의 목록. 검사 뒤 바뀐 경우를 흉내 낸다
 
     async def list_files(self, directory: str) -> list[str]:
         return list(self.existing)
@@ -37,9 +39,15 @@ class FakeGit:
             raise self.read_error
         return self.raw
 
-    async def commit_files(self, directory: str, files: Mapping[str, str], message: str) -> str:
+    async def commit_files(self, directory: str, files: Mapping[str, str], message: str,
+                           *, protect: Iterable[str] = ()) -> str:
         if self.commit_error:
             raise self.commit_error
+        # 실제 클라이언트처럼 커밋을 만드는 시점의 목록으로 검사한다
+        at_commit = self.existing if self.existing_at_commit is None else self.existing_at_commit
+        removed = [name for name in at_commit if name in set(protect) and name not in files]
+        if removed:
+            raise ProtectedFileRemoval(removed)
         self.commits.append((directory, dict(files), message))
         return "a" * 40
 
@@ -173,3 +181,38 @@ async def test_병합_전_검사는_ingress_삭제만_사유로_돌려준다():
 
     assert await make_overlay_guard(keep)(state()) is None
     assert await make_overlay_guard(drop)(state()) == "OVERLAY_RESOURCE_REMOVED: ingress.yaml"
+
+
+@pytest.mark.asyncio
+async def test_검사_뒤_복원된_ingress_도_지우지_않는다():
+    """충돌 재시도로 main 을 다시 읽는 사이 다른 작성자가 ingress 를 복원한 경우.
+
+    보호 검사를 커밋보다 먼저 한 번만 하면 이 경로로 실제 배포 중인 ingress 가 지워진다.
+    """
+    git = FakeGit("01-pass-sample-app-aws.yaml")
+    git.raw = git.raw.replace("network:\n  ingress: {public: true, tls: false}\n", "")
+    git.existing = []                                  # 검사 시점: 없음 → 통과
+    git.existing_at_commit = ["ingress.yaml"]          # 커밋 시점: 복원돼 있음
+
+    out = await make_commit_overlay(git)(state())
+
+    assert out == {"deploy_result": {"status": "blocked", "commit_sha": None,
+                                     "reason": "OVERLAY_RESOURCE_REMOVED: ingress.yaml"}}
+    assert git.commits == []
+
+
+@pytest.mark.asyncio
+async def test_보호_목록은_커밋에_넘긴다():
+    git = FakeGit("01-pass-sample-app-aws.yaml")
+    git.existing = ["ingress.yaml", "kustomization.yaml"]
+    passed: list[tuple[str, ...]] = []
+
+    async def commit_files(directory, files, message, *, protect=()):
+        passed.append(tuple(protect))
+        return "a" * 40
+
+    git.commit_files = commit_files  # type: ignore[method-assign]
+    out = await make_commit_overlay(git)(state())
+
+    assert out["deploy_result"]["status"] == "committed"
+    assert passed == [PROTECTED_OVERLAY_FILES], "노드가 보호 목록을 넘겨야 클라이언트가 같은 트리에서 검사한다"

@@ -14,7 +14,7 @@ from review_ai.errors import TransientError
 from review_ai.judge.llm import LlmResponse
 from review_ai.messages import ReviewRequested
 from review_ai.verdict import applied_ops
-from review_common.github import GitHubError, RefConflict
+from review_common.github import GitHubError, ProtectedFileRemoval, RefConflict
 from review_worker.graph import build_graph
 from review_worker.handler import ReviewHandler
 from tests.conftest import FIX_SHA, HEAD, MERGE_SHA, Harness, load_sample, suite
@@ -488,10 +488,15 @@ class FakeGitClient:
     async def read_file(self, repository: str, path: str, ref: str) -> str:
         return self.github.files[ref]
 
-    async def commit_files(self, directory: str, files: Any, message: str) -> str:
+    async def commit_files(self, directory: str, files: Any, message: str,
+                           *, protect: Any = ()) -> str:
         if self.fail_times:
             self.fail_times -= 1
             raise TransientError("gitops ref 충돌")
+        # 실제 클라이언트처럼 커밋을 만드는 트리에서 보호 파일 삭제를 막는다
+        removed = [name for name in self.existing if name in set(protect) and name not in files]
+        if removed:
+            raise ProtectedFileRemoval(removed)
         self.commits.append((directory, dict(files), message))
         return "e" * 40
 

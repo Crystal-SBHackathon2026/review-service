@@ -9,7 +9,8 @@ import httpx
 import pytest
 
 from review_ai.errors import TransientError
-from review_common.github import GitHubClient, GitHubGitClient, git_blob_sha
+from review_common.github import (GitHubClient, GitHubGitClient, ProtectedFileRemoval,
+                                  git_blob_sha)
 
 GITOPS = "Crystal-SBHackathon2026/gitops"
 DIR = "apps/sample-app/overlays/aws"
@@ -23,6 +24,7 @@ class FakeGitHubApi:
         self.trees = {"t0": dict(files)}
         self.commits = {"c0": "t0"}
         self.conflicts = 0
+        self.on_conflict_files: dict[str, str] | None = None  # 충돌 뒤 main 이 이렇게 바뀐다
         self.server_errors = 0
         self.created_trees: list[list[dict[str, Any]]] = []
         self.ref_updates = 0
@@ -65,7 +67,11 @@ class FakeGitHubApi:
             if self.conflicts:
                 self.conflicts -= 1
                 self.head = f"other{self.conflicts}"  # 다른 CI 가 먼저 커밋했다
-                self.commits[self.head] = "t0"
+                tree = "t0"
+                if self.on_conflict_files is not None:
+                    tree = f"t_other{self.conflicts}"
+                    self.trees[tree] = dict(self.on_conflict_files)
+                self.commits[self.head] = tree
                 return httpx.Response(422, json={"message": "Update is not a fast forward"})
             self.head = body["sha"]
             return httpx.Response(200, json={})
@@ -145,3 +151,32 @@ async def test_list_files_server_error_is_transient() -> None:
     api.server_errors = 1
     with pytest.raises(TransientError):
         await client(api).list_files(DIR)
+
+
+async def test_protect_blocks_removing_a_file_present_at_head() -> None:
+    api = FakeGitHubApi({f"{DIR}/kustomization.yaml": "old", f"{DIR}/ingress.yaml": "i"})
+    with pytest.raises(ProtectedFileRemoval, match="ingress.yaml") as exc:
+        await client(api).commit_files(DIR, {"kustomization.yaml": "new"}, "msg", protect=["ingress.yaml"])
+
+    assert exc.value.removed == ["ingress.yaml"]
+    assert api.created_trees == [] and api.ref_updates == 0  # 커밋을 만들지도 않는다
+
+
+async def test_protect_is_rechecked_on_each_conflict_retry() -> None:
+    """검사는 통과했지만 충돌 재시도로 다시 읽은 main 에 보호 파일이 복원돼 있는 경우."""
+    api = FakeGitHubApi({f"{DIR}/kustomization.yaml": "old"})
+    api.conflicts = 1
+    api.on_conflict_files = {f"{DIR}/kustomization.yaml": "old", f"{DIR}/ingress.yaml": "restored"}
+
+    with pytest.raises(ProtectedFileRemoval, match="ingress.yaml"):
+        await client(api).commit_files(DIR, {"kustomization.yaml": "new"}, "msg", protect=["ingress.yaml"])
+
+    assert api.ref_updates == 1  # 첫 시도만 ref 를 옮기려 했고, 재시도는 검사에서 막혔다
+    assert files_at_head(api)[f"{DIR}/ingress.yaml"] == "restored"  # 복원된 파일이 남아 있다
+
+
+async def test_protect_allows_removing_unprotected_files() -> None:
+    api = FakeGitHubApi({f"{DIR}/kustomization.yaml": "old", f"{DIR}/pvc-data.yaml": "pvc"})
+    await client(api).commit_files(DIR, {"kustomization.yaml": "new"}, "msg", protect=["ingress.yaml"])
+
+    assert files_at_head(api) == {f"{DIR}/kustomization.yaml": "new"}

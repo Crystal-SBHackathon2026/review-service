@@ -13,7 +13,7 @@ import asyncio
 import hashlib
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -50,6 +50,17 @@ class FileTooLarge(GitHubError):
 
 class RefConflict(GitHubError):
     """ref 갱신이 fast-forward 가 아니다 — 그사이 다른 커밋이 브랜치에 들어갔다."""
+
+
+class ProtectedFileRemoval(RuntimeError):
+    """커밋하면 지금 브랜치에 있는 보호 파일이 지워진다.
+
+    GitHubError 가 아니다 — 재시도 대상이 아니라 막아야 하는 결과다. 부르는 쪽이 blocked 로 처리한다.
+    """
+
+    def __init__(self, removed: Sequence[str]) -> None:
+        self.removed = list(removed)
+        super().__init__(f"보호 파일이 지워진다: {', '.join(self.removed)}")
 
 
 def git_blob_sha(content: str) -> str:
@@ -235,12 +246,19 @@ class GitHubGitClient:
             raise
         return sorted(p[len(prefix):] for p in blobs if p.startswith(prefix) and "/" not in p[len(prefix):])
 
-    async def commit_files(self, directory: str, files: Mapping[str, str], message: str) -> str:
+    async def commit_files(self, directory: str, files: Mapping[str, str], message: str,
+                           *, protect: Iterable[str] = ()) -> str:
+        """protect 에 든 이름이 지워지게 되면 ProtectedFileRemoval 을 올린다.
+
+        검사는 커밋을 만드는 트리와 같은 head 에서 한다. 충돌 재시도는 main 을 다시 읽으므로
+        시도마다 다시 검사한다 — 검사 뒤 다른 작성자가 그 파일을 복원해도 지우지 않는다.
+        """
         directory = directory.strip("/")
+        protected = frozenset(protect)
         try:
             for attempt in range(1, self.max_attempts + 1):
                 try:
-                    return await self._commit_once(directory, files, message)
+                    return await self._commit_once(directory, files, message, protected)
                 except RefConflict:
                     log.info("gitops %s 충돌 %d/%d — main 을 다시 읽는다", self.branch, attempt, self.max_attempts)
                     if attempt < self.max_attempts:
@@ -251,19 +269,24 @@ class GitHubGitClient:
             raise
         raise TransientError(f"gitops {self.branch} ref 충돌이 {self.max_attempts}회 계속됐다")
 
-    async def _commit_once(self, directory: str, files: Mapping[str, str], message: str) -> str:
+    async def _commit_once(self, directory: str, files: Mapping[str, str], message: str,
+                           protected: frozenset[str]) -> str:
         repo = self.gitops_repo
         head = await self._gh.branch_sha(repo, self.branch)
         base_tree = await self._gh.commit_tree_sha(repo, head)
         existing = {p: sha for p, sha in (await self._gh.tree_blobs(repo, base_tree)).items()
                     if p.startswith(directory + "/")}
         wanted = {f"{directory}/{name}": content for name, content in files.items()}
+        removals = [p for p in sorted(existing) if p not in wanted]  # 생성물이라 명세에서 빠진 파일은 지운다
+        # 지울 목록과 같은 head 에서 본다. 지금 배포 중인 보호 파일이 들어 있으면 커밋하지 않는다.
+        blocked = [name for name in (p.removeprefix(directory + "/") for p in removals) if name in protected]
+        if blocked:
+            raise ProtectedFileRemoval(blocked)
         entries: list[dict[str, Any]] = [
             {"path": p, "mode": FILE_MODE, "type": "blob", "content": content}
             for p, content in sorted(wanted.items()) if existing.get(p) != git_blob_sha(content)
         ]
-        entries += [{"path": p, "mode": FILE_MODE, "type": "blob", "sha": None}
-                    for p in sorted(existing) if p not in wanted]  # 생성물이라 명세에서 빠진 파일은 지운다
+        entries += [{"path": p, "mode": FILE_MODE, "type": "blob", "sha": None} for p in removals]
         if not entries:
             return head  # 바뀐 게 없으면 커밋하지 않는다
         tree = await self._gh.create_tree(repo, base_tree, entries)

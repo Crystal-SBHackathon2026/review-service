@@ -23,9 +23,10 @@ from review_ai.patching import apply_ops
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.state import DeployResult, ReviewState
 from review_ai.verdict import applied_ops
+from review_common.github import ProtectedFileRemoval
 
 __all__ = ["GitClient", "make_commit_overlay", "make_overlay_guard", "commit_message", "removed_protected",
-           "PROTECTED_OVERLAY_FILES", "OVERLAY_RESOURCE_REMOVED"]
+           "PROTECTED_OVERLAY_FILES", "OVERLAY_RESOURCE_REMOVED", "ProtectedFileRemoval"]
 
 # 지금 배포에 있는데 렌더 결과에서 사라지면 안 되는 overlay 파일. 사라지면 Argo CD prune 이 실제 리소스를 지운다.
 # 10/09 sample-app#11: network: {} 명세 → ingress.yaml 삭제 → ALB 삭제(10분 장애, 주소 변경). 볼륨(pvc-*) 등은 여기에 더한다.
@@ -45,11 +46,12 @@ class GitClient(Protocol):
         ...
 
     async def commit_files(
-        self, directory: str, files: Mapping[str, str], message: str
+        self, directory: str, files: Mapping[str, str], message: str,
+        *, protect: Iterable[str] = (),
     ) -> str:
         """gitops 레포의 directory 아래를 files 로 맞추고 커밋한다. 커밋 SHA 를 돌려준다.
 
-        구현체가 지켜야 할 것 두 가지.
+        구현체가 지켜야 할 것 세 가지.
 
         1. directory 안에 있지만 files 에 없는 파일은 지운다. overlay 는 생성물이라
            명세에서 볼륨이 빠졌는데 예전 pvc-*.yaml 이 남으면 kustomize 가 없는
@@ -57,6 +59,10 @@ class GitClient(Protocol):
         2. push 가 충돌하면 rebase 해서 다시 시도한다. gitops 에 커밋하는 곳이
            셋이다 — sample-app CI(이미지 태그), review-service CI(이미지 태그),
            그리고 이 노드. 같은 시점에 겹칠 수 있다.
+        3. 1 로 지울 파일에 protect 의 이름이 들어가면 커밋하지 않고
+           ProtectedFileRemoval 을 올린다. **지울 목록을 만든 것과 같은 head 에서
+           검사하고, 2 의 재시도마다 다시 검사한다** — 먼저 검사하고 나중에 커밋하면
+           그사이 다른 작성자가 복원한 파일을 지울 수 있다.
 
         네트워크 오류는 TransientError 로 올린다. 재시도해도 안 되는 충돌도 마찬가지다.
         """
@@ -117,6 +123,9 @@ def make_overlay_guard(git: GitClient) -> Callable[[ReviewState], Awaitable[str 
 
     병합 뒤 commit_overlay 에서야 막으면 앱 레포는 병합됐는데 배포는 안 된 상태가 남는다. 그래서 merge_pr 전에 본다.
     렌더링까지 못 가는 명세(파일 없음·형식 오류)는 여기서 막지 않는다 — commit_overlay 가 같은 사유로 blocked 한다.
+
+    이 검사는 **미리 알려주는 쪽**이다. 여기서 본 뒤 gitops 가 바뀔 수 있으므로 보장은 commit_files 가 한다 —
+    커밋을 만드는 트리에서 보고 충돌 재시도마다 다시 본다.
     """
 
     async def guard(state: ReviewState) -> str | None:
@@ -146,16 +155,17 @@ def make_commit_overlay(
             reason = " / ".join(f"[{w.code}] {w}" for w in rendered.blocking)
             return _blocked(reason)
 
-        # ⑤ 지금 배포 중인 보호 리소스를 지우는 커밋은 하지 않는다. 병합 전에도 보지만, 그 뒤 gitops 가 바뀌었을 수 있다.
-        removed = removed_protected(await git.list_files(rendered.directory), rendered.files)
-        if removed:
-            return _blocked(removed_reason(removed))
-
-        sha = await git.commit_files(
-            rendered.directory,
-            rendered.files,
-            commit_message(spec.metadata.name, spec.target.env, state["spec_ref"]["commit"]),
-        )
+        # ⑤ 지금 배포 중인 보호 리소스를 지우는 커밋은 하지 않는다. 병합 전에도 보지만, 그 뒤 gitops 가 바뀌었을 수 있어
+        #    검사를 커밋에 맡긴다 — 클라이언트가 커밋을 만드는 트리에서 보고, 충돌 재시도마다 다시 본다.
+        try:
+            sha = await git.commit_files(
+                rendered.directory,
+                rendered.files,
+                commit_message(spec.metadata.name, spec.target.env, state["spec_ref"]["commit"]),
+                protect=PROTECTED_OVERLAY_FILES,
+            )
+        except ProtectedFileRemoval as exc:
+            return _blocked(removed_reason(exc.removed))
         return _committed(sha)
 
     return commit_overlay
