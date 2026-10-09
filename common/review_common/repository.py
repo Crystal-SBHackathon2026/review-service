@@ -29,6 +29,7 @@ INTAKE_JSON_COLUMNS = frozenset({"errors", "details"})
 INTAKE_FIELDS = ("intake_id", "repository", "head_repository", "pr_number", "head_sha", "head_ref", "path", "kind",
                  "errors", "requested_by")
 INTAKE_FINISH = frozenset({"status", "reason", "message", "details", "result_commit_sha"})
+GENERATED_KINDS = ("missing", "empty")  # intake 가 명세를 새로 만든 경우. 형식 오류 복구(repaired)는 원문 값을 지킨다
 
 CASE_FIELDS = ("case_id", "review_id", "app", "target_env", "rule_ids", "outcome", "summary", "ops")
 
@@ -137,8 +138,16 @@ class ReviewRepository(Protocol):
         ...
 
     async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
-                          review_id: str | None = None) -> None:
-        """만든 커밋·그 커밋의 검토를 잇는다. None 인 값은 그대로 둔다."""
+                          review_id: str | None = None, baseline_used: bool | None = None) -> None:
+        """만든 커밋·그 커밋의 검토·baseline 으로 만들었는지를 잇는다. None 인 값은 그대로 둔다.
+
+        baseline_used 는 처음 기록한 값을 지킨다 — 다시 처리하는 행은 처음 만든 커밋을 그대로 쓰기 때문이다."""
+        ...
+
+    async def unverified_generation_for_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
+        """그 PR 에 intake 가 baseline 없이 만든 명세(missing·empty) 커밋이 있으면 그 행.
+
+        baseline_used 가 NULL 인 행(0006 전·기록 실패)도 baseline 없이 만든 것으로 본다 — 모르면 사람에게."""
         ...
 
     async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
@@ -307,11 +316,18 @@ class PostgresReviewRepository:
             " WHERE intake_id = %s AND status = 'processing'", (*values, intake_id)) == 1
 
     async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
-                          review_id: str | None = None) -> None:
+                          review_id: str | None = None, baseline_used: bool | None = None) -> None:
         await self._execute(
             "UPDATE spec_intakes SET result_commit_sha = COALESCE(%s, result_commit_sha),"
-            " review_id = COALESCE(%s, review_id), updated_at = now() WHERE intake_id = %s",
-            (result_commit_sha, review_id, intake_id))
+            " review_id = COALESCE(%s, review_id), baseline_used = COALESCE(baseline_used, %s),"
+            " updated_at = now() WHERE intake_id = %s",
+            (result_commit_sha, review_id, baseline_used, intake_id))
+
+    async def unverified_generation_for_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT * FROM spec_intakes WHERE repository = %s AND pr_number = %s AND kind = ANY(%s)"
+            " AND result_commit_sha IS NOT NULL AND baseline_used IS NOT TRUE ORDER BY created_at DESC LIMIT 1",
+            (repository, pr_number, list(GENERATED_KINDS)))
 
     async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
         rows = await self._fetchall(
@@ -441,7 +457,7 @@ class InMemoryReviewRepository:
         now = _now()
         self.intakes[intake["intake_id"]] = {
             **copy.deepcopy(intake), "status": "processing", "reason": None, "message": None, "details": [],
-            "result_commit_sha": None, "review_id": None, "created_at": now, "updated_at": now,
+            "result_commit_sha": None, "review_id": None, "baseline_used": None, "created_at": now, "updated_at": now,
         }
         return True
 
@@ -468,12 +484,19 @@ class InMemoryReviewRepository:
         return True
 
     async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
-                          review_id: str | None = None) -> None:
+                          review_id: str | None = None, baseline_used: bool | None = None) -> None:
         row = self.intakes.get(intake_id)
         if row is None:
             return
-        links = {"result_commit_sha": result_commit_sha, "review_id": review_id}
+        links = {"result_commit_sha": result_commit_sha, "review_id": review_id,
+                 "baseline_used": baseline_used if row["baseline_used"] is None else None}
         row.update({k: v for k, v in links.items() if v is not None}, updated_at=_now())
+
+    async def unverified_generation_for_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
+        return self._latest(r for r in self.intakes.values()
+                            if r["repository"] == repository and r["pr_number"] == pr_number
+                            and r["kind"] in GENERATED_KINDS and r["result_commit_sha"] is not None
+                            and r.get("baseline_used") is not True)
 
     async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
         now = _now()

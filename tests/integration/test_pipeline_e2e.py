@@ -105,7 +105,8 @@ def worker_graph(repo: PostgresReviewRepository, github: FakeGitHub, checkpointe
 
 async def test_migrate_is_idempotent(conninfo: str) -> None:
     assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql", "0003_pr_number.sql",
-                                       "0004_spec_intakes.sql", "0005_review_cases.sql"]
+                                       "0004_spec_intakes.sql", "0005_review_cases.sql",
+                                       "0006_generated_spec_unverified.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -178,8 +179,13 @@ async def test_spec_intakes_on_postgres(pool: Any) -> None:
     assert [r["intake_id"] for r in await repo.claim_stale_intakes(timedelta(0))] == ["in_1"]
     assert not await repo.claim_stale_intakes(timedelta(seconds=30))  # 방금 가져간 행은 다른 곳이 못 가져간다
 
+    assert await repo.unverified_generation_for_pr(REPO, 7) is None  # 아직 커밋 전
     await repo.link_intake("in_1", result_commit_sha="b" * 40)
     assert (await repo.find_intake_by_result_commit(REPO, "b" * 40))["intake_id"] == "in_1"
+    assert (await repo.unverified_generation_for_pr(REPO, 7))["intake_id"] == "in_1"  # baseline_used NULL → 모름
+    await repo.link_intake("in_1", baseline_used=False)
+    assert (await repo.unverified_generation_for_pr(REPO, 7))["baseline_used"] is False
+    assert await repo.unverified_generation_for_pr(REPO, 8) is None
     assert await repo.finish_intake("in_1", status="generated", reason="GENERATED", message="m",
                                     details=[{"path": "/runtime"}], result_commit_sha="b" * 40)
     assert not await repo.finish_intake("in_1", status="failed", reason="ERROR", message="late")
@@ -190,6 +196,12 @@ async def test_spec_intakes_on_postgres(pool: Any) -> None:
     row = await repo.get_intake("in_1")
     assert (row["status"], row["details"], row["review_id"], row["result_commit_sha"]) == (
         "generated", [{"path": "/runtime"}], "rv_g", "b" * 40)
+    await repo.update_review("rv_g", verdict="needs_human", reasons=["GENERATED_SPEC_UNVERIFIED"])  # 0006 CHECK
+    await repo.link_intake("in_1", baseline_used=True)  # 다시 처리해도 처음 만든 커밋을 쓴다 — 처음 값이 남는다
+    assert (await repo.unverified_generation_for_pr(REPO, 7))["baseline_used"] is False
+    await repo.insert_intake(**{**intake, "intake_id": "in_2", "head_sha": "c" * 40, "pr_number": 8})
+    await repo.link_intake("in_2", result_commit_sha="d" * 40, baseline_used=True)
+    assert await repo.unverified_generation_for_pr(REPO, 8) is None
     with pytest.raises(psycopg.errors.CheckViolation):
         await repo.insert_intake(**{**intake, "intake_id": "in_bad", "head_sha": "c" * 40, "kind": "nope"})
 

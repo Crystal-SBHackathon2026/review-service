@@ -49,7 +49,7 @@ class ReviewHandler:
         if baseline is not None:
             spec["baseline"] = baseline
         await self._run(rid, initial_state(spec, review_id=rid, spec_ref=msg.spec_ref.model_dump(),
-                                           autofix_commit=msg.autofix_commit))
+                                           autofix_commit=msg.autofix_commit, generated_spec=msg.generated_spec))
 
     async def on_resumed(self, msg: Any) -> None:
         rid = msg.review_id

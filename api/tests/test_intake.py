@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from review_ai.errors import TransientError
 from review_ai.judge.fake_llm import ScriptedLLM
+from review_ai.messages import ReviewRequested
 from review_ai.secrets_pattern import MASK
 from review_ai.spec.deploy_spec import AppSpec
 from review_api.app import ApiDeps, create_app, make_repair_llm
@@ -172,6 +173,79 @@ async def test_new_app_is_generated_from_repo_analysis(ienv: IntakeEnv) -> None:
     assert spec.image.repository == "ghcr.io/crystal-sbhackathon2026/sample-app"
     assert "레포 분석" in ienv.github.last_message
     assert "- /runtime: Dockerfile — EXPOSE 8080, HEALTHCHECK /healthz" in ienv.github.last_message.splitlines()
+
+
+# --- baseline 없이 만든 명세 → 검토 메시지 generated_spec (pass 여도 needs_human) -------------------------
+
+def _review_generated_commit(ienv: IntakeEnv) -> tuple[dict[str, Any], ReviewRequested]:
+    send_pr(ienv, pr_event("opened"))
+    intake = ienv.only_intake()
+    ienv.put(ienv.github.contents[intake["result_commit_sha"]], sha=intake["result_commit_sha"])
+    body = send_pr(ienv, pr_event("synchronize", sha=intake["result_commit_sha"])).json()
+    [(_, _, value)] = ienv.publisher.sent
+    return body, ReviewRequested.model_validate_json(value)
+
+
+async def test_spec_generated_without_baseline_is_sent_as_generated_spec(ienv: IntakeEnv) -> None:
+    ienv.github.tree = dict(SAMPLE_TREE)
+    body, msg = _review_generated_commit(ienv)
+
+    intake = ienv.only_intake()
+    assert intake["baseline_used"] is False
+    assert (msg.generated_spec, body["generated_spec"]) == (True, intake["intake_id"])
+    assert ienv.client.get(f"/intakes/{intake['intake_id']}").json()["baseline_used"] is False
+
+
+async def test_spec_generated_from_baseline_is_a_plain_review(ienv: IntakeEnv) -> None:
+    await ienv.approve_baseline()
+    body, msg = _review_generated_commit(ienv)
+
+    assert ienv.only_intake()["baseline_used"] is True
+    assert msg.generated_spec is False and "generated_spec" not in body
+
+
+async def test_later_commit_on_generated_pr_is_still_generated_spec(ienv: IntakeEnv) -> None:
+    """생성 커밋 위에 코드만 바꾼 커밋 — 명세는 그대로 레포 분석으로 만든 것이다. 다른 PR 은 상관없다."""
+    ienv.github.tree = dict(SAMPLE_TREE)
+    _review_generated_commit(ienv)
+    generated = ienv.github.contents[ienv.only_intake()["result_commit_sha"]]
+    ienv.publisher.sent.clear()
+    ienv.put(generated, sha=NEW)
+    send_pr(ienv, pr_event("synchronize", sha=NEW))
+    [(_, _, value)] = ienv.publisher.sent
+    assert ReviewRequested.model_validate_json(value).generated_spec is True
+
+    ienv.publisher.sent.clear()
+    ienv.put(generated, sha="d" * 40)
+    send_pr(ienv, pr_event("opened", sha="d" * 40, number=99))
+    [(_, _, value)] = ienv.publisher.sent
+    assert ReviewRequested.model_validate_json(value).generated_spec is False
+
+
+async def test_repaired_spec_is_a_plain_review() -> None:
+    """형식 오류 복구(repaired)는 원문 값을 코드 게이트로 대조한다 — baseline 이 없어도 범위 밖."""
+    ienv = IntakeEnv(repair_llm=repairing_llm())
+    ienv.github.tree = dict(SAMPLE_TREE)
+    ienv.put(BROKEN)
+    send_pr(ienv, pr_event("opened"))
+    intake = ienv.only_intake()
+    assert intake["status"] == "repaired"
+    ienv.put(ienv.github.contents[intake["result_commit_sha"]], sha=intake["result_commit_sha"])
+    send_pr(ienv, pr_event("synchronize", sha=intake["result_commit_sha"]))
+    [(_, _, value)] = ienv.publisher.sent
+    assert ReviewRequested.model_validate_json(value).generated_spec is False
+
+
+async def test_review_detail_explains_generated_spec_reason(ienv: IntakeEnv) -> None:
+    ienv.put(sample_text())
+    review_id = send_pr(ienv, pr_event("opened")).json()["review_id"]
+    await ienv.repo.update_review(review_id, status="needs_human", verdict="needs_human",
+                                  reasons=["GENERATED_SPEC_UNVERIFIED"])
+
+    detail = ienv.client.get(f"/reviews/{review_id}").json()
+    assert detail["reasons"] == ["GENERATED_SPEC_UNVERIFIED"]
+    assert detail["reason_messages"] == {
+        "GENERATED_SPEC_UNVERIFIED": "baseline 없이 생성된 명세 — 공개 범위(network·ingress)·env·replicas 확인 필요"}
 
 
 # --- 배포 대상이 아닌 레포 ---------------------------------------------------------------------------
