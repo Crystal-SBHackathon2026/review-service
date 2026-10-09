@@ -126,8 +126,7 @@ dialog label { display: block; margin: 10px 0 4px; }
     <label for="f-approver">승인자 이름</label>
     <input id="f-approver" name="approver" autocomplete="name" required>
     <label for="f-token">REVIEW_API_TOKEN</label>
-    <input id="f-token" name="token" type="password" autocomplete="off" spellcheck="false"
-           placeholder="비워 두면 지금 토큰 유지">
+    <input id="f-token" name="token" type="password" autocomplete="off" spellcheck="false">
     <p id="settings-msg" class="muted"></p>
     <div class="actions">
       <button type="submit" class="primary" value="save">저장</button>
@@ -216,7 +215,8 @@ dialog label { display: block; margin: 10px 0 4px; }
   function openSettings(message) {
     $("f-approver").value = approver;
     $("f-token").value = "";
-    $("f-token").required = !token;
+    $("f-token").required = !token;  // 저장된 토큰이 없으면 빈 값으로 저장 못 한다
+    $("f-token").placeholder = token ? "비워 두면 지금 토큰 유지" : "REVIEW_API_TOKEN 을 붙여넣으세요";
     $("settings-msg").textContent = message || "";
     if (!$("settings").open) $("settings").showModal();
   }
@@ -459,7 +459,7 @@ dialog label { display: block; margin: 10px 0 4px; }
         el("td"),
       ]));
     }
-    function addRow() {
+    function addRow(focus = true) {
       const tr = el("tr", {"data-kind": "manual"});
       const opSel = el("select", {"aria-label": "op"}, ["replace", "add", "remove"].map((o) => el("option", {value: o, text: o})));
       const path = el("input", {placeholder: "/runtime/env/KEY", "aria-label": "경로"});
@@ -469,7 +469,7 @@ dialog label { display: block; margin: 10px 0 4px; }
                 el("td", {}, [value]), el("td", {}, [el("button", {type: "button", class: "link", text: "빼기",
                                                                     onclick: () => tr.remove()})]));
       editRows.append(tr);
-      path.focus();
+      if (focus) path.focus();
     }
 
     const buttons = [];
@@ -555,6 +555,7 @@ dialog label { display: block; margin: 10px 0 4px; }
     parts.push(el("p", {class: "meta", text: recs.length
       ? "고칠 값만 입력하세요. 비워 둔 칸은 보내지 않고 서버가 권장값으로 채웁니다. 값은 JSON 으로 읽고, 아니면 문자열로 보냅니다."
       : "권장값이 없습니다. 고칠 경로와 값을 직접 추가하세요. 값은 JSON 으로 읽고, 아니면 문자열로 보냅니다."}));
+    parts.push(el("p", {class: "meta", text: "op: add 는 명세에 없는 경로를 새로 넣을 때, replace 는 있는 값을 바꿀 때, remove 는 지울 때."}));
     parts.push(el("div", {class: "table-wrap"}, [el("table", {}, [
       el("thead", {}, [el("tr", {}, ["op", "경로", "권장값", "새 값", ""].map((h) => el("th", {text: h})))]),
       editRows,
@@ -564,12 +565,17 @@ dialog label { display: block; margin: 10px 0 4px; }
       button("값 고쳐서 승인", "primary", () => {
         let ops;
         try { ops = editedOps(); } catch (e) { showMsg(msg, "err", e.message); return; }
-        if (!ops.length) { showMsg(msg, "err", "입력한 값이 없습니다. 권장값 그대로라면 \"권장값으로 진행\"을 누르세요."); return; }
+        if (!ops.length) {
+          showMsg(msg, "err", recs.length ? "입력한 값이 없습니다. 권장값 그대로라면 \"권장값으로 진행\"을 누르세요."
+                                          : "고칠 경로와 값을 \"행 추가\"로 넣으세요");
+          return;
+        }
         send({decision: "approved", edited_ops: ops});
       }),
     ]));
     parts.push(msg);
     box.replaceChildren(...parts);
+    if (!recs.length) addRow(false);  // 권장값이 없으면 직접 넣을 빈 행 하나 — 폴링 중 포커스를 뺏지 않게
   }
 
   function parseValue(text) {
