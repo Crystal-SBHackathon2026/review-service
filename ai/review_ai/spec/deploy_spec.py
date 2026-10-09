@@ -201,6 +201,19 @@ class Rollout(_Frozen):
     strategy: Strategy = "canary"
 
 
+class Smoke(_Frozen):
+    """배포가 끝난 뒤 클러스터 안에서 Service 로 GET 해 볼 경로. 하나라도 2xx·3xx 가 아니면 동기화가 실패로 끝난다."""
+
+    paths: tuple[str, ...] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def _paths(self) -> Smoke:
+        bad = [p for p in self.paths if not re.fullmatch(HTTP_PATH, p)]
+        if bad:
+            raise ValueError(f"smoke.paths 는 / 로 시작하는 경로여야 한다: {bad}")
+        return self
+
+
 class Storage(_Frozen):
     volumes: tuple[Volume, ...] = ()
     buckets: tuple[Bucket, ...] = ()
@@ -221,6 +234,7 @@ class AppSpec(_Frozen):
     network: Network = Network()
     storage: Storage = Storage()
     rollout: Rollout = Rollout()
+    smoke: Smoke | None = Field(default=None, description="앱 레포에 테스트가 없으면 생성기가 확인 경로를 채운다")
 
 
 class BaselineFacts(_Frozen):

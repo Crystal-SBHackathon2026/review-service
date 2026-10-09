@@ -38,6 +38,7 @@ secrets:  [{name, source: aws-secrets-manager|gcp-secret-manager|k8s-secret|gene
 network:  {ingress: {public, tls, host, allowed_cidrs} | null}
 storage:  {volumes: [{name, mount_path, size, persistent, access_mode}], buckets: [{name, public, versioning, encryption}]}
 rollout:  {strategy: canary|bluegreen}         # 생략하면 canary
+smoke:    {paths: [/healthz, ..]} | null        # 배포 뒤 클러스터 안에서 GET 할 경로 (최대 10)
 baseline: {spec_ref, spec: <이전 명세>, facts: {database_has_data, observed_at}} | null   # 파이프라인이 채움
 ```
 
@@ -69,6 +70,9 @@ baseline: {spec_ref, spec: <이전 명세>, facts: {database_has_data, observed_
 - 마이그레이션 Job 은 앱과 같은 이미지로 돈다 — kustomize `replacements` 가 Rollout 컨테이너 이미지(CI 가 태그를 쓴 값)를 복사한다.
   재시도 없음(`backoffLimit: 0`), 5분 제한, env·시크릿은 앱 컨테이너와 같다.
 - 생성 명세(prepare_spec)도 같은 함수(`choose_strategy`)로 전략을 고른다.
+- `smoke` 가 있으면 PostSync Job(`curlimages/curl`)이 Rollout 이 Healthy 가 된 뒤 `http://<앱>:80<경로>` 를 GET 한다.
+  경로마다 5번까지 다시 시도하고, 하나라도 실패하면 동기화가 실패로 끝나 Argo CD 알림(on-sync-failed)으로 이어진다.
+  레포 분석은 **테스트 파일이 하나도 없을 때만** readiness 경로 + 소스의 고정 GET 라우트로 이 값을 채운다.
 
 ### 비밀 값은 명세에 넣지 않는다
 
