@@ -466,7 +466,7 @@ def pr_event(action: str = "opened", sha: str = HEAD, number: int = 5, base: str
              head_repo: str = REPO) -> dict[str, Any]:
     return {"action": action, "number": number, "sender": {"login": "octo-dev"},
             "repository": {"full_name": REPO, "default_branch": "main"},
-            "pull_request": {"number": number, "base": {"ref": base},
+            "pull_request": {"number": number, "base": {"ref": base, "repo": {"full_name": REPO}},
                              "head": {"sha": sha, "ref": "feature", "repo": {"full_name": head_repo}}}}
 
 
@@ -550,3 +550,18 @@ def test_pr_webhook_bad_signature_is_401(env: Env) -> None:
     resp = env.client.post("/webhooks/github", content=raw,
                            headers={"X-GitHub-Event": "pull_request", "X-Hub-Signature-256": "sha256=00"})
     assert resp.status_code == 401
+
+
+
+# --- 포크 PR (P0-2) ------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("head_repo", ["someone/sample-app", None])
+def test_fork_pr_is_skipped(env: Env, head_repo: str | None) -> None:
+    """포크(다른 레포)이거나 head 레포가 없으면(포크가 지워짐) 검토도 intake 도 하지 않는다."""
+    env.put_spec(sample_text())
+    body = pr_event("opened")
+    body["pull_request"]["head"]["repo"] = {"full_name": head_repo} if head_repo else None
+    resp = send_pr(env, body)
+
+    assert (resp.status_code, resp.json()) == (202, {"skipped": "fork"})
+    assert env.repo.reviews == {} and env.publisher.sent == []

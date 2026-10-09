@@ -378,11 +378,12 @@ def test_repair_llm_finishes_before_stale_sweep(monkeypatch: pytest.MonkeyPatch)
 
 
 async def test_fork_pr_is_not_committed(ienv: IntakeEnv) -> None:
+    """포크 PR 은 웹훅에서 바로 건너뛴다 — intake 도 열지 않는다 (예전엔 intake 를 열고 FORK_PR 로 거절했다)."""
     await ienv.approve_baseline()
-    send_pr(ienv, pr_event("opened", head_repo="someone/sample-app"))
+    resp = send_pr(ienv, pr_event("opened", head_repo="someone/sample-app"))
 
-    assert (ienv.only_intake()["status"], ienv.only_intake()["reason"]) == ("rejected", "FORK_PR")
-    assert ienv.github.parents == {}
+    assert resp.json() == {"skipped": "fork"}
+    assert ienv.repo.intakes == {} and ienv.github.parents == {}
 
 
 async def test_intake_commit_needing_intake_again_stops(ienv: IntakeEnv) -> None:

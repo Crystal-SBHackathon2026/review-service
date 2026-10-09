@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
+
 import yaml
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -727,3 +729,18 @@ async def test_commit_overlay_checks_again_after_merge() -> None:
     row = h.row()
     assert (row["status"], row["deploy_result"]["reason"]) == ("blocked", "OVERLAY_RESOURCE_REMOVED: ingress.yaml")
     assert git.commits == []
+
+
+# --- 포크 PR 은 병합하지 않는다 (P0-2) -------------------------------------------------------------------
+
+@pytest.mark.parametrize("head_repo", ["someone/fork", None])
+async def test_fork_pr_reaching_merge_is_not_merged(harness: Harness, head_repo: str | None) -> None:
+    """웹훅에서 막지만, 포크 PR 이 merge_pr 까지 와도 병합 API 를 부르지 않는다."""
+    harness.github.open_pr("Crystal-SBHackathon2026/sample-app", HEAD)
+    harness.github.pulls[HEAD][0]["head"]["repo"] = {"full_name": head_repo} if head_repo else None
+    await harness.request(load_sample(SAMPLE_01))
+    await _finish_ci(harness)
+
+    row = harness.row()
+    assert row["status"] == "failed" and "fork PR" in row["error"]
+    assert harness.github.merged == []

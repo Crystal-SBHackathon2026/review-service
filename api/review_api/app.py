@@ -259,6 +259,13 @@ async def submit_review(deps: ApiDeps, loaded: dict[str, Any], spec_ref: dict[st
     return review_id
 
 
+def is_fork(pull_request: dict[str, Any]) -> bool:
+    """head 가 base 와 다른 레포(포크)이거나 head 레포가 없으면(포크가 지워짐) True."""
+    head_repo = (pull_request.get("head") or {}).get("repo")
+    base_repo = (pull_request.get("base") or {}).get("repo") or {}
+    return head_repo is None or head_repo.get("full_name") != base_repo.get("full_name")
+
+
 PR_ACTIONS = frozenset({"opened", "synchronize", "reopened"})
 
 
@@ -273,6 +280,7 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
     - 그 PR 에 intake 가 baseline 없이 만든 명세 커밋이 있으면 generated_spec 으로 보낸다 → pass 여도 needs_human.
       생성 커밋 위에 커밋이 더 올라와도 같다(명세는 여전히 레포 분석으로 만든 것). 판단 근거는 spec_intakes 기록뿐이다 —
       명세 파일 내용·커밋 메시지·PR 작성자처럼 PR 을 올린 사람이 바꿀 수 있는 표시는 보지 않는다
+    - 포크 PR 은 {"skipped": "fork"} — 검토·intake 모두 하지 않는다
     """
     action = payload.get("action")
     if action not in PR_ACTIONS:
@@ -280,6 +288,8 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
     pr, repo = payload["pull_request"], payload["repository"]
     if pr["base"]["ref"] != repo["default_branch"]:
         return {"ignored": f"base {pr['base']['ref']}"}
+    if is_fork(pr):  # 포크 브랜치는 쓸 수도(수정 커밋) 믿을 수도 없다 — 검토도 intake 도 하지 않는다
+        return {"skipped": "fork"}
     repository, head_sha, number = repo["full_name"], pr["head"]["sha"], pr["number"]
     existing = await deps.repo.find_by_head(repository, head_sha)
     if existing is not None:

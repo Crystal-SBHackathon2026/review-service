@@ -118,6 +118,12 @@ class Deps:
     retry_backoff_seconds: float = 1.0
 
 
+def is_fork_pull(pull: dict[str, Any], repository: str) -> bool:
+    """PR head 가 이 레포가 아니거나(포크) head 레포가 없으면(포크가 지워짐) True."""
+    head_repo = (pull.get("head") or {}).get("repo")
+    return head_repo is None or head_repo.get("full_name") != repository
+
+
 def app_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """파이프라인 필드(baseline·observed)를 뺀 명세 — 업무 DB final_spec 과 다음 배포의 baseline.spec 으로 쓴다."""
     return user_fields(spec)
@@ -259,7 +265,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         ops = applied_ops(state)
         try:
             pull = await _open_pull(ref)
-            if (pull["head"].get("repo") or {}).get("full_name", repository) != repository:
+            if is_fork_pull(pull, repository):
                 raise GitHubError(f"PR #{pull['number']} 은 포크 브랜치라 자동 커밋할 수 없다")
             raw = await _retry("deploy.yaml 읽기", lambda: github.get_file(repository, path, parent))
             fixed = apply_ops(yaml.safe_load(raw), ops)  # 원본(가리지 않은 값)에 적용. ops 는 env·시크릿을 건드리지 못한다
@@ -354,7 +360,9 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         rid, ref = state["review_id"], state["spec_ref"]
         await repo.update_review(rid, status="merging")
         try:
-            pull = await _open_pull(ref)
+            pull = await _open_pull(ref)  # 병합 직전에 PR 을 다시 읽는다
+            if is_fork_pull(pull, ref["repository"]):
+                raise GitHubError(f"fork PR — PR #{pull['number']} 은 포크 브랜치라 병합하지 않는다")
             merge_sha = await github.merge_pull(ref["repository"], pull["number"], head_sha=ref["commit"])
         except GitHubError as exc:
             return await _fail(rid, f"merge_pr: {exc}")
