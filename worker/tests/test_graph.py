@@ -914,4 +914,4 @@ async def test_status_links_to_review_when_public_url_set() -> None:
     h.github.create_commit_status = record  # type: ignore[method-assign]
     await h.request(load_sample(SAMPLE_01))
 
-    assert seen == [f"http://alb.example/reviews/{RID}"]
+    assert seen == [f"http://alb.example/ui/reviews/{RID}"]
