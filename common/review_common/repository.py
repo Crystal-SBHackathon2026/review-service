@@ -21,6 +21,8 @@ ReviewDbStatus = Literal[
 ]
 FINISHED: frozenset[str] = frozenset({"committed", "blocked", "rejected", "failed", "superseded"})
 OPEN: tuple[str, ...] = ("received", "reviewing", "needs_human", "waiting_ci")  # 새 커밋이 오면 superseded 로 넘길 상태
+# 0008 부분 unique 인덱스에서 빠지는 상태 — 같은 레포·head SHA 라도 새 검토를 넣을 수 있다
+HEAD_REUSABLE: tuple[str, ...] = ("failed", "superseded")
 # review sweep 이 회수하는 상태 — 워커가 처리 중이어야 하는 상태. needs_human·waiting_ci 는 사람·CI 를 기다린다
 RECOVERABLE: tuple[str, ...] = ("received", "reviewing", "merging")
 
@@ -79,7 +81,10 @@ def baseline_for(row: dict[str, Any] | None) -> dict[str, Any] | None:
 class ReviewRepository(Protocol):
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
-                            pr_number: int | None = None) -> None: ...
+                            pr_number: int | None = None) -> str:
+        """received 로 넣고 review_id 를 돌려준다. 같은 repo_id·pr_head_sha 의 검토(failed·superseded 빼고)가
+        이미 있으면 넣지 않고 그 review_id 를 돌려준다 — 같은 웹훅이 동시에 와도 검토는 하나."""
+        ...
 
     async def get_review(self, review_id: str) -> dict[str, Any] | None: ...
 
@@ -235,12 +240,21 @@ class PostgresReviewRepository:
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
-                            pr_number: int | None = None) -> None:
-        await self._execute(
-            "INSERT INTO reviews (review_id, app, target_env, repo_id, spec_ref, pr_head_sha, requested_by,"
-            " pr_number, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'received')",
-            (review_id, app, target_env, repo_id, Jsonb(spec_ref), pr_head_sha, requested_by, pr_number),
-        )
+                            pr_number: int | None = None) -> str:
+        for _ in range(3):  # 겹친 행이 그사이 failed·superseded 가 되면 다시 넣는다
+            row = await self._fetchone(
+                "INSERT INTO reviews (review_id, app, target_env, repo_id, spec_ref, pr_head_sha, requested_by,"
+                " pr_number, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'received')"
+                " ON CONFLICT (repo_id, pr_head_sha) WHERE status NOT IN ('failed', 'superseded') DO NOTHING"
+                " RETURNING review_id",
+                (review_id, app, target_env, repo_id, Jsonb(spec_ref), pr_head_sha, requested_by, pr_number))
+            if row is None:
+                row = await self._fetchone(
+                    "SELECT review_id FROM reviews WHERE repo_id = %s AND pr_head_sha = %s AND NOT status = ANY(%s)",
+                    (repo_id, pr_head_sha, list(HEAD_REUSABLE)))
+            if row is not None:
+                return row["review_id"]
+        raise RuntimeError(f"검토를 넣지 못했다: {repo_id}@{pr_head_sha}")
 
     async def get_review(self, review_id: str) -> dict[str, Any] | None:
         return await self._fetchone("SELECT * FROM reviews WHERE review_id = %s", (review_id,))
@@ -441,9 +455,12 @@ class InMemoryReviewRepository:
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
-                            pr_number: int | None = None) -> None:
+                            pr_number: int | None = None) -> str:
         if review_id in self.reviews:
             raise ValueError(f"review_id 중복: {review_id}")
+        for r in self.reviews.values():
+            if r["repo_id"] == repo_id and r["pr_head_sha"] == pr_head_sha and r["status"] not in HEAD_REUSABLE:
+                return r["review_id"]
         now = _now()
         self.reviews[review_id] = {
             "review_id": review_id, "app": app, "target_env": target_env, "repo_id": repo_id,
@@ -453,6 +470,7 @@ class InMemoryReviewRepository:
             "final_spec": None, "error": None, "superseded_by": None, "requested_by": requested_by,
             "pr_number": pr_number, "recover_count": 0, "created_at": now, "updated_at": now,
         }
+        return review_id
 
     async def get_review(self, review_id: str) -> dict[str, Any] | None:
         row = self.reviews.get(review_id)

@@ -298,14 +298,19 @@ async def start_review(deps: ApiDeps, spec_ref: dict[str, str], requested_by: st
 
 async def submit_review(deps: ApiDeps, loaded: dict[str, Any], spec_ref: dict[str, str], requested_by: str, *,
                         pr_number: int | None = None, generated_spec: bool = False) -> str:
-    """review_id 발급 → DB received → review.requested 발행. review_id 반환."""
+    """review_id 발급 → DB received → review.requested 발행. review_id 반환.
+
+    같은 레포·head SHA 검토가 이미 있으면(동시에 온 같은 웹훅) 새로 발행하지 않고 그 review_id 를 돌려준다."""
     commit = spec_ref["commit"]
     review_id = new_review_id()
     message = build_review_requested(loaded, review_id=review_id, spec_ref=spec_ref, requested_by=requested_by,
                                      requested_at=datetime.now(UTC), generated_spec=generated_spec)
-    await deps.repo.insert_review(review_id=review_id, app=message.app, target_env=message.target_env,
-                                  repo_id=message.repo_id, spec_ref=spec_ref, pr_head_sha=commit,
-                                  requested_by=requested_by, pr_number=pr_number)
+    stored = await deps.repo.insert_review(review_id=review_id, app=message.app, target_env=message.target_env,
+                                           repo_id=message.repo_id, spec_ref=spec_ref, pr_head_sha=commit,
+                                           requested_by=requested_by, pr_number=pr_number)
+    if stored != review_id:
+        log.info("%s@%s: 검토 %s 가 이미 있다 — 새로 발행하지 않는다", message.repo_id, commit, stored)
+        return stored
     try:
         await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
     except Exception as exc:

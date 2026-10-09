@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 from fastapi.testclient import TestClient
@@ -233,10 +234,10 @@ async def _listed(env: Env, statuses: list[str]) -> list[str]:
     """statuses 순서대로 검토를 만든다. created_at 은 한 시간씩 뒤 — 마지막이 가장 최근."""
     ids = []
     for i, status in enumerate(statuses):
-        rid = f"rv_20261009_{i:08x}"
+        rid, sha = f"rv_20261009_{i:08x}", f"{i:x}" * 40  # 같은 SHA 검토는 하나뿐이다 (0008)
         await env.repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=REPO,
-                                     spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
-                                     pr_head_sha=HEAD, requested_by="hyeyeon", pr_number=5)
+                                     spec_ref={"repository": REPO, "commit": sha, "path": "deploy.yaml"},
+                                     pr_head_sha=sha, requested_by="hyeyeon", pr_number=5)
         env.repo.reviews[rid]["created_at"] = datetime(2026, 10, 9, i, tzinfo=UTC)
         await env.set_status(rid, status=status)
         ids.append(rid)
@@ -614,6 +615,38 @@ def test_same_sha_twice_makes_one_review(env: Env) -> None:
 
     assert second == {"skipped": "already reviewed", "review_id": first}
     assert len(env.repo.reviews) == 1 and len(env.publisher.sent) == 1
+
+
+async def test_same_webhook_twice_at_once_makes_one_review(env: Env) -> None:
+    """P2 — 같은 웹훅 두 개가 동시에 와서 둘 다 find_by_head 를 지나도 검토는 하나, 발행도 한 번."""
+    env.put_spec(sample_text())
+    both_fetching = asyncio.Barrier(2)
+    get_file = env.specs.get_file
+
+    async def slow_get_file(repository: str, path: str, ref: str) -> str:
+        await both_fetching.wait()  # 둘 다 find_by_head 를 지난 뒤에 넣는다
+        return await get_file(repository, path, ref)
+
+    env.specs.get_file = slow_get_file  # type: ignore[method-assign]
+    raw, sig = signed(pr_event("opened"))
+    headers = {"X-GitHub-Event": "pull_request", "X-Hub-Signature-256": sig}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=env.app), base_url="http://api") as client:
+        a, b = await asyncio.gather(client.post("/webhooks/github", content=raw, headers=headers),
+                                    client.post("/webhooks/github", content=raw, headers=headers))
+
+    assert a.status_code == b.status_code == 202
+    assert a.json()["review_id"] == b.json()["review_id"]
+    assert len(env.repo.reviews) == 1 and len(env.publisher.sent) == 1
+
+
+async def test_same_sha_after_failed_review_is_reviewed_again(env: Env) -> None:
+    env.put_spec(sample_text())
+    first = env.request_review().json()["review_id"]
+    await env.set_status(first, status="failed")
+
+    second = env.request_review().json()["review_id"]
+
+    assert second != first and len(env.publisher.sent) == 2
 
 
 async def test_synchronize_supersedes_open_reviews_of_same_pr(env: Env) -> None:

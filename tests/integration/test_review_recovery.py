@@ -335,3 +335,37 @@ async def test_two_pods_sweeping_at_once_publish_each_review_once(stack: Stack) 
     assert sorted(json.loads(v)["review_id"] for _, _, v in stack.bus.sent) == rids
     for rid in rids:
         assert (await stack.row(rid))["recover_count"] == 1
+
+
+# --- 같은 SHA 중복 검토 (P2, 마이그레이션 0008) -------------------------------------------------------
+
+async def test_same_webhook_twice_at_once_makes_one_review(stack: Stack) -> None:
+    both_fetching = asyncio.Barrier(2)
+    get_file = stack.github.get_file
+
+    async def slow_get_file(*args: Any, **kwargs: Any) -> str:
+        await both_fetching.wait()  # 둘 다 find_by_head 를 지난 뒤에 넣는다
+        return await get_file(*args, **kwargs)
+
+    stack.github.get_file = slow_get_file  # type: ignore[method-assign]
+    a, b = await asyncio.gather(stack.pr("opened"), stack.pr("opened"))
+
+    assert a.status_code == b.status_code == 202
+    assert a.json()["review_id"] == b.json()["review_id"]
+    assert len(await stack.repo.list_reviews([], 10)) == 1
+    assert len(stack.bus.sent) == 1
+
+
+async def test_head_unique_index_skips_failed_and_superseded(stack: Stack) -> None:
+    def insert(rid: str) -> Any:
+        return stack.repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=REPO,
+                                        spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
+                                        pr_head_sha=HEAD, requested_by="it", pr_number=3)
+
+    assert await insert("rv_1") == "rv_1"
+    assert await insert("rv_2") == "rv_1"  # 겹치면 넣지 않고 기존 검토
+    await stack.repo.update_review("rv_1", status="failed")
+    assert await insert("rv_3") == "rv_3"
+    await stack.repo.supersede_open(repository=REPO, pr_number=3, superseded_by=None, error="PR closed")
+    assert await insert("rv_4") == "rv_4"
+    assert await stack.repo.get_review("rv_2") is None

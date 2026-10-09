@@ -747,7 +747,7 @@ async def test_next_review_of_same_rule_gets_case_as_evidence() -> None:
     await h.request(load_sample(SAMPLE_06), review_id="rv_first")
     await h.human("rv_first", "rejected")
 
-    await h.request(load_sample(SAMPLE_06), review_id="rv_second")
+    await h.request(load_sample(SAMPLE_06), review_id="rv_second", head="e" * 40)  # 같은 레포의 다음 커밋
 
     docs = (await _state(h, "rv_second"))["retrieved_docs"]
     case_docs = [d for d in docs if d["doc_type"] == "case"]

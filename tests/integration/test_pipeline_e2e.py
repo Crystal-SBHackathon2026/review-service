@@ -111,7 +111,8 @@ def worker_graph(repo: PostgresReviewRepository, github: FakeGitHub, checkpointe
 async def test_migrate_is_idempotent(conninfo: str) -> None:
     assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql", "0003_pr_number.sql",
                                        "0004_spec_intakes.sql", "0005_review_cases.sql",
-                                       "0006_generated_spec_unverified.sql", "0007_review_recovery.sql"]
+                                       "0006_generated_spec_unverified.sql", "0007_review_recovery.sql",
+                                       "0008_review_head_unique.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -249,9 +250,10 @@ async def test_review_cases_on_postgres(pool: Any) -> None:
     """판단 사례 — case_id 로 한 번만, rule_id 배열 매칭, 같은 앱·레포·허용한 종료 방식만, 같은 대상 환경 먼저·그 안에서 최근 순."""
     repo = PostgresReviewRepository(pool)
     for rid, repository in (("rv_1", REPO), ("rv_2", REPO), ("rv_3", REPO), ("rv_4", REPO), ("rv_5", "other/repo")):
+        sha = rid[-1] * 40  # 같은 레포·SHA 검토는 하나뿐이다 (0008)
         await repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=repository,
-                                 spec_ref={"repository": repository, "commit": HEAD, "path": "deploy.yaml"},
-                                 pr_head_sha=HEAD, requested_by="it")
+                                 spec_ref={"repository": repository, "commit": sha, "path": "deploy.yaml"},
+                                 pr_head_sha=sha, requested_by="it")
 
     def case(rid: str, env: str, rules: list[str], *, app: str = "sample-app", outcome: str = "rejected"
              ) -> dict[str, Any]:

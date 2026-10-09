@@ -42,10 +42,12 @@ class Env:
         self.specs.files[(REPO, "deploy.yaml", HEAD)] = sample_text()
 
     async def review(self, rid: str, status: str, *, age: timedelta = STALE + timedelta(minutes=1),
-                     requested_by: str = "octo-dev", pr_number: int | None = 5, **fields: Any) -> None:
+                     requested_by: str = "octo-dev", pr_number: int | None = 5, sha: str = HEAD,
+                     **fields: Any) -> None:
+        self.specs.files[(REPO, "deploy.yaml", sha)] = sample_text()
         await self.repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=REPO,
-                                      spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
-                                      pr_head_sha=HEAD, requested_by=requested_by, pr_number=pr_number)
+                                      spec_ref={"repository": REPO, "commit": sha, "path": "deploy.yaml"},
+                                      pr_head_sha=sha, requested_by=requested_by, pr_number=pr_number)
         await self.repo.update_review(rid, status=status, **fields)
         self.repo.reviews[rid]["updated_at"] -= age
 
@@ -153,8 +155,8 @@ async def test_more_than_max_recoveries_fails_with_verify_failure(env: Env) -> N
 
 
 async def test_spec_gone_fails_instead_of_retrying(env: Env) -> None:
-    env.specs.files.clear()
     await env.review("rv_nospec", "received")
+    env.specs.files.clear()  # 브랜치가 지워졌다
 
     assert [r["action"] for r in await env.sweep()] == ["failed"]
     assert env.repo.reviews["rv_nospec"]["status"] == "failed"
@@ -162,7 +164,7 @@ async def test_spec_gone_fails_instead_of_retrying(env: Env) -> None:
 
 async def test_one_broken_row_does_not_stop_others(env: Env) -> None:
     await env.review("rv_a", "merging", age=STALE * 3)  # GitHub 조회 실패
-    await env.review("rv_b", "received", age=STALE * 2)
+    await env.review("rv_b", "received", age=STALE * 2, sha="b" * 40)
 
     async def boom(*_: Any) -> list[Any]:
         raise RuntimeError("github down")
