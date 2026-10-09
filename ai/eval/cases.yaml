@@ -167,6 +167,58 @@ cases:
     llm: reviewer
     expect: {verdict: pass, findings: [RUN-005, STO-003], rounds: 1, values: {/runtime/resources/memory_limit: 128Mi}}
 
+  - id: p1-db007-backup-off
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: add, path: /database, value: {engine: postgres, version: "16", placement: managed, backup_retention_days: 0}}
+      - {op: add, path: /secrets, value: [{name: DATABASE_URL, source: aws-secrets-manager, key: app/db}]}
+    llm: reviewer
+    expect: {verdict: pass, findings: [DB-007, NET-001], rounds: 1, values: {/database/backup_retention_days: 1}}
+  - id: p1-db008-version-downgrade  # external 은 버전 무관이라 DB-002 없이 DB-008 만 걸린다. baseline facts 없음 = 데이터 있음
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: add, path: /baseline, value: {spec_ref: prev, spec: SELF}}
+      - {op: add, path: /baseline/spec/database, value: {engine: postgres, version: "16", placement: external}}
+      - {op: add, path: /database, value: {engine: postgres, version: "15", placement: external}}
+      - {op: add, path: /secrets, value: [{name: DATABASE_URL, source: aws-secrets-manager, key: app/db}]}
+    llm: reviewer
+    expect: {verdict: needs_human, reasons_include: [IRREVERSIBLE], findings: [DB-008, NET-001], rounds: 0}
+  - id: p1-db008-no-answer        # 값 없이 승인하면 baseline 의 버전(16)으로 되돌린다
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: add, path: /baseline, value: {spec_ref: prev, spec: SELF}}
+      - {op: add, path: /baseline/spec/database, value: {engine: postgres, version: "16", placement: external}}
+      - {op: add, path: /database, value: {engine: postgres, version: "15", placement: external}}
+      - {op: add, path: /secrets, value: [{name: DATABASE_URL, source: aws-secrets-manager, key: app/db}]}
+    resume: {edited_ops: []}
+    llm: reviewer
+    expect: {verdict: pass, values: {/database/version: "16"}}
+  - id: p1-sec002-foreign-secret-store
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: add, path: /secrets, value: [{name: API_TOKEN, source: gcp-secret-manager, key: api-token}]}
+    llm: reviewer
+    expect: {verdict: needs_human, reasons_include: [AUTOFIX_FORBIDDEN], findings: [NET-001, SEC-002], rounds: 0}
+  - id: p1-sec003-duplicate-secret
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: add, path: /secrets, value: [{name: API_TOKEN, source: k8s-secret, key: api-token},
+                                          {name: API_TOKEN, source: k8s-secret, key: api-token}]}
+    llm: reviewer
+    expect: {verdict: pass, findings: [NET-001, SEC-003], rounds: 1}
+  - id: p1-net002-internal-open
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: replace, path: /network/ingress, value: {public: false, allowed_cidrs: [10.0.0.0/8, 0.0.0.0/0]}}
+    llm: reviewer
+    expect: {verdict: pass, findings: [NET-002], rounds: 1, values: {/network/ingress/allowed_cidrs/0: 10.0.0.0/8}}
+  - id: p1-sto004-unencrypted-bucket
+    sample: 01-pass-sample-app-aws.yaml
+    mutate:
+      - {op: add, path: /storage, value: {buckets: [{name: sample-app-uploads, encryption: false}]}}
+    llm: reviewer
+    expect: {verdict: pass, findings: [NET-001, STO-004], rounds: 1, values: {/storage/buckets/0/encryption: true}}
+
   # ── 엣지케이스: 명세 없음·형식 오류·값 없는 승인 (plan 4-a) ──────────────────────
   - id: e01-missing
     intake: {repo: sample-app, file: missing}

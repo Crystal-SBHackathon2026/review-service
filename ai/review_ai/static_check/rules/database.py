@@ -59,3 +59,37 @@ def managed_db_public(ctx: CheckContext) -> list[Hit]:
     if db.placement != "managed" or not db.publicly_accessible:
         return []
     return [Hit("/database/publicly_accessible", f"managed {db.engine}: publicly_accessible true")]
+
+
+def managed_db_without_backup(ctx: CheckContext) -> list[Hit]:
+    """DB-007 — 관리형 DB 의 자동 백업이 꺼져 있다."""
+    db = ctx.spec.database
+    if db.placement != "managed" or db.backup_retention_days > 0:
+        return []
+    return [Hit("/database/backup_retention_days", f"managed {db.engine}: backup_retention_days 0")]
+
+
+def _version_key(version: str | None) -> tuple[int, ...] | None:
+    try:
+        return tuple(int(part) for part in version.split(".")) if version else None
+    except ValueError:
+        return None
+
+
+def version_downgrade(ctx: CheckContext) -> list[Hit]:
+    """DB-008 — 데이터가 있는(또는 모르는) DB 의 메이저 버전을 낮춘다. 엔진이 바뀌면 DB-001 이 맡는다.
+
+    버전은 짧은 쪽 길이까지만 비교한다 — '16' 과 '16.4' 는 같은 메이저 버전이다. 숫자가 아니면 판단하지 않는다.
+    """
+    if ctx.previous is None or not ctx.has_existing_data:
+        return []
+    before, after = ctx.previous.database, ctx.spec.database
+    if before.engine != after.engine:
+        return []
+    old, new = _version_key(before.version), _version_key(after.version)
+    if old is None or new is None:
+        return []
+    width = min(len(old), len(new))
+    if new[:width] >= old[:width]:
+        return []
+    return [Hit("/database/version", f"{after.engine} {before.version} → {after.version}")]

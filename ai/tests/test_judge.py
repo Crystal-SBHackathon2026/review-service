@@ -168,6 +168,61 @@ async def test_sec004_patch_may_only_drop_the_shadowed_env(ops: list[dict[str, A
     assert (patch is not None, validation["patch_scope_ok"]) == (ok, ok)
 
 
+async def _state_with(mutate: dict[str, Any]) -> dict[str, Any]:
+    state = await prepared("01-pass-sample-app-aws.yaml")
+    state["deploy_spec"] = {**state["deploy_spec"], **mutate}
+    state["findings"] = run_static_check(DeploySpec.model_validate(state["deploy_spec"]))
+    state["retrieved_docs"] = await FileRetriever().search(state["findings"], "aws")
+    return state
+
+
+TOKEN = {"name": "API_TOKEN", "source": "k8s-secret", "key": "token"}
+OTHER = {"name": "OTHER_KEY", "source": "k8s-secret", "key": "other"}
+
+
+@pytest.mark.parametrize(
+    ("ops", "ok"),
+    [
+        ([{"op": "remove", "path": "/secrets/2"}], True),
+        ([{"op": "remove", "path": "/secrets/0"}], True),  # 같은 Secret 키를 읽으니 어느 쪽을 남겨도 값은 같다
+        ([{"op": "replace", "path": "/secrets", "value_json": json.dumps([TOKEN])}], False),  # OTHER_KEY 까지 지운다
+        ([{"op": "remove", "path": "/secrets/2"},
+          {"op": "replace", "path": "/secrets/0/key", "value_json": '"stolen"'}], False),
+    ],
+    ids=["drop-later", "drop-first", "drops-other-secret", "also-rewrites-key"],
+)
+async def test_sec003_patch_may_only_drop_duplicates(ops: list[dict[str, Any]], ok: bool) -> None:
+    state = await _state_with({"secrets": [TOKEN, OTHER, TOKEN]})
+    _, validation, patch = validate_output(_with_patch(state, ops), state["findings"], state["retrieved_docs"],
+                                           state["deploy_spec"])
+    assert (patch is not None, validation["patch_scope_ok"]) == (ok, ok)
+
+
+@pytest.mark.parametrize(
+    ("ops", "ok"),
+    [
+        ([{"op": "remove", "path": "/network/ingress/allowed_cidrs/1"}], True),
+        ([{"op": "replace", "path": "/network/ingress/allowed_cidrs", "value_json": "[]"}], False),  # 좁은 대역까지 지움
+        ([{"op": "replace", "path": "/network/ingress/allowed_cidrs/1", "value_json": '"10.0.0.0/8"'}], False),
+    ],
+    ids=["drop-full-range", "drops-narrow-too", "rewrites-instead-of-drop"],
+)
+async def test_net002_patch_may_only_drop_full_range(ops: list[dict[str, Any]], ok: bool) -> None:
+    state = await _state_with({"network": {"ingress": {"public": False, "allowed_cidrs": ["10.1.0.0/16", "0.0.0.0/0"]}}})
+    _, validation, patch = validate_output(_with_patch(state, ops), state["findings"], state["retrieved_docs"],
+                                           state["deploy_spec"])
+    assert (patch is not None, validation["patch_scope_ok"]) == (ok, ok)
+
+
+async def test_oracle_removes_list_entries_from_the_back() -> None:
+    """두 항목을 지울 때 앞을 먼저 지우면 뒤 항목의 인덱스가 밀린다 — 가짜 리뷰어도 뒤에서부터 지운다."""
+    state = await _state_with({"secrets": [TOKEN, TOKEN, OTHER, TOKEN]})
+    _, validation, patch = validate_output(json.dumps(oracle_text(state)), state["findings"], state["retrieved_docs"],
+                                           state["deploy_spec"])
+    assert validation["patch_scope_ok"] and patch is not None
+    assert [op["path"] for op in patch["ops"]] == ["/secrets/3", "/secrets/1"]
+
+
 async def test_whole_object_replace_passes_when_only_allowed_field_changes() -> None:
     state = await prepared("07-fix-public-bucket.yaml")
     ops = [{"op": "replace", "path": "/storage/buckets/0", "value_json":

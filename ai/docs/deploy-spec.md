@@ -9,7 +9,7 @@
 |---|---|
 | `review_ai/spec/deploy_spec.py` | Pydantic 모델(정본). 형식 검사와 `load_spec()` |
 | `schema/deploy_spec.schema.json` | 위 모델에서 내보낸 JSON Schema. 파이프라인 쪽 FastAPI 나 다른 언어가 쓸 수 있다 |
-| `catalog/rules.yaml` | 정적 검사 규칙 26개 (P0 12개 — STO-001 추가) |
+| `catalog/rules.yaml` | 정적 검사 규칙 25개 (P0 12 + P1 13, 전부 구현 — RUN-003 은 10/09 폐기) |
 | `catalog/targets.yaml` | 대상 환경 능력표 (aws·gcp·local). aws 만 실측(10/08) |
 | `samples/*.yaml` | 샘플 명세 10개 |
 | `samples/cases.yaml` | 샘플별 기대 finding·verdict·사유 |
@@ -59,13 +59,16 @@ evidence 에도 값을 남기지 않는다. `source: generated` 는 배포 시 �
 
 ## 규칙 요약
 
-| 카테고리 | P0 (구현) | P1 구현 | P1 미구현 |
-|---|---|---|---|
-| database | DB-001 데이터 있는 엔진 변경 · DB-002 지원 안 되는 엔진·배치 · DB-003 SQLite 복제 · DB-005 SQLite 영속 볼륨 없음 | DB-004 영속 저장소 없음 · DB-006 관리형 DB 공개 | DB-007 · DB-008 |
-| secret | SEC-001 평문 비밀 · SEC-005 DB 접속 시크릿 없음 | SEC-004 env·secrets 이름 중복 | SEC-002 · SEC-003 |
-| network | NET-001 TLS 없음 (low) | | NET-002 |
-| storage | STO-001 접근 모드 미지원 · STO-003 공개 버킷 · STO-005 볼륨 축소 | STO-002 RWO 볼륨 복제 · STO-006 persistent 볼륨 제거 | STO-004 |
-| runtime | RUN-001 readiness 없음 · RUN-004 아키텍처 불일치 | RUN-002 liveness 없음 (low) · RUN-005 리소스 상한 없음 (low) | RUN-003 |
+| 카테고리 | P0 | P1 |
+|---|---|---|
+| database | DB-001 데이터 있는 엔진 변경 · DB-002 지원 안 되는 엔진·배치 · DB-003 SQLite 복제 · DB-005 SQLite 영속 볼륨 없음 | DB-004 영속 저장소 없음 · DB-006 관리형 DB 공개 · DB-007 관리형 DB 백업 꺼짐 · DB-008 메이저 버전 다운그레이드 |
+| secret | SEC-001 평문 비밀 · SEC-005 DB 접속 시크릿 없음 | SEC-002 대상 환경에 없는 비밀 저장소 · SEC-003 시크릿 이름 중복 · SEC-004 env·secrets 이름 중복 |
+| network | NET-001 TLS 없음 (low) | NET-002 내부 전용인데 전체 대역 허용 |
+| storage | STO-001 접근 모드 미지원 · STO-003 공개 버킷 · STO-005 볼륨 축소 | STO-002 RWO 볼륨 복제 · STO-004 버킷 암호화 꺼짐 · STO-006 persistent 볼륨 제거 |
+| runtime | RUN-001 readiness 없음 · RUN-004 아키텍처 불일치 | RUN-002 liveness 없음 (low) · RUN-005 리소스 상한 없음 (low) |
+
+카탈로그의 규칙 25개를 모두 구현했다. RUN-003(이미지 digest 고정 없음)은 폐기했다 — 배포 이미지는 CI 가 gitops base 에
+커밋 SHA 태그로 고정하고 명세의 `image.tag`·`digest` 는 렌더러가 쓰지 않는다. 병합 전 PR 에는 digest 가 아직 없어 모든 검토에 고칠 수 없는 경고가 붙는다.
 
 `autofix` 는 규칙에 `allowed` / `forbidden` / `when_no_data` 로 적고, Finding 을 만들 때 인스턴스마다 `allowed` 나 `forbidden` 으로 확정한다.
 되돌릴 수 없는 변경(DB-001·DB-008·STO-005·STO-006)은 `irreversible: true` 로 표시해 사유 코드를 IRREVERSIBLE 로 낸다.

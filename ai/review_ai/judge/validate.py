@@ -10,6 +10,7 @@
    - DB 를 없애거나(engine none) 외부 DB 로 돌리지 않고, 버킷을 지우지 않으며, 보호 설정을 약하게 바꾸지 않는다
      (허용 필드를 넓혀도 "지워서 고친" 패치가 통과하지 않게 따로 둔다)
    - 비밀처럼 보이는 env 를 새로 넣지 않는다. env 는 SEC-004 대상 항목을 지우는 것 말고는 바꾸지 않는다
+   - secrets 는 이름이 겹친 항목을 지우는 것만(SEC-003), allowed_cidrs 는 전체 대역 항목을 지우는 것만(NET-002) 허용한다
    - 적용한 명세를 다시 검사하면 대상 finding 이 사라지고 새 finding 이 생기지 않는다
 4. 자유 텍스트(why·extra_opinions)는 비밀처럼 보이는 부분을 가린다
 """
@@ -17,7 +18,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from pydantic import ValidationError
@@ -32,6 +33,7 @@ from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.state import Doc, Finding, Patch, PatchOp
 from review_ai.static_check import run_static_check
 from review_ai.static_check.context import CheckContext, size_mi
+from review_ai.static_check.rules.network import is_full_range
 from review_ai.verdict import Validation
 
 INVALID = Validation(llm_available=True, schema_ok=False, citations_ok=False, patch_scope_ok=False)
@@ -140,6 +142,34 @@ def _env_only_drops_shadowed(before: DeploySpec, after: DeploySpec, targets: Seq
     return all(k in shadowed and k not in new for k in changed)
 
 
+def _drops_only(before: Sequence[Any], after: Sequence[Any], droppable: Callable[[Any], bool]) -> bool:
+    """after 가 before 에서 droppable 항목만 뺀 것인가 (순서 유지, 바꾸거나 새로 넣은 항목 없음)."""
+    rest = iter(before)
+    for item in after:
+        for old in rest:
+            if old == item:
+                break
+            if not droppable(old):
+                return False
+        else:
+            return False
+    return all(droppable(old) for old in rest)
+
+
+def _secrets_only_drop_duplicates(before: DeploySpec, after: DeploySpec) -> bool:
+    """secrets 는 이름이 남는 항목(=중복)만 지울 수 있다 — 'SEC-003: /secrets' 허용 필드로 시크릿을 바꾸지 못하게."""
+    names = {s.name for s in after.secrets}
+    return _drops_only(before.secrets, after.secrets, lambda s: s.name in names)
+
+
+def _cidrs_only_drop_full_range(before: DeploySpec, after: DeploySpec) -> bool:
+    """allowed_cidrs 는 전체 대역만 지울 수 있다 — 좁은 대역을 지우면 오히려 넓어진다 (비면 제한 없음)."""
+    b, a = before.network.ingress, after.network.ingress
+    if b is None or a is None:
+        return b == a
+    return _drops_only(b.allowed_cidrs, a.allowed_cidrs, is_full_range)
+
+
 def _resolves_without_new(before_findings: Sequence[Finding], after: DeploySpec, targets: set[str]) -> bool:
     after_ids = {f["finding_id"] for f in run_static_check(after)}
     before_ids = {f["finding_id"] for f in before_findings}
@@ -177,6 +207,8 @@ def build_patch(llm_patch: LlmPatch, findings: Sequence[Finding], spec: dict[str
         _keeps_buckets(before, after),
         not _adds_secret_env(before, after),
         _env_only_drops_shadowed(before, after, [by_id[fid] for fid in targets]),
+        _secrets_only_drop_duplicates(before, after),
+        _cidrs_only_drop_full_range(before, after),
         _resolves_without_new(findings, after, targets),
     )
     if not all(guards):

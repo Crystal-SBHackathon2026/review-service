@@ -14,6 +14,11 @@ from review_ai.state import Finding, Patch
 from review_ai.static_check import run_static_check
 
 
+# 겹치거나 넓은 리스트 항목을 지우는 규칙 → 권장 이유
+DROP_ENTRY_RULES = {
+    "SEC-003": "이름이 겹친 시크릿 항목을 지우고 첫 항목만 남김 (같은 Secret 키를 읽어 값은 그대로)",
+    "NET-002": "내부 전용 진입점에서 전체 대역(0.0.0.0/0·::/0) 허용을 지움",
+}
 BASE_LIMITS = {"cpu_limit": BASE_RESOURCES.cpu_limit, "memory_limit": BASE_RESOURCES.memory_limit}
 
 
@@ -64,6 +69,7 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
     ):
         previous = None
     removed: list[tuple[str, Volume]] = []
+    dropped: dict[str, list[tuple[str, str]]] = {}
     for finding in findings:
         if finding["finding_id"] in covered:
             continue
@@ -82,6 +88,14 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
         elif rule == "DB-006":
             ops = [{"op": "replace", "path": path, "value": False}]
             why = "관리형 DB를 인터넷에 공개하지 않음"
+        elif rule == "DB-007":
+            ops = [{"op": "replace", "path": path, "value": 1}]
+            why = "관리형 DB 자동 백업을 켬 (보관 1일, Terraform 기본값)"
+        elif rule == "STO-004":
+            ops = [{"op": "replace", "path": path, "value": True}]
+            why = "버킷 암호화를 켬"
+        elif rule in DROP_ENTRY_RULES:
+            dropped.setdefault(rule, []).append((finding["finding_id"], path))
         elif rule == "SEC-004":
             ops = [{"op": "remove", "path": path}]
             why = "쓰이지 않는 runtime.env 항목을 지우고 시크릿 값만 남김"
@@ -105,6 +119,11 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
             removed.append((finding["finding_id"], previous.storage.volumes[int(parse_pointer(path)[4])]))
         if ops:
             candidates.append({"finding_ids": [finding["finding_id"]], "source": source, "why": why, "ops": ops})
+    for rule, entries in dropped.items():
+        # 리스트 항목을 지우는 op 는 뒤에서부터 — 앞을 먼저 지우면 뒤 항목의 인덱스가 밀린다
+        paths = sorted((path for _, path in entries), key=lambda p: int(parse_pointer(p)[-1]), reverse=True)
+        candidates.append({"finding_ids": [fid for fid, _ in entries], "source": "rule", "why": DROP_ENTRY_RULES[rule],
+                           "ops": [{"op": "remove", "path": path} for path in paths]})
     if removed:
         # 이전 볼륨을 한 op 로 되살린다 — persistent 를 끈 것은 그 자리에서 바꾸고, 지운 것은 뒤에 붙인다.
         # storage·volumes 키가 없어도 되고, 여럿이어도 서로 덮지 않는다

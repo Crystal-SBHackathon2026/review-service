@@ -91,7 +91,7 @@ rules:
     priority: P1
     providers: [any]
     title: DB 메이저 버전 다운그레이드
-    check: baseline 과 엔진이 같고 메이저 버전이 더 낮다
+    check: baseline 과 엔진이 같고 메이저 버전이 더 낮으며 database_has_data 가 false 가 아니다 (DB-001 과 같은 기준)
     fix: 이전 버전 유지. 다운그레이드는 덤프·복원으로만 가능
 
   # ── secret ──────────────────────────────────────────────────
@@ -123,7 +123,7 @@ rules:
     providers: [any]
     title: 시크릿 이름 중복
     check: secrets[].name 이 겹친다
-    fix: 중복 항목 제거
+    fix: 두 번째부터의 중복 항목 제거 — overlay 는 이름으로 같은 Secret 키를 읽으므로 적용 값은 그대로다
 
   - id: SEC-004
     category: secret
@@ -164,7 +164,7 @@ rules:
     providers: [any]
     title: 내부 전용인데 전체 대역에 열려 있다
     check: network.ingress.public 이 false 인데 allowed_cidrs 에 0.0.0.0/0 또는 ::/0
-    fix: 전체 대역 항목 제거
+    fix: 전체 대역 항목 제거. 그것만 있었다면 지운 뒤에도 내부망 전체에 열려 있다 — 좁힐 대역은 사람이 정한다
 
   # ── storage ─────────────────────────────────────────────────
   - id: STO-001
@@ -250,15 +250,9 @@ rules:
     check: runtime.health.liveness 가 없다
     fix: 외부 의존성 없이 프로세스 생존만 보는 경로를 만든다
 
-  - id: RUN-003
-    category: runtime
-    severity: low
-    autofix: allowed
-    priority: P1
-    providers: [any]
-    title: 이미지가 digest 로 고정되지 않았다
-    check: image.digest 가 없다
-    fix: CI 가 기록한 digest 로 고정 (같은 태그 재푸시 시 다른 이미지가 배포된다)
+  # RUN-003 (이미지 digest 고정 없음) 은 폐기했다 (10/09). 배포 이미지는 CI 가 gitops base 에 커밋 SHA 태그(newTag)로
+  # 고정하고, 명세의 image.tag·digest 는 참고용이라 렌더러가 쓰지 않는다. 병합 전 PR 에는 digest 가 아직 없어
+  # 규칙을 두면 모든 검토에 아무도 고칠 수 없는 경고가 붙는다.
 
   - id: RUN-004
     category: runtime

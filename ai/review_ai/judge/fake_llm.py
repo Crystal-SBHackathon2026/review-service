@@ -17,8 +17,8 @@ from review_ai.spec.deploy_spec import BASE_RESOURCES
 from review_ai.state import Finding
 
 FAKE_MODEL = "fake-oracle"
-FIX_KIND = {"SEC-001": "env", "RUN-001": "code", "RUN-002": "code", "RUN-004": "code", "DB-004": "code",
-            "DB-001": "none", "STO-005": "none", "STO-006": "none", "STO-001": "none"}
+FIX_KIND = {"SEC-001": "env", "SEC-002": "env", "RUN-001": "code", "RUN-002": "code", "RUN-004": "code", "DB-004": "code",
+            "DB-001": "none", "DB-008": "none", "STO-005": "none", "STO-006": "none", "STO-001": "none"}
 BASE_LIMITS = {"cpu_limit": BASE_RESOURCES.cpu_limit, "memory_limit": BASE_RESOURCES.memory_limit}
 
 
@@ -56,9 +56,13 @@ def _ops_for(finding: Finding, spec: dict[str, Any], env: str) -> list[dict[str,
     rule, path = finding["rule_id"], finding["location"]["spec_path"]
     if rule in {"DB-003", "STO-002"}:
         return [_op("replace", "/runtime/replicas", 1)]
-    if rule == "DB-006":
+    if rule in {"DB-006", "STO-003"}:
         return [_op("replace", path, False)]
-    if rule == "SEC-004":
+    if rule == "DB-007":
+        return [_op("replace", path, 1)]
+    if rule == "STO-004":
+        return [_op("replace", path, True)]
+    if rule in {"SEC-003", "SEC-004", "NET-002"}:
         return [_op("remove", path)]
     if rule == "RUN-005":
         resources = spec["runtime"].get("resources")
@@ -69,9 +73,16 @@ def _ops_for(finding: Finding, spec: dict[str, Any], env: str) -> list[dict[str,
         return _db002_ops(spec, env)
     if rule == "DB-005":
         return _db005_ops(spec)
-    if rule == "STO-003":
-        return [_op("replace", path, False)]
     return []
+
+
+def _removals_last(ops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """리스트 항목 삭제는 맨 뒤에, 큰 인덱스부터 — 앞 항목을 먼저 지우면 뒤 항목의 인덱스가 밀린다."""
+    def index(op: dict[str, Any]) -> int:
+        last = op["path"].rsplit("/", 1)[1]
+        return int(last) if last.isdigit() else -1
+    removes = [op for op in ops if op["op"] == "remove"]
+    return [op for op in ops if op["op"] != "remove"] + sorted(removes, key=index, reverse=True)
 
 
 def oracle_review(request: JudgeRequest) -> dict[str, Any]:
@@ -88,7 +99,7 @@ def oracle_review(request: JudgeRequest) -> dict[str, Any]:
             if new_ops:
                 ops.extend(new_ops)
                 targets.append(f["finding_id"])
-    patch = {"ops": ops, "target_finding_ids": targets} if ops else None
+    patch = {"ops": _removals_last(ops), "target_finding_ids": targets} if ops else None
     return {"items": items, "patch": patch, "extra_opinions": []}
 
 
