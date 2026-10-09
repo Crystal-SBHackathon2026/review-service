@@ -114,6 +114,21 @@ def test_preserves_sample_catches_a_different_repair() -> None:
     assert _check_intake(case, _Run(spec=None, final=None, outcome=outcome)) == ["복구한 명세가 원래 샘플과 다르다"]
 
 
+def _repaired_target(**target: str) -> IntakeOutcome:
+    spec = build_spec({"sample": "01-pass-sample-app-aws.yaml"})
+    return IntakeOutcome("repaired", "REPAIRED", "m", content=yaml.safe_dump({**spec, "target": target}))
+
+
+def test_preserves_sample_accepts_omitted_namespace_that_defaults_to_the_same() -> None:
+    """namespace 생략은 metadata.name 과 같다 — 실제 복구 LLM 이 가끔 빼도 배포 결과는 같다."""
+    case = _intake_case(sample="01-pass-sample-app-aws.yaml")
+    same = _repaired_target(env="aws", region="ap-northeast-2")
+    other = _repaired_target(env="aws", region="ap-northeast-2", namespace="other-ns")
+
+    assert _check_intake(case, _Run(spec=None, final=None, outcome=same)) == []
+    assert _check_intake(case, _Run(spec=None, final=None, outcome=other)) == ["복구한 명세가 원래 샘플과 다르다"]
+
+
 async def test_rejected_intake_is_not_reviewed() -> None:
     case = next(c for c in load_eval_cases() if c["id"] == "e08-repair-invents")
     result = await run_case(case, FAKES["oracle"], FileRetriever())
