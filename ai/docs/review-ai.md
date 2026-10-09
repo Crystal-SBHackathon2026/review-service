@@ -140,15 +140,32 @@ scripts/sync_knowledge_s3.sh oneaction-review-docs-<계정ID> --apply    # 업�
 
 ## 평가셋 (eval/cases.yaml)
 
-샘플 10개 + 제안서의 환각 케이스 10개. `reviewer` 자리에는 평가 대상 LLM 이, 나머지 자리에는 일부러 틀리는 가짜 LLM 이 들어가 코드 게이트가 잡는지 본다.
+샘플 10개 + 제안서의 환각 케이스 12개 + 엣지케이스 10개(e01~e09). `reviewer` 자리에는 평가 대상 LLM 이, 나머지 자리에는 일부러 틀리는 가짜 LLM 이 들어가 코드 게이트가 잡는지 본다.
+
+엣지케이스는 명세가 아니라 PR 상태에서 시작한다. 실행기(`evaluation.py`)가 Review API 와 같은 순서를 밟는다 — 원문 분류(`load_spec` 과 같은 기준) → 레포 분석(`eval/repos/sample-app.yaml`) → 생성(`prepare_intake`) 또는 LLM 복구(`repair_intake`) → 검토. 사람 응답 케이스는 승인 API 와 같은 검사(`resolve_human_decision` → `check_edited_ops`)를 거쳐 재개한다.
+
+| id | 입력 | 기대 |
+|---|---|---|
+| e01·e02 | 파일 없음·주석뿐인 파일 | 레포 분석으로 생성 → pass, judge 호출 0 |
+| e03 | 들여쓰기 한 칸 밀린 sample-app (YAML 오류) | 복구 → 샘플과 같은 명세 → pass |
+| e04 | `replica` 오타 + `target` 누락 (스키마 오류) | 오타는 옮기고 target 은 분석값으로 복구 → pass |
+| e05·e06 | 엔진 변경 needs_human 에 값 없이·engine 만 승인 | 권장값(postgres 16) 보충 → pass |
+| e07 | 없는 경로(`/database/enigne`) 승인 | 승인 거절(API 422), 상태 그대로 |
+| e08·e08b | 복구 LLM 이 env 를 지어내거나 포트를 바꿈 | 복구 게이트가 버림(INVENTED_VALUE·VALUE_CONFLICT), 검토 안 함 |
+| e09 | 깨진 YAML 안 평문 토큰 | 복구·judge 프롬프트에 토큰 없음, 커밋본엔 원문 값 복원, SEC-001 needs_human |
+
+복구 자리(`intake.repair`)는 `--llm fake` 면 정답(고치기 전 샘플)을 내는 가짜(`intake/fake_repair.py`), `--llm claude` 면 실제 Claude 다. 거절된 intake 의 verdict 는 `intake_rejected`(`/verify` 의 `intake_{status}` 와 같은 뜻).
 
 ```bash
 .venv/bin/python scripts/run_eval.py                                  # 가짜 LLM, 키 없이
-ANTHROPIC_API_KEY=... .venv/bin/python scripts/run_eval.py --llm claude --repeat 3
+ANTHROPIC_API_KEY=... .venv/bin/python scripts/run_eval.py --llm claude --repeat 3   # judge·복구 모두 Claude
+.venv/bin/python scripts/run_eval.py --only e                         # 엣지케이스만
 .venv/bin/python scripts/run_eval.py --retriever qdrant               # 로컬 임베딩 + 메모리 Qdrant
 ```
 
-지표: 기대 verdict 일치율 · 인용 유효율 · pass 기대 케이스 오탐 · LLM 호출 수·토큰·시간. 결과는 `eval/reports/`(git 제외).
+지표: 기대 verdict 일치율 · 인용 유효율 · pass 기대 케이스 오탐 · LLM 호출 수(복구 포함)·토큰·시간. 결과는 `eval/reports/`(git 제외).
+
+2026-10-09 실측(Claude Sonnet, `--only e`): 10/10 일치. 복구 3건(e03·e04·e09) 모두 값 보존·비밀 복원, 건당 5~9초. 전체 9회 호출 ≈ $0.14.
 
 ## 검색 평가셋 (eval/retrieval_cases.yaml)
 

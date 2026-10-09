@@ -3,9 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+import yaml
 
-from review_ai.evaluation import build_spec, load_eval_cases, run_case, summarize
+from review_ai.evaluation import (
+    INTAKE_REJECTED, _check_intake, _Run, build_spec, intake_kind, intake_text, load_eval_cases, run_case, summarize,
+)
 from review_ai.graph import initial_state, run_graph
+from review_ai.intake import IntakeOutcome
+from review_ai.intake.fake_repair import REPAIR_FAKES
 from review_ai.judge.fake_llm import FAKES
 from review_ai.patching import apply_ops
 from review_ai.retrieval.file_retriever import FileRetriever
@@ -65,9 +70,61 @@ async def test_pass_without_fix_has_no_applied_ops(name: str) -> None:
     assert (final["status"], final["applied_ops"], final["patched"]) == ("pass", [], False)
 
 
-@pytest.mark.parametrize("case", load_eval_cases(), ids=lambda c: c["id"])
+@pytest.mark.parametrize("case", [c for c in load_eval_cases() if "intake" not in c], ids=lambda c: c["id"])
 async def test_applied_ops_reproduce_final_spec(case: dict[str, Any]) -> None:
     spec = build_spec(case)
     final = await run_graph(initial_state(spec, review_id="t"), llm=FAKES["oracle"](), retriever=FileRetriever())
     assert apply_ops(spec, final["applied_ops"]) == final["deploy_spec"]
     assert final["patched"] == bool(final["rounds"])
+
+
+# ── intake·resume 케이스 실행기 ─────────────────────────────────────────
+
+
+def _intake_case(**intake: Any) -> dict[str, Any]:
+    return {"id": "t", "llm": "reviewer", "intake": {"repo": "sample-app", **intake},
+            "expect": {"verdict": "pass", "preserves_sample": True}}
+
+
+def test_intake_edit_must_hit_sample_exactly_once() -> None:
+    case = _intake_case(sample="01-pass-sample-app-aws.yaml", edit=[["no-such-text", "x"]])
+    with pytest.raises(ValueError, match="정확히 한 번"):
+        intake_text(case)
+
+
+@pytest.mark.parametrize(("text", "kind"), [
+    (None, "missing"), ("", "empty"), ("# 주석\n", "empty"), ("{}", "empty"),
+    ("a: [1", "yaml_error"), ("a: 1", "schema_error"),
+])
+def test_intake_kind_matches_review_api(text: str | None, kind: str) -> None:
+    assert intake_kind(text) == kind
+
+
+async def test_intake_case_that_is_still_valid_is_a_broken_case() -> None:
+    case = _intake_case(sample="01-pass-sample-app-aws.yaml", edit=[["replicas: 2", "replicas: 3"]])
+    with pytest.raises(ValueError, match="정상 명세"):
+        await run_case(case, FAKES["oracle"], FileRetriever())
+
+
+def test_preserves_sample_catches_a_different_repair() -> None:
+    case = _intake_case(sample="01-pass-sample-app-aws.yaml")
+    other = build_spec({"sample": "06-human-plaintext-secret.yaml"})
+    outcome = IntakeOutcome("repaired", "REPAIRED", "m", content=yaml.safe_dump(other))
+
+    assert _check_intake(case, _Run(spec=None, final=None, outcome=outcome)) == ["복구한 명세가 원래 샘플과 다르다"]
+
+
+async def test_rejected_intake_is_not_reviewed() -> None:
+    case = next(c for c in load_eval_cases() if c["id"] == "e08-repair-invents")
+    result = await run_case(case, FAKES["oracle"], FileRetriever())
+
+    assert (result.verdict, result.reasons, result.llm_role) == (INTAKE_REJECTED, ["REPAIR_REJECTED"],
+                                                                 "repair:invents_value")
+    assert result.llm_calls == 1  # 복구 한 번 — 검토(judge)는 돌지 않는다
+
+
+async def test_repairer_replaces_oracle_for_reviewer_role() -> None:
+    case = next(c for c in load_eval_cases() if c["id"] == "e03-yaml-syntax")
+    result = await run_case(case, FAKES["oracle"], FileRetriever(), REPAIR_FAKES["changes_value"])
+
+    assert not result.ok and result.verdict == INTAKE_REJECTED
