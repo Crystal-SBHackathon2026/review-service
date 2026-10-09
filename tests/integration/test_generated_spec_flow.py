@@ -3,6 +3,9 @@
 10/09 sample-app #11: deploy.yaml 을 지운 PR 에 intake 가 baseline 없이(레포 분석만으로) 명세를 만들었고,
 그 명세가 network: {} 라 검토가 pass → 자동 병합 → gitops 의 ingress 가 지워져 ALB 가 삭제됐다.
 baseline 없이 생성한 명세는 공개 범위·env·replicas 를 모르므로 pass 여도 사람 확인(GENERATED_SPEC_UNVERIFIED)으로 보낸다.
+
+baseline 없는 생성 커밋은 intake 가 남기는 그대로(spec_intakes 행 + PR 브랜치 커밋) 넣어 둔다 — intake 가 어떤 명세를
+커밋할지(#39 는 network 를 모르면 커밋하지 않는다)와 상관없이, 커밋된 뒤의 검토 층만 확인한다.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ REPO = "Crystal-SBHackathon2026/sample-app"
 HEAD = "a" * 40
 MERGE_SHA = "c0ffee1" + "0" * 33
 SECRET = "flow-secret"
-APP_TREE = {  # baseline 없는 새 앱 — 레포 분석이 명세를 만든다
+APP_TREE = {  # PR head — deploy.yaml 을 지운 앱 레포
     "Dockerfile": "FROM node:22-alpine\nEXPOSE 8080\nHEALTHCHECK CMD wget -qO- http://127.0.0.1:8080/healthz\n",
     "package.json": '{"dependencies": {"express": "^4.21.2"}}',
     ".github/workflows/ci.yml": "env:\n  IMAGE: ghcr.io/crystal-sbhackathon2026/sample-app\n"
@@ -143,14 +146,32 @@ class Flow:
         await self.handler.handle("review.resumed", json.dumps(body).encode())
 
     async def generated_review(self) -> dict[str, Any]:
-        """deploy.yaml 없는 PR → intake 생성 커밋 → synchronize 웹훅 → 워커 검토. 그 검토 행."""
-        assert "kind" in self.pr("opened", HEAD)  # TestClient 가 BackgroundTasks(process_intake)까지 돌린다
+        """deploy.yaml 없는 PR → intake 생성 커밋 → synchronize 웹훅 → 워커 검토. 그 검토 행.
+
+        baseline 이 있으면 실제 intake 가 만들고, 없으면 레포 분석으로 만든 명세(network: {})를 intake 처럼 커밋해 둔다."""
+        if await self.repo.latest_baseline_for_repository(REPO) is not None:
+            assert "kind" in self.pr("opened", HEAD)  # TestClient 가 BackgroundTasks(process_intake)까지 돌린다
+        else:
+            await self._commit_like_intake_without_baseline()
         [intake] = self.repo.intakes.values()
         assert intake["status"] == "generated", intake
         body = self.pr("synchronize", intake["result_commit_sha"])
         assert body["from_intake"] == intake["intake_id"]
         await self.deliver()
         return self.repo.reviews[body["review_id"]]
+
+    async def _commit_like_intake_without_baseline(self) -> None:
+        spec = yaml.safe_load((SAMPLES / "01-pass-sample-app-aws.yaml").read_text(encoding="utf-8"))
+        spec["network"] = {}  # 장애 때의 생성 명세 — 공개 범위를 몰라 내부 전용이 됐다
+        await self.repo.insert_intake(intake_id="in_gen", repository=REPO, head_repository=REPO, pr_number=11,
+                                      head_sha=HEAD, head_ref="feature", path="deploy.yaml", kind="missing",
+                                      errors=[], requested_by="hyeyeon")
+        sha = await self.github.prepare_file_commit(REPO, parent=HEAD, path="deploy.yaml",
+                                                    content=yaml.safe_dump(spec), message="chore: 생성")
+        await self.repo.link_intake("in_gen", result_commit_sha=sha, baseline_used=False)
+        await self.github.update_branch(REPO, "feature", sha)
+        await self.repo.finish_intake("in_gen", status="generated", reason="GENERATED", message="m",
+                                      result_commit_sha=sha)
 
 
 async def _approve_baseline(flow: Flow) -> None:
