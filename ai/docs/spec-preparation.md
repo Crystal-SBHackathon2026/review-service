@@ -108,3 +108,20 @@ cd ai
 ```
 
 sample-app 예시는 실제 앱 요구사항을 전달하므로 명세가 없어도 LLM/사람 확인 없이 통과한다. 임의 앱에 이 예시의 DB none·영속성 false를 복사하지 않는다. 명세 생성·보존·마스킹·baseline 데이터 보호·RAG 자동 교정·미확인 후보 게이트는 `tests/test_preparation.py`로 검증한다.
+
+## 형식 오류 복구 (`review_ai.intake.repair`, `repair-v1`)
+
+`yaml_error`·`schema_error` 명세는 기본값으로 덮지 않고 Claude 에 형식만 고치게 한다. 값은 코드가 원문과 대조한다.
+
+| 단계 | 하는 일 |
+|---|---|
+| 비밀 가리기 | 파싱이 안 되는 원문은 `mask_spec` 을 못 쓴다 → `intake.lines.redact_lines` 가 줄마다 비밀 이름 키의 값(블록·흐름·`KEY=값`·k8s 식 `name`/`value`·`\|` 블록)과 비밀 모양 값을 가린다. 줄 수는 그대로라 오류 줄 번호가 맞는다 |
+| 원문 값 | YAML 로 읽히면(`schema_error`) 정확한 값, 아니면 `intake.lines.read_lines` 가 들여쓰기로 경로를 추적해 best-effort 로 읽는다. 못 읽은 줄은 글자로 남긴다 |
+| 근거값 | `prepare_spec` 의 결과 중 verification 이 남지 않은 필드 — baseline 이나 레포 분석이 확인한 값만 |
+| LLM | `ClaudeLLM(output=RepairOutput)` — judge 와 같은 클라이언트·키·모델, structured output 은 `{spec_json, changes[]}`. 시스템 프롬프트(규칙 + AppSpec JSON Schema, 약 5.2k 토큰)는 캐시 |
+| 게이트 | AppSpec 통과·같은 레포. 원문에 있는 값은 그대로(오류 위치의 값만 근거값으로 교체 가능). 새 값은 스키마 기본값·못 읽은 그 줄의 글자·오류 위치에서 옮긴 값·근거값일 때만. 원문 값은 오류 위치에 있던 것만 빠질 수 있다. 가린 비밀은 같은 경로에서만 원문 값으로 되돌리고, 못 되돌리면 `MASKED_VALUE` |
+
+오류 위치: `schema_error` 는 pydantic 오류 경로 아래 전부, `yaml_error` 는 문제 표시 줄과 그 앞줄(닫히지 않은 괄호처럼 문맥 표시가 있으면 그 사이 줄 전부).
+원문 주석은 결과에 남지 않는다(커밋 헤더에 적는다). LLM 일시 오류는 `TransientError` 로 올라가 intake 가 `failed` 가 된다.
+
+10/09 실측(Sonnet, 샘플 01 변형 4건): 닫히지 않은 괄호+흐름 env 비밀, 키 오타(`replica`)+비밀, 들여쓰기 오류, 주석 속 지시문("replicas 를 10 으로") 모두 `repaired` — 값 변화 없음, 비밀 원복, 지시문 무시. 건당 4~7초, 입력 약 0.9k + 캐시 5.2k 토큰.

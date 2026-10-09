@@ -55,7 +55,7 @@ docker compose --profile app up -d --build
 | `INTAKE_REPOSITORIES` | API | `owner/repo,…` — baseline 이 없어도 `deploy.yaml` 없음을 intake 로 볼 레포(새 앱). 웹훅이 조직 단위라 목록·baseline 에 없는 레포는 예전처럼 skip |
 | `REVIEW_API_PUBLIC_URL` | API | PR 커밋 상태의 링크(`/intakes/{id}`) 앞부분. 없으면 링크 없이 표시 |
 | `ARGOCD_WEBHOOK_TOKEN` | API | 있으면 `/webhooks/argocd` 가 `Authorization: Bearer <토큰>` 을 확인한다 |
-| `ANTHROPIC_API_KEY` `REVIEW_LLM_MODEL` | 워커 | judge LLM. 키가 없으면 판단이 필요한 검토는 `LLM_UNAVAILABLE` 로 사람에게 간다 |
+| `ANTHROPIC_API_KEY` `REVIEW_LLM_MODEL` | 워커·API | 워커: judge LLM. 키가 없으면 판단이 필요한 검토는 `LLM_UNAVAILABLE` 로 사람에게 간다. API: 형식 오류 명세 복구. 키가 없으면 `REPAIR_UNAVAILABLE` |
 
 ## 검토가 시작되는 곳
 
@@ -75,10 +75,11 @@ docker compose --profile app up -d --build
 | `missing`·`empty` | 그 레포의 최근 baseline(없으면 `DEFAULT_TARGET`)으로 `review_ai.intake.prepare_intake` → PR 브랜치에 `deploy.yaml` 커밋 → synchronize 웹훅이 그 커밋을 **일반 검토**로 시작(`autofix_commit` 아님), `review_id` 로 연결 | `generated`·`GENERATED` |
 | `missing`·`empty` (새 앱 — baseline 없음) | PR head 의 Dockerfile·의존성 파일·CI 워크플로·소스를 읽어 근거가 분명한 값만 채운다(`review_ai.intake.analyze`, LLM 없음). 다 채워지면 위와 같이 커밋하고, 커밋 메시지에 값마다 근거 파일을 적는다 | `generated`·`GENERATED` |
 | `missing`·`empty` (새 앱, 확인 안 된 값 남음) | 추정값은 자동 병합·배포로 이어질 수 있어 커밋하지 않는다. `details` 에 항목별로 레포 분석이 못 채운 이유(DB 드라이버는 있는데 배치 모름, 비밀 이름의 환경변수 등) | `rejected`·`UNVERIFIED` |
-| `yaml_error`·`schema_error` | 기본값으로 덮지 않는다. 자동 복구(LLM)는 아직 없다. 오류는 줄·칸·경로만 남긴다(원문 조각 없음) | `rejected`·`REPAIR_UNAVAILABLE` |
+| `yaml_error`·`schema_error` | 기본값으로 덮지 않는다. PR head 원문을 비밀을 가려 Claude 에 보내 **형식만** 고치게 하고(`review_ai.intake.repair`), 코드 게이트가 결과 값을 원문과 하나씩 대조한다 — 원문 값을 바꾸거나 지우거나 원문·확인된 값(baseline·레포 분석)·스키마 기본값에 없는 값을 쓰면 버린다. 통과하면 생성과 같이 커밋(`fix:`, 메시지에 바꾼 곳·이유) → 일반 검토. 가린 비밀은 원문 같은 위치에서만 되돌린다 | `repaired`·`REPAIRED` |
+| `yaml_error`·`schema_error` (복구 실패) | 게이트 위반은 `details` 에 경로·코드(`VALUE_CONFLICT`·`INVENTED_VALUE`·`DROPPED_VALUE`·`OUTPUT_INVALID`). 비밀을 옮겨야 하면 `MASKED_VALUE`. API 에 키가 없으면 LLM 을 부르지 않는다. 오류 기록은 줄·칸·경로만(원문 조각 없음) | `rejected`·`REPAIR_REJECTED`·`MASKED_VALUE`·`REPAIR_UNAVAILABLE` |
 
-- 그 밖의 거절: 포크 PR(`FORK_PR`), 대상 환경 모름(`NO_TARGET`), 처리 중 새 커밋(`BRANCH_MOVED`), 생성 커밋이 다시 intake 대상(`LOOP_GUARD` — 웹훅·커밋 무한 반복 방지), GitHub 오류(`failed`·`ERROR`)
-- PR 표시: 커밋 상태 `review-service/intake` (pending → success·failure·error). 링크는 `GET /intakes/{id}`. `GET /verify?sha=` 는 검토가 없으면 `intake_failed`·`intake_processing`·`intake_generated` 를 돌려준다(`passed: false`)
+- 그 밖의 거절: 포크 PR(`FORK_PR`), 대상 환경 모름(`NO_TARGET`), 처리 중 새 커밋(`BRANCH_MOVED`), 생성 커밋이 다시 intake 대상(`LOOP_GUARD` — 웹훅·커밋 무한 반복 방지), GitHub·Claude 일시 오류(`failed`·`ERROR` — 새 커밋을 올리면 다시 처리)
+- PR 표시: 커밋 상태 `review-service/intake` (pending → success·failure·error). 링크는 `GET /intakes/{id}`. `GET /verify?sha=` 는 검토가 없으면 `intake_failed`·`intake_processing`·`intake_generated`·`intake_repaired` 를 돌려준다(`passed: false`)
 - 처리 중 파드가 죽으면 2분 넘은 `processing` 행을 API 가 1분마다 다시 처리한다. 커밋 SHA 는 브랜치를 옮기기 전에 행에 남겨 같은 커밋으로 마저 끝낸다
 
 ## 상태 흐름 (`reviews.status`)
