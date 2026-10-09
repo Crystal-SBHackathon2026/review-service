@@ -13,7 +13,8 @@
                                         check_suite completed → review.resumed(ci_completed)
     POST /webhooks/argocd               배포 Healthy·Degraded 기록, Healthy 면 baselines 갱신, Degraded 면 판단 사례
                                         [Bearer ARGOCD_WEBHOOK_TOKEN]
-    GET  /healthz
+    GET  /healthz                       프로세스가 떠 있는지만 (ALB 헬스체크·livenessProbe)
+    GET  /readyz                        DB SELECT 1·Kafka producer 연결. 하나라도 실패하면 503 (readinessProbe)
 
 토큰이 설정되지 않은 [Bearer] 경로는 503 으로 거절한다 (fail-closed). GET 경로와 /webhooks/github(서명 검증)는 그대로.
 """
@@ -27,13 +28,13 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, get_args
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from review_ai.graph import check_edited_ops
@@ -99,6 +100,36 @@ class ApiDeps:
     repair_llm: LlmClient | None = None  # 형식 오류 명세 복구. None 이면 yaml_error·schema_error 는 REPAIR_UNAVAILABLE
     transform_llm: LlmClient | None = None  # 새 앱 코드 패치(SQLite→Postgres·/metrics). None 이면 TRANSFORM_UNAVAILABLE
     lockfile: Callable[[str, str], Awaitable[str]] = regenerate_lockfile  # 코드 패치가 바꾼 의존성의 잠금 파일
+    # /readyz 가 볼 의존성 — 이름 → 실패하면 예외를 내는 확인. 비어 있으면 늘 준비됨
+    readiness: dict[str, Callable[[], Awaitable[Any]]] = field(default_factory=dict)
+
+
+READY_TIMEOUT_SECONDS = 2.0  # 확인 하나의 상한. readinessProbe timeoutSeconds 는 이보다 길게 (gitops, 기본 1초)
+
+
+def make_readiness(pool: Any, producer: Any) -> dict[str, Callable[[], Awaitable[Any]]]:
+    """운영 /readyz 확인 — 업무 DB SELECT 1, Kafka 브로커와 메타데이터 왕복(끊겼으면 KafkaError)."""
+    async def db() -> None:
+        async with pool.connection(timeout=READY_TIMEOUT_SECONDS) as conn:
+            await conn.execute("SELECT 1")
+
+    async def kafka() -> None:
+        await producer.client.fetch_all_metadata()
+
+    return {"db": db, "kafka": kafka}
+
+
+async def check_ready(checks: dict[str, Callable[[], Awaitable[Any]]]) -> dict[str, str]:
+    """각 확인을 동시에, READY_TIMEOUT_SECONDS 안에. 이름 → "ok" 또는 실패 사유."""
+    async def one(check: Callable[[], Awaitable[Any]]) -> str:
+        try:
+            await asyncio.wait_for(check(), READY_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001 — 사유만 보여 준다
+            return f"{type(exc).__name__}: {exc}"[:200] if str(exc) else type(exc).__name__
+        return "ok"
+
+    results = await asyncio.gather(*(one(check) for check in checks.values()))
+    return dict(zip(checks, results, strict=True))
 
 
 class SpecRefIn(BaseModel):
@@ -139,6 +170,13 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/readyz")
+    async def readyz(request: Request) -> JSONResponse:
+        checks = await check_ready(d(request).readiness)
+        ready = all(v == "ok" for v in checks.values())
+        return JSONResponse({"status": "ok" if ready else "unavailable", "checks": checks},
+                            status_code=200 if ready else 503)
 
     @app.post("/reviews", status_code=202)
     async def create_review(body: ReviewIn, request: Request,
@@ -482,6 +520,7 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
                                       if r.strip()),
         repair_llm=make_repair_llm(),
         transform_llm=make_transform_llm(),
+        readiness=make_readiness(pool, producer),
     )
     sweeps = [asyncio.create_task(sweep_stale_intakes(app.state.deps)),
               asyncio.create_task(sweep_stale_reviews(app.state.deps))]  # 멈춘 intake·검토 회수

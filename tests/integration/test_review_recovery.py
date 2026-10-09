@@ -369,3 +369,25 @@ async def test_head_unique_index_skips_failed_and_superseded(stack: Stack) -> No
     await stack.repo.supersede_open(repository=REPO, pr_number=3, superseded_by=None, error="PR closed")
     assert await insert("rv_4") == "rv_4"
     assert await stack.repo.get_review("rv_2") is None
+
+
+# --- /readyz (P2) — 실제 Postgres·Kafka --------------------------------------------------------------
+
+async def test_readiness_checks_real_db_and_kafka(pool: Any) -> None:
+    from aiokafka import AIOKafkaProducer
+
+    from review_api.app import check_ready, make_readiness
+
+    producer = AIOKafkaProducer(bootstrap_servers=BOOTSTRAP)
+    await producer.start()
+    try:
+        assert await check_ready(make_readiness(pool, producer)) == {"db": "ok", "kafka": "ok"}
+        broken = make_pool(make_conninfo(DSN, port="1", connect_timeout="1"))  # 아무도 듣지 않는 포트
+        await broken.open(wait=False)
+        try:
+            checks = await check_ready(make_readiness(broken, producer))
+        finally:
+            await broken.close()
+        assert checks["db"] != "ok" and checks["kafka"] == "ok"
+    finally:
+        await producer.stop()

@@ -92,6 +92,46 @@ def test_healthz(env: Env) -> None:
     assert env.client.get("/healthz").status_code == 200
 
 
+async def _ok() -> None:
+    return None
+
+
+def test_readyz_ok_when_db_and_kafka_answer(env: Env) -> None:
+    env.app.state.deps.readiness = {"db": _ok, "kafka": _ok}
+
+    resp = TestClient(env.app).get("/readyz")  # probe 는 토큰 없이
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "checks": {"db": "ok", "kafka": "ok"}}
+
+
+def test_readyz_503_when_db_down_but_healthz_200(env: Env) -> None:
+    """P2 — DB 가 죽으면 /readyz 503 (트래픽을 빼고), /healthz 는 200 그대로 (ALB·liveness 가 파드를 죽이지 않게)."""
+    async def db_down() -> None:
+        raise ConnectionError("connection refused")
+
+    env.app.state.deps.readiness = {"db": db_down, "kafka": _ok}
+
+    resp = env.client.get("/readyz")
+    assert resp.status_code == 503
+    assert resp.json()["checks"] == {"db": "ConnectionError: connection refused", "kafka": "ok"}
+    assert env.client.get("/healthz").status_code == 200
+
+
+def test_readyz_503_when_a_check_hangs(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    import review_api.app as app_module
+
+    async def hang() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(app_module, "READY_TIMEOUT_SECONDS", 0.05)
+    env.app.state.deps.readiness = {"db": _ok, "kafka": hang}
+
+    resp = env.client.get("/readyz")
+    assert resp.status_code == 503
+    assert resp.json()["checks"] == {"db": "ok", "kafka": "TimeoutError"}
+
+
 def test_sample_01_accepted_and_published(env: Env) -> None:
     env.put_spec(sample_text())
     resp = env.request_review()
