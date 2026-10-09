@@ -20,6 +20,7 @@ from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.retrieval.case_retriever import CaseRetriever
 from review_ai.retrieval.runtime import make_retriever, qdrant_from_url
 from review_common.github import GitHubClient, GitHubGitClient
+from review_common.kafka import KafkaPublisher
 from review_common.migrate import migrate
 from review_common.repository import PostgresReviewRepository, make_pool
 from review_common.resumed import TOPIC as RESUMED_TOPIC
@@ -60,10 +61,6 @@ async def run() -> None:
     )
     producer = AIOKafkaProducer(bootstrap_servers=kafka_bootstrap(), acks="all", enable_idempotence=True)
 
-    class KafkaPublisher:
-        async def send(self, topic: str, key: str, value: bytes) -> None:
-            await producer.send_and_wait(topic, value=value, key=key.encode())
-
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -76,8 +73,9 @@ async def run() -> None:
         # 규칙 문서(파일) → Qdrant 의미 검색(QDRANT_URL 이 있을 때, 실패하면 건너뜀) → 판단 사례
         retriever = make_retriever(CaseRetriever(repo), qdrant=qdrant_from_url(os.environ.get("QDRANT_URL")))
         gitops = GitHubGitClient(github)  # gitops 레포: GITOPS_REPO
-        deps = Deps(repo=repo, github=github, publisher=KafkaPublisher(), llm=make_llm(), retriever=retriever,
-                    commit_overlay=make_commit_overlay(gitops), overlay_guard=make_overlay_guard(gitops),
+        deps = Deps(repo=repo, github=github, publisher=KafkaPublisher(producer), llm=make_llm(),
+                    retriever=retriever, commit_overlay=make_commit_overlay(gitops),
+                    overlay_guard=make_overlay_guard(gitops),
                     ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None,
                     public_url=os.environ.get("REVIEW_API_PUBLIC_URL") or None)
         graph = build_graph(deps, checkpointer)

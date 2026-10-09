@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,10 +15,12 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from review_ai.errors import TransientError
 from review_ai.messages import ReviewRequested
 from review_api.app import ApiDeps, create_app
 from review_common.ids import new_review_id
 from review_common.github import SpecNotFound
+from review_common.kafka import DEFAULT_SEND_TIMEOUT, KafkaPublisher
 from review_common.repository import InMemoryReviewRepository
 from review_common.resumed import parse_review_resumed
 
@@ -140,6 +144,53 @@ def test_publish_failure_marks_failed(env: Env) -> None:
     assert resp.status_code == 503
     [row] = env.repo.reviews.values()
     assert row["status"] == "failed"
+
+
+class StuckProducer:
+    """MSK 가 응답하지 않는다 — send_and_wait 가 끝나지 않는다."""
+
+    async def send_and_wait(self, topic: str, value: bytes | None = None, key: bytes | None = None) -> None:
+        await asyncio.Event().wait()
+
+
+def test_kafka_send_timeout_default_fits_github_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KAFKA_SEND_TIMEOUT", raising=False)
+    assert KafkaPublisher(StuckProducer()).timeout == DEFAULT_SEND_TIMEOUT <= 5  # GitHub 웹훅은 10초 안에 응답해야 한다
+    monkeypatch.setenv("KAFKA_SEND_TIMEOUT", "2.5")
+    assert KafkaPublisher(StuckProducer()).timeout == 2.5
+
+
+async def test_stuck_kafka_send_raises_transient_error() -> None:
+    with pytest.raises(TransientError, match="review.requested"):
+        await KafkaPublisher(StuckProducer(), timeout=0.05).send("review.requested", "k", b"v")
+
+
+@pytest.mark.parametrize("route", ["review", "decision", "check_suite"])
+async def test_stuck_kafka_returns_503_within_timeout(env: Env, route: str) -> None:
+    """발행이 멈추면 웹훅·API 가 KAFKA_SEND_TIMEOUT 안에 503 을 준다 (P1-6)."""
+    env.publisher = KafkaPublisher(StuckProducer(), timeout=0.2)  # type: ignore[assignment]
+    env.app.state.deps.publisher = env.publisher
+    env.put_spec(sample_text())
+    rid = new_review_id()
+    if route != "review":
+        await env.repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=REPO,
+                                     spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
+                                     pr_head_sha=HEAD, requested_by="t")
+        await env.set_status(rid, status="needs_human" if route == "decision" else "waiting_ci")
+
+    started = time.monotonic()
+    if route == "review":
+        resp = env.request_review()
+    elif route == "decision":
+        resp = env.client.post(f"/reviews/{rid}/decision", json={"decision": "rejected", "approver": "h"})
+    else:
+        raw, sig = signed({"action": "completed", "check_suite": {
+            "head_sha": HEAD, "conclusion": "success", "app": {"slug": "github-actions"}}})
+        resp = env.client.post("/webhooks/github", content=raw,
+                               headers={"X-GitHub-Event": "check_suite", "X-Hub-Signature-256": sig})
+
+    assert resp.status_code == 503
+    assert time.monotonic() - started < 5
 
 
 def test_review_id_format() -> None:

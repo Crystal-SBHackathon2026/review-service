@@ -216,7 +216,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             except ValueError as exc:
                 raise HTTPException(422, {"message": "edited_ops 를 적용할 수 없다", "errors": str(exc)}) from exc
         msg = HumanDecisionResumed(review_id=review_id, human_decision=body, resumed_at=datetime.now(UTC))
-        await deps_.publisher.send(RESUMED_TOPIC, review_id, msg.model_dump_json().encode())
+        await publish(deps_, RESUMED_TOPIC, review_id, msg.model_dump_json().encode())
         return {"review_id": review_id}
 
     @app.post("/webhooks/github", status_code=202)
@@ -251,7 +251,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         resumed = []
         for row in await deps_.repo.waiting_ci_by_head_sha(ci.head_sha):
             msg = CiCompletedResumed(review_id=row["review_id"], ci=ci, resumed_at=datetime.now(UTC))
-            await deps_.publisher.send(RESUMED_TOPIC, row["review_id"], msg.model_dump_json().encode())
+            await publish(deps_, RESUMED_TOPIC, row["review_id"], msg.model_dump_json().encode())
             resumed.append(row["review_id"])
         return {"resumed": resumed}
 
@@ -263,6 +263,15 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         return await handle_deploy_event(deps_.repo, event)
 
     return app
+
+
+async def publish(deps: ApiDeps, topic: str, key: str, value: bytes) -> None:
+    """발행 실패·시간 초과(KAFKA_SEND_TIMEOUT)는 503 — 웹훅 응답을 붙잡지 않는다. GitHub 은 실패한 전달을 다시 보낼 수 있다."""
+    try:
+        await deps.publisher.send(topic, key, value)
+    except Exception as exc:
+        log.exception("%s %s 발행 실패", topic, key)
+        raise HTTPException(503, "메시지를 큐에 넣지 못했다") from exc
 
 
 async def fetch_spec(deps: ApiDeps, spec_ref: dict[str, str]) -> dict[str, Any]:
@@ -417,6 +426,7 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
     from aiokafka import AIOKafkaProducer
 
     from review_common.github import GitHubClient
+    from review_common.kafka import KafkaPublisher
     from review_common.migrate import migrate
     from review_common.repository import PostgresReviewRepository, make_pool
     from review_common.settings import db_conninfo, kafka_bootstrap
@@ -429,14 +439,10 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
     await producer.start()
     github = GitHubClient()
 
-    class KafkaPublisher:
-        async def send(self, topic: str, key: str, value: bytes) -> None:
-            await producer.send_and_wait(topic, value=value, key=key.encode())
-
     app.state.deps = ApiDeps(
         repo=PostgresReviewRepository(pool),
         specs=github,
-        publisher=KafkaPublisher(),
+        publisher=KafkaPublisher(producer),
         github_webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET"),
         argocd_webhook_token=os.environ.get("ARGOCD_WEBHOOK_TOKEN") or None,
         api_token=os.environ.get("REVIEW_API_TOKEN") or None,
