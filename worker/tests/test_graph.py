@@ -91,13 +91,59 @@ async def test_other_apps_suites_are_ignored(harness: Harness) -> None:
     assert harness.github.merged
 
 
-async def test_check_suites_error_falls_back_to_webhook(harness: Harness) -> None:
+async def test_ci_lookup_failure_merges_on_webhook_conclusion(harness: Harness) -> None:
+    """P1-5 — check-suites 조회가 실패하면 웹훅 한 건의 conclusion 으로 병합하지 않고 waiting_ci 로 기다린다."""
     harness.github.suite_error = GitHubError("boom", 502)
     await harness.request(load_sample(SAMPLE_01))
     assert harness.row()["status"] == "waiting_ci"
 
-    await harness.ci(RID, "success")  # 조회가 여전히 실패하면 웹훅 결론을 쓴다
+    await harness.ci(RID, "success")  # 다른 suite 가 아직 돌 수도 있다 — 조회가 안 되면 모른다
+    assert harness.github.merged == []
+    assert harness.row()["status"] == "waiting_ci"
+    assert (await _state(harness))["_next"] == ("wait_ci",)
+
+    harness.github.suite_error = None  # 조회가 돌아오면 다음 웹훅에 전체 suite 를 보고 병합한다
+    await _finish_ci(harness)
     assert harness.github.merged
+
+
+class FlakySuites:
+    """check-suites 응답을 호출마다 차례로 준다 — 마지막 것은 계속."""
+
+    def __init__(self, harness: Harness, *answers: list[dict[str, Any]] | GitHubError) -> None:
+        self.answers = list(answers)
+        self.calls = 0
+        harness.github.check_suites = self  # type: ignore[method-assign]
+
+    async def __call__(self, repository: str, sha: str) -> list[dict[str, Any]]:
+        answer = self.answers[min(self.calls, len(self.answers) - 1)]
+        self.calls += 1
+        if isinstance(answer, GitHubError):
+            raise answer
+        return answer
+
+
+async def test_merge_rechecks_all_suites_right_before_merge(harness: Harness) -> None:
+    """check_ci 가 끝난 걸 본 뒤 병합 직전 다시 읽었더니 suite 2개 중 1개만 끝났다 — 병합하지 않고 waiting_ci."""
+    suites = FlakySuites(harness, [suite(conclusion="success")],
+                         [suite(conclusion="success"), suite(status="in_progress", conclusion=None)])
+    await harness.request(load_sample(SAMPLE_01))
+
+    assert harness.github.merged == []
+    assert harness.row()["status"] == "waiting_ci"
+    assert (await _state(harness))["_next"] == ("wait_ci",)
+
+    suites.answers = [[suite(conclusion="success"), suite(conclusion="success")]]  # 두 번째 suite 도 끝났다
+    await harness.ci(RID, "success")
+    assert harness.github.merged
+
+
+async def test_merge_recheck_lookup_failure_does_not_merge(harness: Harness) -> None:
+    FlakySuites(harness, [suite(conclusion="success")], GitHubError("boom", 502))
+    await harness.request(load_sample(SAMPLE_01))
+
+    assert harness.github.merged == []
+    assert harness.row()["status"] == "waiting_ci"
 
 
 async def test_01_ci_success_merges_then_commit_stub(harness: Harness) -> None:

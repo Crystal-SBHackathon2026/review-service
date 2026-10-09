@@ -8,7 +8,7 @@
                           승인              → await_ci (AI 가 고친 회차가 있으면 commit_fix)
                           거절              → END (rejected)
     pass + 수정 있음  → commit_fix → END (superseded — 수정 커밋을 autofix_commit 새 검토로)
-    pass + 수정 없음  → await_ci → check_ci ─ CI 끝남 → guard_overlay → merge_pr → commit_overlay(gitops 커밋) → END
+    pass + 수정 없음  → await_ci → check_ci ─ CI 끝남 → confirm_ci → guard_overlay → merge_pr → commit_overlay → END
                                            └ 아직    → wait_ci ⏸ → (재개) 다시 확인, 다른 suite 가 남았으면 await_ci
 
 ⏸ 는 LangGraph interrupt. review.resumed 가 오면 같은 thread_id(review_id) 로 Command(resume=...) 재개한다.
@@ -16,6 +16,9 @@ interrupt 노드는 재개 때 처음부터 다시 실행되므로 상태 기록
 
 CI 를 기다리기 전에 이미 끝났는지 먼저 본다 (gitops#9). 검토가 CI 보다 늦게 끝나면 check_suite 웹훅은 이미 지나가 있다.
 check_ci 는 DB 를 waiting_ci 로 바꾼 **뒤에** 조회하므로, 그 뒤에 끝난 CI 는 웹훅이 waiting_ci 검토를 찾아 재개한다.
+CI 결론은 언제나 GitHub check-suites 조회로 정한다 — 웹훅 한 건의 conclusion 으로는 병합하지 않는다 (P1-5).
+조회가 실패하면 waiting_ci 로 남아 다음 check_suite 웹훅(또는 review sweep 의 재확인)을 기다린다.
+confirm_ci 는 병합 직전에 전체 suite 를 한 번 더 본다 — 앱 레포마다 브랜치 보호 필수 체크가 다를 수 있다.
 
 고쳐서 통과하면(applied_ops 가 있으면) 원본 deploy.yaml 에 ops 를 적용해 PR 브랜치에 커밋하고, 그 커밋 SHA 를
 autofix_commit=True 새 검토로 넘긴다. 새 커밋이라 CI 가 다시 돌고, 앱 레포와 gitops 가 같은 명세를 갖는다.
@@ -336,7 +339,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     async def _after_ci(state: dict[str, Any], conclusion: str) -> Command:
         if conclusion != "success":
             return await _fail(state["review_id"], f"CI {conclusion} ({state['spec_ref']['commit']})")
-        return Command(goto="guard_overlay")
+        return Command(goto="confirm_ci")
 
     async def await_ci(state: dict[str, Any]) -> dict[str, Any]:
         await repo.update_review(state["review_id"], status="waiting_ci", final_spec=app_spec(state["deploy_spec"]))
@@ -361,13 +364,28 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         resumed = CiResult.model_validate(interrupt({"kind": "ci_completed", "review_id": state["review_id"]}))
         try:
             conclusion = await _ci_now(state)  # 다른 suite 가 아직 돌면 다시 기다린다
-        except GitHubError as exc:
-            log.warning("review %s: CI 상태 조회 실패 — 웹훅 결론(%s)을 쓴다: %s", state["review_id"],
-                        resumed.conclusion, exc)
-            conclusion = resumed.conclusion
+        except GitHubError as exc:  # 웹훅 한 건의 결론(suite 하나)으로 병합하지 않는다 — waiting_ci 로 돌아간다
+            log.warning("review %s: CI 상태 조회 실패 — 웹훅 결론(%s)은 쓰지 않고 다시 기다린다: %s",
+                        state["review_id"], resumed.conclusion, exc)
+            return Command(goto="await_ci")
         if conclusion is None:
             return Command(goto="await_ci")
         return await _after_ci(state, conclusion)
+
+    async def confirm_ci(state: dict[str, Any]) -> Command:
+        """병합 직전 — check-suites 를 다시 읽어 전체가 success 인지 본다. 조회 실패·미완료면 병합하지 않고 waiting_ci."""
+        rid = state["review_id"]
+        try:
+            conclusion = await _ci_now(state)
+        except GitHubError as exc:
+            log.warning("review %s: 병합 전 CI 확인 실패 — 병합하지 않고 다시 기다린다: %s", rid, exc)
+            return Command(goto="await_ci")
+        if conclusion is None:
+            log.info("review %s: 병합 전 CI 확인 — 아직 끝나지 않은 suite 가 있다", rid)
+            return Command(goto="await_ci")
+        if conclusion != "success":
+            return await _after_ci(state, conclusion)
+        return Command(goto="guard_overlay")
 
     async def guard_overlay(state: dict[str, Any]) -> Command:
         """병합 전 — 지금 배포 중인 보호 리소스(ingress 등)를 지우는 명세면 병합하지 않고 blocked (10/09 sample-app#11 장애)."""
@@ -435,8 +453,9 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     graph.add_node("apply_human_edits", apply_human_edits, destinations=("static_check", "await_human"))
     graph.add_node("commit_fix", commit_fix, destinations=(END,))
     graph.add_node("await_ci", await_ci)
-    graph.add_node("check_ci", check_ci, destinations=("wait_ci", "guard_overlay", END))
-    graph.add_node("wait_ci", wait_ci, destinations=("await_ci", "guard_overlay", END))
+    graph.add_node("check_ci", check_ci, destinations=("wait_ci", "confirm_ci", END))
+    graph.add_node("wait_ci", wait_ci, destinations=("await_ci", "confirm_ci", END))
+    graph.add_node("confirm_ci", confirm_ci, destinations=("await_ci", "guard_overlay", END))
     graph.add_node("guard_overlay", guard_overlay, destinations=("merge_pr", END))
     graph.add_node("merge_pr", merge_pr, destinations=("commit_overlay", END))
     graph.add_node("commit_overlay", commit_overlay)
