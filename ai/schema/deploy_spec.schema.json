@@ -43,7 +43,8 @@
             "env_var": "DATABASE_URL",
             "backup_retention_days": 1,
             "publicly_accessible": false,
-            "migration": null
+            "migration": null,
+            "data_import": null
           }
         },
         "secrets": {
@@ -188,6 +189,31 @@
       "title": "Bucket",
       "type": "object"
     },
+    "DataImport": {
+      "additionalProperties": false,
+      "description": "이전 배포가 볼륨의 SQLite 에 쌓은 데이터를 새 DB 로 한 번 옮긴다. 렌더러가 PreSync Job 으로 만든다(마이그레이션 다음).\n\nPostgres 의 data_import_log 에 표식을 남겨, 다음 동기화부터는 건너뛴다 — 옮긴 뒤 쌓인 데이터를 덮어쓰지 않는다.",
+      "properties": {
+        "from_volume": {
+          "description": "SQLite 파일이 있는 storage.volumes[].name (persistent)",
+          "pattern": "^[a-z]([-a-z0-9]{0,38}[a-z0-9])?$",
+          "title": "From Volume",
+          "type": "string"
+        },
+        "file": {
+          "description": "볼륨 안 SQLite 파일 이름 (예: todo.db)",
+          "maxLength": 100,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "title": "File",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from_volume",
+        "file"
+      ],
+      "title": "DataImport",
+      "type": "object"
+    },
     "Database": {
       "additionalProperties": false,
       "properties": {
@@ -278,6 +304,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/Migration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "data_import": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DataImport"
             },
             {
               "type": "null"
@@ -840,7 +877,8 @@
         "env_var": "DATABASE_URL",
         "backup_retention_days": 1,
         "publicly_accessible": false,
-        "migration": null
+        "migration": null,
+        "data_import": null
       }
     },
     "secrets": {

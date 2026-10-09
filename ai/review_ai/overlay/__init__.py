@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from review_ai.catalog import TargetCaps, load_targets
+from review_ai.overlay.data_import import data_import_job
 from review_ai.overlay.ingress import render_ingress
 from review_ai.overlay.plan import image_replacements, migration_job, preview_service, smoke_job, strategy_ops
 from review_ai.overlay.warnings import RenderWarning
@@ -90,7 +91,9 @@ def render_overlay(spec: AppSpec, *, apps_root: str = "apps") -> RenderedOverlay
     if spec.rollout.strategy == "bluegreen":
         files["service-preview.yaml"] = dump_with_header(preview_service(spec), HEADER)
         resources.append("service-preview.yaml")
-    for filename, job in (("job-migrate.yaml", migration_job(spec)), ("job-smoke.yaml", smoke_job(spec))):
+    jobs = (("job-migrate.yaml", migration_job(spec)), ("job-data-import.yaml", data_import_job(spec)),
+            ("job-smoke.yaml", smoke_job(spec)))
+    for filename, job in jobs:
         if job is not None:
             files[filename] = dump_with_header(job, HEADER)
             resources.append(filename)

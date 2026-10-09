@@ -123,6 +123,16 @@ class Migration(_Frozen):
     change: SchemaChange = Field(description="이 배포의 스키마 변경 종류 — 실행 시점(PreSync·PostSync)과 배포 전략을 정한다")
 
 
+class DataImport(_Frozen):
+    """이전 배포가 볼륨의 SQLite 에 쌓은 데이터를 새 DB 로 한 번 옮긴다. 렌더러가 PreSync Job 으로 만든다(마이그레이션 다음).
+
+    Postgres 의 data_import_log 에 표식을 남겨, 다음 동기화부터는 건너뛴다 — 옮긴 뒤 쌓인 데이터를 덮어쓰지 않는다.
+    """
+
+    from_volume: str = Field(pattern=DNS_LABEL, description="SQLite 파일이 있는 storage.volumes[].name (persistent)")
+    file: str = Field(pattern=r"^[A-Za-z0-9._-]+$", max_length=100, description="볼륨 안 SQLite 파일 이름 (예: todo.db)")
+
+
 class Database(_Frozen):
     engine: DbEngine = "none"
     version: str | None = Field(default=None, description="메이저 버전 (예: '16', '8.0')")
@@ -135,6 +145,7 @@ class Database(_Frozen):
     backup_retention_days: int = Field(default=1, ge=0, le=35)
     publicly_accessible: bool = False
     migration: Migration | None = None
+    data_import: DataImport | None = None
 
     @model_validator(mode="after")
     def _placement_when_engine(self) -> Database:
@@ -143,6 +154,10 @@ class Database(_Frozen):
         if self.migration is not None and self.engine not in MIGRATION_ENGINES:
             # SQLite 파일은 앱 파드의 볼륨 안에 있어 별도 Job 이 열 수 없다 — 앱이 시작할 때 마이그레이션한다
             raise ValueError(f"database.migration 은 {'·'.join(MIGRATION_ENGINES)} 에서만 쓴다 (지금 {self.engine})")
+        if self.data_import is not None:
+            # 테이블은 마이그레이션이 먼저 만든다 — 앱이 시작할 때 만드는 구조면 옮길 곳이 없어 데이터를 건너뛴다
+            if self.engine != "postgres" or self.migration is None or self.migration.change == "contract":
+                raise ValueError("database.data_import 는 postgres + 새 버전 전에 도는 migration(change ≠ contract)이 필요하다")
         return self
 
 
@@ -235,6 +250,17 @@ class AppSpec(_Frozen):
     storage: Storage = Storage()
     rollout: Rollout = Rollout()
     smoke: Smoke | None = Field(default=None, description="앱 레포에 테스트가 없으면 생성기가 확인 경로를 채운다")
+
+    @model_validator(mode="after")
+    def _import_volume(self) -> AppSpec:
+        data_import = self.database.data_import
+        if data_import is None:
+            return self
+        volume = next((v for v in self.storage.volumes if v.name == data_import.from_volume), None)
+        if volume is None or not volume.persistent:
+            raise ValueError(f"database.data_import.from_volume={data_import.from_volume!r} 는 "
+                             "storage.volumes 의 persistent 볼륨이어야 한다 — 빼면 옮기기 전에 PVC 가 지워진다")
+        return self
 
 
 class BaselineFacts(_Frozen):

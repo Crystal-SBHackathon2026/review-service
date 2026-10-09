@@ -94,6 +94,16 @@ rules:
     check: baseline 과 엔진이 같고 메이저 버전이 더 낮으며 database_has_data 가 false 가 아니다 (DB-001 과 같은 기준)
     fix: 이전 버전 유지. 다운그레이드는 덤프·복원으로만 가능
 
+  - id: DB-009
+    category: database
+    severity: high
+    autofix: forbidden
+    priority: P1
+    providers: [any]
+    title: SQLite 데이터를 옮길 계획 없이 엔진 변경
+    check: baseline 이 데이터 있는(또는 모르는) sqlite 이고 지금 engine 이 다른데 database.data_import 가 없다
+    fix: database.data_import{from_volume, file} 를 적고 그 볼륨을 storage.volumes 에 남긴다 — 렌더러가 마이그레이션 다음에 한 번 옮기는 Job 을 만든다
+
   # ── secret ──────────────────────────────────────────────────
   - id: SEC-001
     category: secret
