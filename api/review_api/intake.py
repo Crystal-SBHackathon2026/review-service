@@ -46,6 +46,7 @@ from review_ai.catalog import load_targets
 from review_ai.intake.repair import MAX_RAW_CHARS, repair_intake
 from review_ai.preparation import GenerationContext, app_name
 from review_ai.transform import TransformOutcome, apply_to_context, plan_transform, transform_repository
+from review_api import metrics
 from review_api.lockfile import LockfileUnavailable
 from review_ai.spec.deploy_spec import Baseline, DeploySpec, Target
 from review_common.github import FileTooLarge, GitHubError, RefConflict
@@ -343,6 +344,8 @@ async def _post_status(deps: ApiDeps, row: dict[str, Any], state: str, descripti
 async def resume_stale_intakes(deps: ApiDeps) -> list[str]:
     """처리 중 파드가 죽어 STALE_AFTER 넘게 processing 으로 남은 행을 다시 처리한다. 다시 처리한 intake_id 들."""
     rows = await deps.repo.claim_stale_intakes(STALE_AFTER)
+    if rows:
+        metrics.safe(metrics.INTAKE_SWEEP_RECOVERED.inc, len(rows))
     for row in rows:
         await process_intake(deps, row["intake_id"])
     return [row["intake_id"] for row in rows]

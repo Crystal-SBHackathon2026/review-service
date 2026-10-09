@@ -11,9 +11,13 @@ import asyncio
 import os
 from typing import Any, Protocol
 
+from prometheus_client import Counter
+
 from review_ai.errors import TransientError
 
 DEFAULT_SEND_TIMEOUT = 5.0
+
+PUBLISH = Counter("review_kafka_publish", "Kafka 발행 결과 (API·워커 각자)", ["topic", "result"])  # ok·timeout·error
 
 
 def send_timeout() -> float:
@@ -34,4 +38,9 @@ class KafkaPublisher:
         try:
             await asyncio.wait_for(self._producer.send_and_wait(topic, value=value, key=key.encode()), self.timeout)
         except TimeoutError as exc:
+            PUBLISH.labels(topic, "timeout").inc()
             raise TransientError(f"Kafka {topic} 발행이 {self.timeout:g}초 안에 끝나지 않았다") from exc
+        except Exception:
+            PUBLISH.labels(topic, "error").inc()
+            raise
+        PUBLISH.labels(topic, "ok").inc()

@@ -15,6 +15,7 @@
                                         [Bearer ARGOCD_WEBHOOK_TOKEN]
     GET  /healthz                       프로세스가 떠 있는지만 (ALB 헬스체크·livenessProbe)
     GET  /readyz                        DB SELECT 1·Kafka producer 연결. 하나라도 실패하면 503 (readinessProbe)
+    GET  /metrics                       Prometheus 지표 (review_api.metrics). 토큰 없이
 
 토큰이 설정되지 않은 [Bearer] 경로는 503 으로 거절한다 (fail-closed). GET 경로와 /webhooks/github(서명 검증)는 그대로.
 """
@@ -26,6 +27,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -34,7 +36,7 @@ from pathlib import Path
 from typing import Any, Protocol, get_args
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from review_ai.graph import check_edited_ops
@@ -50,6 +52,7 @@ from review_ai.transform.prompt import TransformOutput
 from review_api.argocd import ArgoCdEvent, handle_deploy_event
 from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spec, open_intake, process_intake,
                                sweep_stale_intakes)
+from review_api import metrics
 from review_api.lockfile import regenerate_lockfile
 from review_api.recovery import sweep_stale_reviews
 from review_common.github import GitHubError, SpecNotFound
@@ -167,6 +170,22 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
     def d(request: Request) -> ApiDeps:
         return request.app.state.deps
 
+    @app.middleware("http")
+    async def http_metrics(request: Request, call_next: Callable[[Request], Awaitable[Any]]) -> Any:
+        started, status = time.perf_counter(), 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        finally:
+            route = getattr(request.scope.get("route"), "path", None) or "unmatched"  # 경로 템플릿 — 실제 ID 를 넣지 않는다
+            metrics.observe_http(route, request.method, status, time.perf_counter() - started)
+
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics(request: Request) -> Response:
+        body, content_type = await metrics.render(d(request).repo)
+        return Response(body, media_type=content_type)
+
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
@@ -266,6 +285,24 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         x_github_event: str = Header(default=""),
         x_hub_signature_256: str = Header(default=""),
     ) -> dict[str, Any]:
+        event = x_github_event if x_github_event in ("pull_request", "check_suite") else "other"
+        try:
+            result = await _github_webhook(request, background, x_github_event, x_hub_signature_256)
+        except HTTPException as exc:
+            metrics.webhook(event, "rejected" if exc.status_code in (401, 503) and exc.detail != PUBLISH_FAILED
+                            else "error")
+            raise
+        except Exception:
+            metrics.webhook(event, "error")
+            raise
+        if event == "pull_request":
+            metrics.webhook(event, metrics.pull_request_result(result))
+        else:
+            metrics.webhook(event, "started" if result.get("resumed") else "skipped")
+        return result
+
+    async def _github_webhook(request: Request, background: BackgroundTasks, x_github_event: str,
+                              x_hub_signature_256: str) -> dict[str, Any]:
         deps_ = d(request)
         body = await request.body()
         if not deps_.github_webhook_secret:
@@ -299,10 +336,23 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
     async def argocd_webhook(event: ArgoCdEvent, request: Request,
                              authorization: str = Header(default="")) -> dict[str, Any]:
         deps_ = d(request)
-        require_bearer(authorization, deps_.argocd_webhook_token, "ARGOCD_WEBHOOK_TOKEN")
-        return await handle_deploy_event(deps_.repo, event)
+        try:
+            require_bearer(authorization, deps_.argocd_webhook_token, "ARGOCD_WEBHOOK_TOKEN")
+        except HTTPException:
+            metrics.webhook("argocd", "rejected")
+            raise
+        try:
+            result = await handle_deploy_event(deps_.repo, event)
+        except Exception:
+            metrics.webhook("argocd", "error")
+            raise
+        metrics.webhook("argocd", metrics.argocd_result(result))
+        return result
 
     return app
+
+
+PUBLISH_FAILED = "메시지를 큐에 넣지 못했다"
 
 
 async def publish(deps: ApiDeps, topic: str, key: str, value: bytes) -> None:
@@ -311,7 +361,7 @@ async def publish(deps: ApiDeps, topic: str, key: str, value: bytes) -> None:
         await deps.publisher.send(topic, key, value)
     except Exception as exc:
         log.exception("%s %s 발행 실패", topic, key)
-        raise HTTPException(503, "메시지를 큐에 넣지 못했다") from exc
+        raise HTTPException(503, PUBLISH_FAILED) from exc
 
 
 async def fetch_spec(deps: ApiDeps, spec_ref: dict[str, str]) -> dict[str, Any]:
@@ -354,7 +404,7 @@ async def submit_review(deps: ApiDeps, loaded: dict[str, Any], spec_ref: dict[st
     except Exception as exc:
         log.exception("review %s: review.requested 발행 실패", review_id)
         await deps.repo.update_review(review_id, status="failed", error=f"publish: {exc}"[:2000])
-        raise HTTPException(503, "검토 요청을 큐에 넣지 못했다") from exc
+        raise HTTPException(503, PUBLISH_FAILED) from exc
     await post_verify_status(deps, spec_ref, review_id, "pending", "AI 검토 중")
     return review_id
 
