@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from typing import Any
 
 from review_ai.retrieval import Retriever
 from review_ai.retrieval.case_retriever import CompositeRetriever
@@ -25,9 +26,10 @@ class OptionalRetriever:
         self._retriever = retriever
         self._name = name
 
-    async def search(self, findings: Sequence[Finding], target_env: str) -> list[Doc]:
+    async def search(self, findings: Sequence[Finding], target_env: str, *args: Any, **kwargs: Any) -> list[Doc]:
+        # 뒤 인자(검색 범위 scope 등)는 감싼 검색기에 그대로 넘긴다 — Retriever 프로토콜에 인자가 늘어도 깨지지 않게
         try:
-            return await self._retriever.search(findings, target_env)
+            return await self._retriever.search(findings, target_env, *args, **kwargs)
         except Exception:
             log.warning("%s 검색 실패 — 이번 검토는 %s 없이 진행한다", self._name, self._name, exc_info=True)
             return []

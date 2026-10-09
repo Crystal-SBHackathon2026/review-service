@@ -135,3 +135,15 @@ def test_parse_args_rejects_missing_dir(tmp_path) -> None:
 async def test_run_rejects_empty_knowledge_dir(tmp_path) -> None:
     with pytest.raises(SystemExit, match="색인할 문서가 없다"):
         await run(["--qdrant-url", "http://q", "--knowledge-dir", str(tmp_path)])
+
+
+async def test_optional_retriever_passes_extra_arguments() -> None:
+    seen = []
+
+    class Scoped:
+        async def search(self, findings, target_env, scope=None):
+            seen.append(scope)
+            return []
+
+    await OptionalRetriever(Scoped(), "Qdrant").search([], "aws", "scope-x")
+    assert seen == ["scope-x"]
