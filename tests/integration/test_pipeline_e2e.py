@@ -223,28 +223,38 @@ async def test_spec_intakes_on_postgres(pool: Any) -> None:
     assert await repo.latest_baseline_for_repository("other/repo") is None
 
 async def test_review_cases_on_postgres(pool: Any) -> None:
-    """판단 사례 — case_id 로 한 번만, rule_id 배열 매칭, 같은 대상 환경 먼저·그 안에서 최근 순."""
+    """판단 사례 — case_id 로 한 번만, rule_id 배열 매칭, 같은 앱·레포·허용한 종료 방식만, 같은 대상 환경 먼저·그 안에서 최근 순."""
     repo = PostgresReviewRepository(pool)
-    for rid in ("rv_1", "rv_2", "rv_3"):
-        await repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=REPO,
-                                 spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
+    for rid, repository in (("rv_1", REPO), ("rv_2", REPO), ("rv_3", REPO), ("rv_4", REPO), ("rv_5", "other/repo")):
+        await repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=repository,
+                                 spec_ref={"repository": repository, "commit": HEAD, "path": "deploy.yaml"},
                                  pr_head_sha=HEAD, requested_by="it")
 
-    def case(rid: str, env: str, rules: list[str]) -> dict[str, Any]:
-        return {"case_id": f"{rid}.rejected", "review_id": rid, "app": "sample-app", "target_env": env,
-                "rule_ids": rules, "outcome": "rejected", "summary": f"지난 검토 {rid}",
+    def case(rid: str, env: str, rules: list[str], *, app: str = "sample-app", outcome: str = "rejected"
+             ) -> dict[str, Any]:
+        return {"case_id": f"{rid}.{outcome}", "review_id": rid, "app": app, "target_env": env,
+                "rule_ids": rules, "outcome": outcome, "summary": f"지난 검토 {rid}",
                 "ops": [{"op": "replace", "path": "/database/engine", "value": "postgres"}]}
+
+    def find(rule_id: str, env: str, limit: int, outcomes: tuple[str, ...] = ("rejected",)) -> Any:
+        return repo.find_cases(rule_id, app="sample-app", repository=REPO, target_env=env, outcomes=outcomes,
+                               limit=limit)
 
     assert await repo.insert_case(**case("rv_1", "aws", ["DB-001", "STO-005"]))
     assert await repo.insert_case(**case("rv_2", "gcp", ["DB-001"]))
     assert await repo.insert_case(**case("rv_3", "aws", ["DB-001"]))
     assert not await repo.insert_case(**case("rv_3", "aws", ["DB-001"]))
+    assert await repo.insert_case(**case("rv_4", "aws", ["DB-001"], app="other-app"))  # 다른 앱
+    assert await repo.insert_case(**case("rv_5", "aws", ["DB-001"]))  # 같은 앱 이름, 다른 레포
+    assert await repo.insert_case(**case("rv_1", "aws", ["DB-001"], outcome="human_approved"))
 
-    found = await repo.find_cases("DB-001", target_env="aws", limit=3)
+    found = await find("DB-001", "aws", 5)
     assert [c["case_id"] for c in found] == ["rv_3.rejected", "rv_1.rejected", "rv_2.rejected"]
     assert found[0]["ops"] == [{"op": "replace", "path": "/database/engine", "value": "postgres"}]
-    assert [c["case_id"] for c in await repo.find_cases("STO-005", target_env="gcp", limit=3)] == ["rv_1.rejected"]
-    assert len(await repo.find_cases("DB-001", target_env="gcp", limit=2)) == 2
+    assert [c["case_id"] for c in await find("STO-005", "gcp", 3)] == ["rv_1.rejected"]
+    assert len(await find("DB-001", "gcp", 2)) == 2
+    assert [c["case_id"] for c in await find("DB-001", "aws", 1, ("rejected", "human_approved"))] == [
+        "rv_1.human_approved"]
     with pytest.raises(psycopg.errors.CheckViolation):
         await repo.insert_case(**{**case("rv_1", "aws", ["DB-001"]), "case_id": "rv_1.x", "outcome": "merged"})
 

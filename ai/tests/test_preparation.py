@@ -211,7 +211,7 @@ async def test_masked_spec_is_not_rendered_or_marked_ready(sample_app: dict) -> 
 
 async def test_retrieval_failure_does_not_return_success(sample_app: dict) -> None:
     class BrokenRetriever:
-        async def search(self, findings: list, target_env: str) -> list:
+        async def search(self, findings: list, target_env: str, scope: object = None) -> list:
             raise TimeoutError("retrieval unavailable")
 
     with pytest.raises(TimeoutError):
