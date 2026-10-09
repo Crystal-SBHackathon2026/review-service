@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>검토 승인</title>
+<!--
+  needs_human 검토 승인 화면. Review API 가 GET /ui 로 직접 서빙한다 (같은 주소라 CORS 없음).
+  - 읽기(GET /reviews, /reviews/{id})는 토큰 없이, 응답(POST /reviews/{id}/decision)만 Bearer 토큰
+  - 토큰·승인자는 sessionStorage 에만 둔다. 화면·URL·콘솔에 토큰을 남기지 않는다
+  - 서버 값(명세·findings)은 사용자 입력이라 innerHTML 을 쓰지 않고 textContent 로만 그린다
+-->
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5b6470; --border: #d9dde3;
+  --accent: #2557d6; --accent-text: #ffffff; --hover: #eef2fb; --selected: #e3ebff;
+  --warn-bg: #fff4d6; --warn-text: #7a4b00; --warn-border: #f0c75e;
+  --danger: #c62828; --danger-bg: #fde8e8; --ok: #1e7b3a; --ok-bg: #e3f4e8;
+  --info-bg: #e6eefc; --info-text: #1d4aa8; --gray-bg: #eceef1; --gray-text: #4b5360;
+  --code-bg: #f1f3f6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418; --panel: #1a1e24; --text: #e6e9ee; --muted: #9aa3ae; --border: #2e353f;
+    --accent: #5b8cff; --accent-text: #0b0e12; --hover: #222833; --selected: #1f2b45;
+    --warn-bg: #3a2e10; --warn-text: #f3cf73; --warn-border: #6b5418;
+    --danger: #ff7b7b; --danger-bg: #3a1c1c; --ok: #6fd18f; --ok-bg: #173523;
+    --info-bg: #1b2a48; --info-text: #9dbaff; --gray-bg: #262c35; --gray-text: #b4bcc7;
+    --code-bg: #232831;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between;
+  padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
+header h1 { font-size: 16px; margin: 0; }
+.who { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); }
+.conn { font-size: 12px; }
+.conn.bad { color: var(--danger); }
+main { display: grid; grid-template-columns: minmax(300px, 420px) 1fr; gap: 16px; padding: 16px; }
+@media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+section.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+  min-width: 0; }
+h2 { font-size: 15px; margin: 0 0 8px; }
+h3 { font-size: 14px; margin: 16px 0 6px; }
+button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--panel); color: var(--text); cursor: pointer; }
+button:hover:not(:disabled) { background: var(--hover); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+button.danger { color: var(--danger); border-color: var(--danger); }
+button.link { border: 0; background: none; color: var(--accent); padding: 0; }
+input, select { font: inherit; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); color: var(--text); min-width: 0; width: 100%; }
+a { color: var(--accent); }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+pre { background: var(--code-bg); padding: 8px; border-radius: 6px; margin: 4px 0; white-space: pre-wrap;
+  word-break: break-all; }
+.muted { color: var(--muted); }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap;
+  background: var(--gray-bg); color: var(--gray-text); }
+.badge.needs_human, .badge.high { background: var(--warn-bg); color: var(--warn-text); }
+.badge.reviewing, .badge.waiting_ci, .badge.merging, .badge.received, .badge.medium { background: var(--info-bg);
+  color: var(--info-text); }
+.badge.committed { background: var(--ok-bg); color: var(--ok); }
+.badge.rejected, .badge.failed, .badge.blocked { background: var(--danger-bg); color: var(--danger); }
+.badge.high { font-weight: 600; }
+ul.list { list-style: none; margin: 0; padding: 0; }
+ul.list li { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px;
+  cursor: pointer; }
+ul.list li:hover { background: var(--hover); }
+ul.list li.urgent { border-color: var(--warn-border); border-left: 4px solid var(--warn-border); }
+ul.list li.selected { background: var(--selected); }
+.row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.row .grow { flex: 1; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.meta { font-size: 12px; color: var(--muted); }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; }
+.card { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; }
+.why { border-left: 3px solid var(--accent); padding-left: 8px; margin-top: 6px; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 6px; border-bottom: 1px solid var(--border); vertical-align: top;
+  overflow-wrap: anywhere; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.notice { padding: 8px 10px; border-radius: 6px; margin-top: 10px; }
+.notice.ok { background: var(--ok-bg); color: var(--ok); }
+.notice.err { background: var(--danger-bg); color: var(--danger); white-space: pre-wrap; }
+.notice.info { background: var(--info-bg); color: var(--info-text); }
+.banner { background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border); }
+dialog { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text);
+  width: min(420px, calc(100vw - 32px)); }
+dialog::backdrop { background: rgba(0, 0, 0, .4); }
+dialog label { display: block; margin: 10px 0 4px; }
+.empty { color: var(--muted); padding: 16px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AI 검토 · 사람 승인</h1>
+  <div class="who">
+    <span id="who-approver"></span>
+    <span id="who-token"></span>
+    <button type="button" id="open-settings">승인자·토큰 설정</button>
+    <span id="conn" class="conn"></span>
+  </div>
+</header>
+<main>
+  <section class="panel" aria-labelledby="list-title">
+    <h2 id="list-title">진행 중인 검토</h2>
+    <ul id="list" class="list"></ul>
+  </section>
+  <section class="panel" aria-live="polite">
+    <div id="detail"><p class="empty">왼쪽에서 검토를 고르세요.</p></div>
+    <div id="respond"></div>
+  </section>
+</main>
+
+<dialog id="settings">
+  <form id="settings-form" method="dialog">
+    <h2>승인자·토큰</h2>
+    <p class="muted">조회는 토큰 없이 됩니다. 승인·거절에만 토큰이 필요합니다. 이 탭을 닫으면 지워집니다.</p>
+    <label for="f-approver">승인자 이름</label>
+    <input id="f-approver" name="approver" autocomplete="name" required>
+    <label for="f-token">REVIEW_API_TOKEN</label>
+    <input id="f-token" name="token" type="password" autocomplete="off" spellcheck="false"
+           placeholder="비워 두면 지금 토큰 유지">
+    <p id="settings-msg" class="muted"></p>
+    <div class="actions">
+      <button type="submit" class="primary" value="save">저장</button>
+      <button type="button" id="settings-cancel">나중에</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+(function () {
+  const ACTIVE = ["needs_human", "reviewing", "waiting_ci", "merging"];
+  const LIST_MS = 5000, DETAIL_MS = 3000;
+  const STATUS_LABEL = {
+    received: "접수", reviewing: "검토 중", needs_human: "사람 확인 필요", waiting_ci: "CI 대기",
+    merging: "병합 중", committed: "배포 커밋됨", blocked: "막힘", rejected: "거절됨", failed: "실패",
+    superseded: "새 검토로 대체됨",
+  };
+  const KEY_TOKEN = "review-ui.token", KEY_APPROVER = "review-ui.approver";
+
+  // --- sessionStorage (막혀 있어도 이 탭 안에서는 동작) ---
+  const memory = {};
+  function load(key) {
+    try { const v = sessionStorage.getItem(key); if (v !== null) return v; } catch (e) { /* 막힘 */ }
+    return memory[key] || "";
+  }
+  function save(key, value) {
+    memory[key] = value;
+    try { if (value) sessionStorage.setItem(key, value); else sessionStorage.removeItem(key); } catch (e) { /* 막힘 */ }
+  }
+
+  // --- DOM: textContent 로만 그린다 ---
+  function el(tag, props, children) {
+    const node = document.createElement(tag);
+    if (props) {
+      for (const [k, v] of Object.entries(props)) {
+        if (v === undefined || v === null || v === false) continue;
+        if (k === "text") node.textContent = String(v);
+        else if (k === "class") node.className = v;
+        else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+        else node.setAttribute(k, v === true ? "" : String(v));
+      }
+    }
+    for (const c of [].concat(children || [])) {
+      if (c === null || c === undefined || c === false) continue;
+      node.append(c instanceof Node ? c : document.createTextNode(String(c)));
+    }
+    return node;
+  }
+  const $ = (id) => document.getElementById(id);
+  const badge = (status) => el("span", {class: "badge " + status, text: STATUS_LABEL[status] || status});
+  const json = (v) => JSON.stringify(v, null, 2);
+  const valueText = (v) => (typeof v === "string" ? v : JSON.stringify(v));
+
+  function ago(iso) {
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return "";
+    const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (s < 60) return s + "초 전";
+    if (s < 3600) return Math.floor(s / 60) + "분 전";
+    if (s < 86400) return Math.floor(s / 3600) + "시간 " + Math.floor((s % 3600) / 60) + "분 전";
+    return Math.floor(s / 86400) + "일 전";
+  }
+  function localTime(iso) {
+    const t = Date.parse(iso);
+    return Number.isNaN(t) ? String(iso || "") : new Date(t).toLocaleString();
+  }
+  function prLink(specRef, number) {
+    const repo = (specRef || {}).repository || "";
+    if (!Number.isInteger(number) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return null;
+    return el("a", {href: "https://github.com/" + repo + "/pull/" + number, target: "_blank", rel: "noopener noreferrer",
+                    text: repo.split("/")[1] + " #" + number, onclick: (e) => e.stopPropagation()});
+  }
+
+  // --- 상태 ---
+  let token = load(KEY_TOKEN), approver = load(KEY_APPROVER);
+  let selectedId = decodeURIComponent(location.hash.slice(1));
+  let lastListJson = "", lastDetailJson = "", respondKey = "";
+  let current = null;            // 선택한 검토 (GET /reviews/{id})
+  const submitted = new Set();    // 202 를 받은 review_id — needs_human 이 풀릴 때까지 버튼을 잠근다
+
+  function renderWho() {
+    $("who-approver").textContent = approver ? "승인자: " + approver : "승인자 미설정";
+    $("who-token").textContent = token ? "토큰 입력됨" : "토큰 없음";
+  }
+  function openSettings(message) {
+    $("f-approver").value = approver;
+    $("f-token").value = "";
+    $("f-token").required = !token;
+    $("settings-msg").textContent = message || "";
+    if (!$("settings").open) $("settings").showModal();
+  }
+  $("settings-form").addEventListener("submit", () => {
+    approver = $("f-approver").value.trim();
+    const t = $("f-token").value.trim();
+    if (t) token = t;
+    $("f-token").value = "";
+    save(KEY_APPROVER, approver);
+    save(KEY_TOKEN, token);
+    renderWho();
+  });
+  $("settings-cancel").addEventListener("click", () => { $("f-token").value = ""; $("settings").close(); });
+  $("open-settings").addEventListener("click", () => openSettings());
+
+  async function getJson(url) {
+    const res = await fetch(url, {headers: {Accept: "application/json"}, cache: "no-store"});
+    if (!res.ok) { const err = new Error("HTTP " + res.status); err.status = res.status; throw err; }
+    return res.json();
+  }
+  function setConn(ok) {
+    $("conn").textContent = ok ? "" : "서버 연결 끊김 — 다시 시도 중";
+    $("conn").className = "conn" + (ok ? "" : " bad");
+  }
+
+  // --- 목록 ---
+  async function pollList() {
+    const qs = ACTIVE.map((s) => "status=" + s).join("&") + "&limit=50";
+    try {
+      const rows = await getJson("/reviews?" + qs);
+      setConn(true);
+      const text = JSON.stringify(rows);
+      if (text !== lastListJson) { lastListJson = text; renderList(rows); }
+      else refreshAges();
+    } catch (e) { setConn(false); }
+  }
+  function renderList(rows) {
+    rows.sort((a, b) => (b.status === "needs_human") - (a.status === "needs_human")
+                        || Date.parse(b.created_at) - Date.parse(a.created_at));
+    const list = $("list");
+    if (!rows.length) { list.replaceChildren(el("li", {class: "empty", text: "진행 중인 검토가 없습니다."})); return; }
+    list.replaceChildren(...rows.map((r) => {
+      const urgent = r.status === "needs_human";
+      return el("li", {
+        class: (urgent ? "urgent" : "") + (r.review_id === selectedId ? " selected" : ""),
+        "data-id": r.review_id, tabindex: "0",
+        onclick: () => select(r.review_id),
+        onkeydown: (e) => { if (e.key === "Enter") select(r.review_id); },
+      }, [
+        el("div", {class: "row"}, [el("span", {class: "grow", text: r.app + " · " + r.target_env}), badge(r.status)]),
+        el("div", {class: "row meta"}, [
+          prLink(r.spec_ref, r.pr_number) || el("span", {text: "PR 없음"}),
+          el("span", {text: (r.reasons || []).join(", ") || "사유 없음"}),
+        ]),
+        el("div", {class: "row meta"}, [
+          el("span", {text: "요청 " + (r.requested_by || "-")}),
+          el("span", {class: "age", "data-at": r.created_at, text: ago(r.created_at)}),
+        ]),
+      ]);
+    }));
+  }
+  function refreshAges() {
+    for (const n of document.querySelectorAll(".age[data-at]")) n.textContent = ago(n.getAttribute("data-at"));
+  }
+  function markSelected() {
+    for (const li of $("list").children) li.classList.toggle("selected", li.getAttribute("data-id") === selectedId);
+  }
+
+  // --- 상세 ---
+  function select(id) {
+    if (!id || id === selectedId) return;
+    selectedId = id;
+    if (location.hash.slice(1) !== encodeURIComponent(id)) history.replaceState(null, "", "#" + encodeURIComponent(id));
+    lastDetailJson = ""; respondKey = ""; current = null;
+    $("detail").replaceChildren(el("p", {class: "muted", text: "불러오는 중…"}));
+    $("respond").replaceChildren();
+    markSelected();
+    pollDetail();
+  }
+  window.addEventListener("hashchange", () => select(decodeURIComponent(location.hash.slice(1))));
+
+  async function pollDetail() {
+    if (!selectedId) return;
+    const id = selectedId;
+    try {
+      const review = await getJson("/reviews/" + encodeURIComponent(id));
+      if (id !== selectedId) return;
+      setConn(true);
+      const text = JSON.stringify(review);
+      if (text === lastDetailJson) return;
+      lastDetailJson = text;
+      current = review;
+      if (review.status !== "needs_human") submitted.delete(id);
+      renderDetail(review);
+      renderRespond(review);
+    } catch (e) {
+      if (id !== selectedId) return;
+      if (e.status === 404) {
+        $("detail").replaceChildren(el("p", {class: "notice err", text: "검토가 없습니다: " + id}));
+        $("respond").replaceChildren();
+      } else setConn(false);
+    }
+  }
+
+  function kv(pairs) {
+    return el("dl", {class: "kv"}, pairs.filter(([, v]) => v !== null && v !== undefined && v !== "")
+      .flatMap(([k, v]) => [el("dt", {text: k}), el("dd", {}, [v])]));
+  }
+
+  function renderDetail(r) {
+    const decision = r.decision || {};
+    const out = [];
+    out.push(el("div", {class: "row"}, [
+      el("h2", {class: "grow", text: r.app + " · " + r.target_env}), badge(r.status),
+    ]));
+    if (r.superseded_by) {
+      out.push(el("p", {class: "notice banner"}, [
+        "새 커밋으로 대체된 검토입니다. ",
+        el("a", {href: "#" + encodeURIComponent(r.superseded_by), text: "새 검토 " + r.superseded_by + " 보기"}),
+      ]));
+    }
+    const ref = r.spec_ref || {};
+    out.push(kv([
+      ["review_id", el("code", {text: r.review_id})],
+      ["verdict", r.verdict || "-"],
+      ["PR", prLink(ref, r.pr_number) || "-"],
+      ["명세", ref.repository ? el("code", {text: ref.repository + "@" + String(ref.commit || "").slice(0, 12) + ":" + (ref.path || "")}) : null],
+      ["요청자", r.requested_by],
+      ["요청", localTime(r.created_at) + " (" + ago(r.created_at) + ")"],
+      ["최근 변경", localTime(r.updated_at)],
+    ]));
+
+    // 사유
+    out.push(el("h3", {text: "사유"}));
+    const reasons = r.reasons || [];
+    const messages = r.reason_messages || {};
+    out.push(reasons.length
+      ? el("ul", {}, reasons.map((c) => el("li", {}, [el("code", {text: c}), messages[c] ? " — " + messages[c] : ""])))
+      : el("p", {class: "muted", text: "사유 없음"}));
+
+    // findings + AI 설명 (finding_id 로 묶는다)
+    const findings = r.findings || [];
+    const items = decision.items || [];
+    const itemsById = new Map(items.map((i) => [i.finding_id, i]));
+    out.push(el("h3", {text: "규칙 검사 결과 (" + findings.length + ")"}));
+    if (!findings.length) out.push(el("p", {class: "muted", text: "걸린 규칙 없음"}));
+    for (const f of findings) {
+      const item = itemsById.get(f.finding_id);
+      itemsById.delete(f.finding_id);
+      out.push(el("div", {class: "card"}, [
+        el("div", {class: "row"}, [
+          el("code", {text: f.rule_id}), el("span", {class: "badge " + f.severity, text: f.severity}),
+          el("span", {class: "grow", text: f.title}),
+        ]),
+        el("div", {class: "meta"}, [
+          "위치 ", el("code", {text: (f.location || {}).spec_path || "-"}),
+          f.irreversible ? " · 되돌릴 수 없음" : "", f.autofix === "forbidden" ? " · 자동 수정 금지" : "",
+        ]),
+        f.evidence ? el("pre", {text: f.evidence}) : null,
+        item ? el("div", {class: "why"}, [
+          el("strong", {text: "AI 설명 "}),
+          el("span", {class: "meta", text: [(item.cited_rule_ids || []).join(", "), item.fix_kind].filter(Boolean).join(" · ")}),
+          el("div", {text: item.why || ""}),
+        ]) : null,
+      ]));
+    }
+    for (const item of itemsById.values()) {  // finding 에 묶이지 않은 설명 (검증에서 걸러지지만 혹시)
+      out.push(el("div", {class: "card why"}, [el("code", {text: item.finding_id}), el("div", {text: item.why || ""})]));
+    }
+    if ((decision.extra_opinions || []).length) {
+      out.push(el("h3", {text: "참고 의견"}));
+      out.push(el("p", {class: "meta", text: "판정에 쓰이지 않은 AI 의견입니다."}));
+      out.push(el("ul", {}, decision.extra_opinions.map((o) => el("li", {text: o}))));
+    }
+
+    // 권장값
+    const recs = decision.recommendations || [];
+    out.push(el("h3", {text: "권장값"}));
+    if (!recs.length) {
+      out.push(el("p", {class: "muted", text: "권장값 없음, 직접 입력하거나 그대로 승인"}));
+    } else {
+      const rows = [];
+      for (const rec of recs) {
+        (rec.ops || []).forEach((op, i) => rows.push(el("tr", {}, [
+          i === 0 ? el("td", {rowspan: String(rec.ops.length)}, [rec.why || "", el("div", {class: "meta", text: rec.source || ""})]) : null,
+          el("td", {}, [el("code", {text: op.op})]),
+          el("td", {}, [el("code", {text: op.path})]),
+          el("td", {}, [op.op === "remove" ? el("span", {class: "muted", text: "(삭제)"}) : el("code", {text: valueText(op.value)})]),
+        ])));
+      }
+      out.push(el("div", {class: "table-wrap"}, [el("table", {}, [
+        el("thead", {}, [el("tr", {}, ["이유", "op", "경로", "값"].map((h) => el("th", {text: h})))]),
+        el("tbody", {}, rows),
+      ])]));
+    }
+
+    // 처리 이력
+    out.push(el("h3", {text: "처리 이력"}));
+    const human = r.human_decision;
+    const deploy = r.deploy_result;
+    out.push(kv([
+      ["회차", String((r.rounds || []).length)],
+      ["사람 결정", human ? el("pre", {text: json(human)}) : null],
+      ["배포 결과", deploy ? el("pre", {text: json(deploy)}) : null],
+      ["merge_sha", r.merge_sha ? el("code", {text: r.merge_sha}) : null],
+      ["gitops 커밋", r.gitops_commit_sha ? el("code", {text: r.gitops_commit_sha}) : null],
+      ["오류", r.error ? el("pre", {text: r.error}) : null],
+    ]));
+    $("detail").replaceChildren(...out);
+  }
+
+  // --- 응답 ---
+  // 응답 영역은 검토·상태·권장값이 바뀔 때만 다시 그린다 — 폴링이 입력 중인 값을 지우지 않게
+  function renderRespond(r) {
+    const recs = (r.decision || {}).recommendations || [];
+    const key = [r.review_id, r.status, JSON.stringify(recs)].join("|");
+    if (key === respondKey) return;
+    respondKey = key;
+    const box = $("respond");
+    if (r.status !== "needs_human") {
+      box.replaceChildren(el("p", {class: "notice info", text: "사람 응답은 needs_human 상태에서만 할 수 있습니다. 지금: "
+        + (STATUS_LABEL[r.status] || r.status)}));
+      return;
+    }
+    const locked = submitted.has(r.review_id);
+    const msg = el("div", {id: "respond-msg"});
+    const recOps = recs.flatMap((rec) => rec.ops || []);
+
+    // 값 고쳐서 승인 — 권장값 행(path 고정)과 직접 추가한 행
+    const editRows = el("tbody");
+    for (const op of recOps) {
+      const input = op.op === "remove" ? null
+        : el("input", {"data-kind": "rec", "data-op": op.op, "data-path": op.path, placeholder: "비우면 권장값 사용",
+                        "aria-label": op.path + " 값"});
+      editRows.append(el("tr", {}, [
+        el("td", {}, [el("code", {text: op.op})]),
+        el("td", {}, [el("code", {text: op.path})]),
+        el("td", {}, [op.op === "remove" ? el("span", {class: "muted", text: "(삭제)"}) : el("code", {text: valueText(op.value)})]),
+        el("td", {}, [input || el("span", {class: "muted", text: "권장값 그대로"})]),
+        el("td"),
+      ]));
+    }
+    function addRow() {
+      const tr = el("tr", {"data-kind": "manual"});
+      const opSel = el("select", {"aria-label": "op"}, ["replace", "add", "remove"].map((o) => el("option", {value: o, text: o})));
+      const path = el("input", {placeholder: "/runtime/env/KEY", "aria-label": "경로"});
+      const value = el("input", {placeholder: "값 (JSON 또는 문자열)", "aria-label": "값"});
+      opSel.addEventListener("change", () => { value.disabled = opSel.value === "remove"; });
+      tr.append(el("td", {}, [opSel]), el("td", {}, [path]), el("td", {class: "muted", text: "직접 입력"}),
+                el("td", {}, [value]), el("td", {}, [el("button", {type: "button", class: "link", text: "빼기",
+                                                                    onclick: () => tr.remove()})]));
+      editRows.append(tr);
+      path.focus();
+    }
+
+    const buttons = [];
+    function button(label, cls, handler) {
+      const b = el("button", {type: "button", class: cls, text: label, disabled: locked, onclick: handler});
+      buttons.push(b);
+      return b;
+    }
+    async function send(body, confirmText) {
+      if (!approver || !token) { openSettings("승인자와 토큰을 먼저 입력하세요."); return; }
+      if (confirmText && !window.confirm(confirmText)) return;
+      buttons.forEach((b) => { b.disabled = true; });
+      showMsg(msg, "info", "보내는 중…");
+      let res;
+      try {
+        res = await fetch("/reviews/" + encodeURIComponent(r.review_id) + "/decision", {
+          method: "POST", cache: "no-store",
+          headers: {"Content-Type": "application/json", Authorization: "Bearer " + token},
+          body: JSON.stringify({...body, approver}),
+        });
+      } catch (e) {
+        showMsg(msg, "err", "서버에 보내지 못했습니다. 다시 시도하세요.");
+        buttons.forEach((b) => { b.disabled = false; });
+        return;
+      }
+      if (res.status === 202) {
+        submitted.add(r.review_id);
+        showMsg(msg, "ok", "보냈습니다. 워커 재개 중 — 상태가 바뀌면 여기에 보입니다.");
+        pollDetail(); pollList();
+        return;
+      }
+      const detail = await errorDetail(res);
+      if (res.status === 401) {
+        token = ""; save(KEY_TOKEN, ""); renderWho();
+        showMsg(msg, "err", "토큰이 맞지 않습니다. 다시 입력한 뒤 버튼을 다시 누르세요.");
+        openSettings("토큰이 맞지 않습니다.");
+      } else if (res.status === 409) {
+        showMsg(msg, "err", "이미 처리됐거나 상태가 바뀌었습니다. 새로고침합니다." + (detail ? "\n" + detail : ""));
+        respondKey = ""; lastDetailJson = "";
+        pollDetail(); pollList();
+        return;
+      } else if (res.status === 422) {
+        showMsg(msg, "err", detail || "입력값을 적용할 수 없습니다.");
+      } else {
+        showMsg(msg, "err", "실패 (HTTP " + res.status + ")" + (detail ? "\n" + detail : ""));
+      }
+      buttons.forEach((b) => { b.disabled = false; });
+    }
+    function editedOps() {
+      const ops = [];
+      for (const input of editRows.querySelectorAll("input[data-kind=rec]")) {
+        const text = input.value.trim();
+        if (!text) continue;  // 비운 칸은 보내지 않는다 — 서버가 권장값으로 채운다
+        ops.push({op: input.getAttribute("data-op"), path: input.getAttribute("data-path"), value: parseValue(text)});
+      }
+      for (const tr of editRows.querySelectorAll("tr[data-kind=manual]")) {
+        const [opSel, path, value] = tr.querySelectorAll("select, input");
+        const p = path.value.trim();
+        if (!p) continue;
+        if (!p.startsWith("/")) throw new Error("경로는 / 로 시작해야 합니다: " + p);
+        if (opSel.value === "remove") { ops.push({op: "remove", path: p}); continue; }
+        const text = value.value.trim();
+        if (!text) continue;
+        ops.push({op: opSel.value, path: p, value: parseValue(text)});
+      }
+      return ops;
+    }
+
+    const parts = [el("h3", {text: "응답"})];
+    if (locked) parts.push(el("p", {class: "notice ok", text: "보냈습니다. 워커 재개 중…"}));
+    const main = el("div", {class: "actions"});
+    if (recs.length) {
+      main.append(button("권장값으로 진행", "primary", () => send({decision: "approved"})));
+    }
+    main.append(
+      button("작성한 명세 그대로 승인", "", () => send({decision: "approved", use_recommendations: false},
+        "권장값을 쓰지 않고 작성한 명세 그대로 승인합니다. 진행할까요?")),
+      button("거절", "danger", () => send({decision: "rejected"}, "이 검토를 거절합니다. 병합하지 않습니다. 진행할까요?")),
+    );
+    parts.push(main);
+
+    parts.push(el("h3", {text: "값 고쳐서 승인"}));
+    parts.push(el("p", {class: "meta", text: recs.length
+      ? "고칠 값만 입력하세요. 비워 둔 칸은 보내지 않고 서버가 권장값으로 채웁니다. 값은 JSON 으로 읽고, 아니면 문자열로 보냅니다."
+      : "권장값이 없습니다. 고칠 경로와 값을 직접 추가하세요. 값은 JSON 으로 읽고, 아니면 문자열로 보냅니다."}));
+    parts.push(el("div", {class: "table-wrap"}, [el("table", {}, [
+      el("thead", {}, [el("tr", {}, ["op", "경로", "권장값", "새 값", ""].map((h) => el("th", {text: h})))]),
+      editRows,
+    ])]));
+    parts.push(el("div", {class: "actions"}, [
+      el("button", {type: "button", text: "행 추가", onclick: addRow}),
+      button("값 고쳐서 승인", "primary", () => {
+        let ops;
+        try { ops = editedOps(); } catch (e) { showMsg(msg, "err", e.message); return; }
+        if (!ops.length) { showMsg(msg, "err", "입력한 값이 없습니다. 권장값 그대로라면 \"권장값으로 진행\"을 누르세요."); return; }
+        send({decision: "approved", edited_ops: ops});
+      }),
+    ]));
+    parts.push(msg);
+    box.replaceChildren(...parts);
+  }
+
+  function parseValue(text) {
+    try { return JSON.parse(text); } catch (e) { return text; }
+  }
+  function showMsg(node, kind, text) {
+    node.replaceChildren(el("p", {class: "notice " + kind, text}));
+  }
+  async function errorDetail(res) {
+    let body;
+    try { body = await res.json(); } catch (e) { return ""; }
+    const d = body && body.detail;
+    if (!d) return "";
+    if (typeof d === "string") return d;
+    if (Array.isArray(d)) return d.map((x) => (x.loc || []).join(".") + ": " + x.msg).join("\n");
+    if (d.message) return d.message + (d.errors ? "\n" + (typeof d.errors === "string" ? d.errors : json(d.errors)) : "");
+    return json(d);
+  }
+
+  // --- 폴링 (응답이 끝난 뒤 다음 요청 — 겹치지 않게) ---
+  function loop(fn, ms) {
+    const tick = async () => { if (!document.hidden) await fn(); setTimeout(tick, ms); };
+    tick();
+  }
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) { pollList(); pollDetail(); } });
+
+  renderWho();
+  if (!approver || !token) openSettings();
+  loop(pollList, LIST_MS);
+  loop(pollDetail, DETAIL_MS);
+  setInterval(refreshAges, 1000 * 30);
+})();
+</script>
+</body>
+</html>
