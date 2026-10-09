@@ -266,6 +266,7 @@ async def test_merged_but_overlay_failed(stack: Stack) -> None:
 
     row = await stack.row(rid)
     assert (row["status"], row["merge_sha"], row["gitops_commit_sha"]) == ("committed", MERGE_SHA, GITOPS_SHA)
+    assert row["created_at"] <= row["judged_at"] <= row["merged_at"] <= row["gitops_committed_at"]
     assert stack.github.merged == [HEAD]  # 다시 병합하지 않는다
     assert stack.overlay_calls == 2
 

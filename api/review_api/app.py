@@ -226,7 +226,8 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             raise HTTPException(404, "검토가 없다")
         keys = ("review_id", "app", "target_env", "spec_ref", "status", "verdict", "reasons", "findings", "decision",
                 "rounds", "human_decision", "deploy_result", "merge_sha", "gitops_commit_sha", "error",
-                "superseded_by", "requested_by", "created_at", "updated_at", "pr_number")
+                "superseded_by", "requested_by", "created_at", "updated_at", "pr_number", "judged_at",
+                "human_decided_at", "merged_at", "gitops_committed_at")
         reasons = row.get("reasons") or []
         return {**{k: row.get(k) for k in keys},
                 "reason_messages": {code: REASON_MESSAGES[code] for code in reasons if code in REASON_MESSAGES}}

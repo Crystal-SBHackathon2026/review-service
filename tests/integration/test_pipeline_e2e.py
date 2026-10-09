@@ -112,7 +112,7 @@ async def test_migrate_is_idempotent(conninfo: str) -> None:
     assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql", "0003_pr_number.sql",
                                        "0004_spec_intakes.sql", "0005_review_cases.sql",
                                        "0006_generated_spec_unverified.sql", "0007_review_recovery.sql",
-                                       "0008_review_head_unique.sql"]
+                                       "0008_review_head_unique.sql", "0009_review_stage_times.sql"]
     assert await migrate(conninfo) == []
 
 

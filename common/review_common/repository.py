@@ -27,7 +27,9 @@ HEAD_REUSABLE: tuple[str, ...] = ("failed", "superseded")
 RECOVERABLE: tuple[str, ...] = ("received", "reviewing", "merging")
 
 JSON_COLUMNS = frozenset({"spec_ref", "decision", "findings", "rounds", "human_decision", "deploy_result", "final_spec"})
-UPDATABLE = JSON_COLUMNS | {"status", "verdict", "reasons", "merge_sha", "gitops_commit_sha", "error", "superseded_by"}
+STAGE_TIMES = frozenset({"judged_at", "human_decided_at", "merged_at", "gitops_committed_at"})  # 0009, 커밋 타임라인
+UPDATABLE = JSON_COLUMNS | STAGE_TIMES | {"status", "verdict", "reasons", "merge_sha", "gitops_commit_sha", "error",
+                                         "superseded_by"}
 
 INTAKE_JSON_COLUMNS = frozenset({"errors", "details"})
 INTAKE_FIELDS = ("intake_id", "repository", "head_repository", "pr_number", "head_sha", "head_ref", "path", "kind",
@@ -486,7 +488,8 @@ class InMemoryReviewRepository:
             "status": "received", "verdict": None, "reasons": [], "decision": None, "findings": None,
             "rounds": None, "human_decision": None, "deploy_result": None, "gitops_commit_sha": None,
             "final_spec": None, "error": None, "superseded_by": None, "requested_by": requested_by,
-            "pr_number": pr_number, "recover_count": 0, "created_at": now, "updated_at": now,
+            "pr_number": pr_number, "recover_count": 0, **dict.fromkeys(STAGE_TIMES), "created_at": now,
+            "updated_at": now,
         }
         return review_id
 

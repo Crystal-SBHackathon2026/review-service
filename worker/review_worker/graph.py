@@ -235,7 +235,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         await repo.update_review(
             state["review_id"], verdict=decision["verdict"], reasons=list(decision["reasons"]), decision=decision,
             findings=state.get("findings") or [], rounds=state.get("rounds") or [],
-            final_spec=app_spec(state["deploy_spec"]),
+            final_spec=app_spec(state["deploy_spec"]), judged_at=datetime.now(UTC),
         )
         app, env = app_env(state)
         metrics.safe(lambda: metrics.VERDICTS.labels(app, env, decision["verdict"]).inc())
@@ -265,7 +265,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         decision = HumanDecisionModel.model_validate(value).as_state()
         rid = state["review_id"]
         if decision["decision"] == "rejected":
-            await repo.update_review(rid, status="rejected", human_decision=decision)
+            await repo.update_review(rid, status="rejected", human_decision=decision, human_decided_at=datetime.now(UTC))
             await _verify_status(rid, state.get("spec_ref"), "failure", f"사람이 거절 ({decision['approver']})")
             await _record_case(state, human=decision)
             metrics.finished(*app_env(state), "rejected")
@@ -275,7 +275,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         except ValueError as exc:
             await repo.update_review(rid, error=f"사람 응답 적용 실패: {exc}"[:2000])
             return Command(goto="await_human", update={"human_decision": None})
-        await repo.update_review(rid, human_decision=decision, error=None)
+        await repo.update_review(rid, human_decision=decision, error=None, human_decided_at=datetime.now(UTC))
         if decision["edited_ops"]:
             goto = "apply_human_edits"
         elif applied_ops(state):  # 사람 확인 전에 AI 가 고친 회차가 있다 — 앱 레포에도 커밋해야 gitops 와 어긋나지 않는다
@@ -439,7 +439,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             merge_sha = await github.merge_pull(ref["repository"], pull["number"], head_sha=ref["commit"])
         except GitHubError as exc:
             return await _fail(rid, f"merge_pr: {exc}")
-        await repo.update_review(rid, merge_sha=merge_sha)
+        await repo.update_review(rid, merge_sha=merge_sha, merged_at=datetime.now(UTC))
         return Command(goto="commit_overlay")
 
     async def commit_overlay(state: dict[str, Any]) -> dict[str, Any]:
@@ -453,8 +453,10 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
                     raise
                 log.warning("review %s: commit_overlay 일시 오류 %d — %s", state["review_id"], attempt, exc)
                 await asyncio.sleep(deps.retry_backoff_seconds * 2**attempt)
+        committed = result["status"] == "committed"
         await repo.update_review(state["review_id"], status=result["status"], deploy_result=result,
-                                 gitops_commit_sha=result["commit_sha"] if result["status"] == "committed" else None)
+                                 gitops_commit_sha=result["commit_sha"] if committed else None,
+                                 gitops_committed_at=datetime.now(UTC) if committed else None)
         metrics.finished(*app_env(state), result["status"])
         if result["status"] == "blocked":  # 병합은 됐지만 배포는 막혔다
             await _verify_status(state["review_id"], state.get("spec_ref"), "failure", result["reason"] or "blocked")

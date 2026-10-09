@@ -204,6 +204,9 @@ async def test_commit_overlay_receives_state_and_merge_sha() -> None:
     assert seen == {"ref": HEAD, "ops": []}
     assert h.row()["merge_sha"] == MERGE_SHA  # 병합 SHA 는 merge_pr 이 DB 에
     assert (h.row()["status"], h.row()["gitops_commit_sha"]) == ("committed", "d" * 40)
+    row = h.row()  # 커밋 타임라인 — 생성 ≤ 판정 ≤ 병합 ≤ gitops 커밋
+    assert row["created_at"] <= row["judged_at"] <= row["merged_at"] <= row["gitops_committed_at"]
+    assert row["human_decided_at"] is None
 
 
 # --- 샘플 05: fix → AI 수정 커밋 → autofix_commit 재검토 → pass ----------------------------------
