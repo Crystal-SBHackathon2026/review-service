@@ -30,7 +30,8 @@ pip install "./ai[qdrant]"        # 이미지 빌드 — catalog/·knowledge/ �
 | Review API | `messages.build_review_requested(spec, review_id=, spec_ref=, requested_by=, requested_at=, autofix_commit=False)` | baseline 을 떼고 `mask_spec()` 한 뒤 `spec_sha256` 계산. `ReviewRequested` 모델이 평문 비밀·baseline·해시 불일치를 거절한다. **검토할 커밋이 워커가 `applied_ops` 를 커밋한 것(봇 커밋)이면 `autofix_commit=True`** — 워커는 `initial_state(..., autofix_commit=message.autofix_commit)` 로 넘긴다 |
 | Review API | `spec.deploy_spec.DeploySpec` / `schema/deploy_spec.schema.json` | 형식 오류 → 422 |
 | 워커 그래프 | `static_check.make_static_check()` | `findings` 만 반환 |
-| 워커 그래프 | `retrieval.make_retrieve_evidence(retriever)` | `FileRetriever()`(벡터 DB 없음) 또는 `QdrantRetriever(client, FastEmbedder())` |
+| 워커 그래프 | `retrieval.make_retrieve_evidence(retriever)` | `FileRetriever()`(벡터 DB 없음) 또는 `QdrantRetriever(client, FastEmbedder())`. 워커는 `CompositeRetriever(FileRetriever(), CaseRetriever(repo))` — 규칙 문서 뒤에 업무 DB 판단 사례(아래 [판단 사례](#판단-사례-review_cases)) |
+| 워커 종료 지점·Argo CD Degraded | `cases.case_from_state(state, human=)` · `cases.case_from_review(row, "deploy_degraded")` → `repo.insert_case(**case)` | 판단이 필요했던 finding(low 제외)이 없으면 `None`. 기록 실패는 경고 로그만 — 검토 결과를 바꾸지 않는다 |
 | 워커 그래프 | `judge.node.make_judge(llm)` | `CachedLLM(ClaudeLLM())` 권장. `llm=None` 이면 LLM_UNAVAILABLE. `decision`·`patch`·**`status`(= verdict)** 를 쓴다 — 그래프를 직접 조립해도 status 가 채워진다. `autofix_commit` 이거나 `human_decision` 이 있으면 fix 대신 needs_human(LOOP_EXHAUSTED) |
 | 워커 재시도 실패 시 | `judge.node.judge_unavailable(state, error=...)` | RetryPolicy 소진 뒤 이 결과로 State 를 채우고 계속. 원인은 `decision.llm.error` |
 | apply_patch | `verdict.round_snapshot(state)` · `patching.apply_ops(spec, patch["ops"])` | 참고 구현: `graph.apply_patch` |
@@ -137,6 +138,24 @@ scripts/sync_knowledge_s3.sh oneaction-review-docs-<계정ID> --apply    # 업�
 어긋나면 없는·남은·다른 항목 이름과 고치는 명령을 보여 주고 종료 코드 1. 하나만 볼 때는 `--bucket`·`--qdrant-url` 중 하나만 준다.
 
 워커 쪽에서 버킷을 받아 색인할 때는 `aws s3 sync s3://<버킷>/ <dir>` 뒤 `index_knowledge.py --knowledge-dir <dir>`.
+
+## 판단 사례 (review_cases)
+
+끝난 검토에서 사람·AI 가 어떻게 판단했는지를 업무 DB `review_cases`(마이그레이션 0005)에 남기고, 다음 검토가 같은 규칙에 걸리면 judge 근거로 붙인다.
+S3·Qdrant 가 아니라 업무 DB 인 이유: 근거 문서(FileRetriever)는 이미지에 구워져 있어 버킷에 올려도 재빌드 전엔 안 쓰이고, Qdrant 는 배포돼 있지 않다.
+
+| 기록 시점 | 종료 방식(`outcome`) |
+|---|---|
+| 워커 `wait_human` 거절 | `rejected` (ops 없음) |
+| 워커 `commit_fix` (PR 브랜치에 수정 커밋 → superseded) | 사람 응답이 없으면 `auto_fixed`, 있으면 아래 셋 중 하나 |
+| 워커 `commit_overlay` 가 `committed` 이고 사람 응답이 있을 때 | `human_approved`(값 없이 그대로) · `human_edited`(사람이 직접 쓴 값 있음) · `recommended`(권장값만) |
+| API `/webhooks/argocd` Degraded | `deploy_degraded`. 병합된 검토가 AI 수정 커밋 재검토(`requested_by=autofix:<원래>`)면 판단이 있는 원래 검토로 만든다 |
+
+- **내용은 마스킹된 rounds·findings 에서만**: 규칙 ID·제목·경로·사람 확인 사유·적용한 값. finding `evidence`(값)는 넣지 않는다. ops 는 `/runtime/env`·`/secrets`·`/baseline`(과 그 위를 통째 교체하는 op)과 비밀처럼 보이는 값을 뺀다. 판단이 필요했던 finding(low 제외)이 없으면 남기지 않는다.
+- `case_id = <review_id>.<outcome>` 이라 같은 종료 지점이 다시 돌거나 Argo CD 가 Degraded 를 여러 번 보내도 한 번만 남는다.
+- **검색**(`retrieval.case_retriever`): ruleId 정확 매칭, 같은 대상 환경 먼저, 그 안에서 최근 3개. 문서는 `chunk_id=case:<case_id>`·`doc_type=case`·`rule_id`=걸린 규칙이라 인용 검증을 그대로 통과한다. 규칙 문서 뒤에 붙고, 저장소 오류면 경고 로그만 남기고 규칙 문서로 검토한다.
+- judge 프롬프트(`judge-v3`)는 case 문서를 "지난 검토 기록, 규칙보다 우선하지 않고 참고로만"으로 다룬다.
+- **권장값에는 쓰지 않는다.** 규칙·baseline 으로 권장값을 못 만드는 항목(빌드 플랫폼·시크릿 출처)은 관측 없이 정할 수 없는 값이라, 다른 검토에서 사람이 고른 값을 옮겨도 이 배포의 근거가 아니다.
 
 ## 평가셋 (eval/cases.yaml)
 

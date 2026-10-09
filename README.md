@@ -101,4 +101,5 @@ received → reviewing ─┬─ needs_human ─┬─ (승인, 적용할 수정
 - 그래프 오류·PR head 불일치·병합 실패도 `failed` 이고 원인은 `error` 열에 남는다.
 - 사람 승인 시 입력하지 않은 항목은 `decision.recommendations`의 검증된 권장값을 적용하고 재검사한다.
   입력한 값이 우선이며, 기존 명세 그대로 승인하려면 `use_recommendations: false`를 명시한다. 권장값이 없으면 값 없는 승인은 그대로 승인이다. [응답 기본값 안내](ai/docs/human-recommendations.md).
+- 종료 지점(거절·AI 수정 커밋·사람 승인 뒤 committed)과 Argo CD Degraded 에서 판단 사례를 `review_cases` 에 남기고, 다음 검토가 같은 규칙에 걸리면 근거 문서로 붙인다. 기록 실패는 검토 결과를 바꾸지 않는다. [판단 사례](ai/docs/review-ai.md#판단-사례-review_cases)
 - `commit_overlay`(성진님, `worker/review_worker/commit_overlay.py`)가 원본 명세 + `applied_ops` → overlay 를 gitops main 에 커밋한다. 렌더러 blocking 경고면 커밋하지 않고 `blocked`. gitops ref 충돌은 main 을 다시 읽어 최대 5회.

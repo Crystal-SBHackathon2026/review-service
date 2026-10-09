@@ -220,7 +220,7 @@ async def test_node_low_only_skips_llm() -> None:
 async def test_node_returns_patch_only_for_fix() -> None:
     out = await make_judge(FAKES["oracle"]())(await prepared("07-fix-public-bucket.yaml"))
     assert out["decision"]["verdict"] == "fix" and out["patch"] is not None
-    assert out["decision"]["llm"]["prompt_version"] == "judge-v2"
+    assert out["decision"]["llm"]["prompt_version"] == "judge-v3"
     human = await make_judge(FAKES["oracle"]())(await prepared("10-human-mixed-aws.yaml"))
     assert human["decision"]["verdict"] == "needs_human" and human["patch"] is None
 

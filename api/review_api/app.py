@@ -8,7 +8,7 @@
     POST /webhooks/github               pull_request opened·synchronize·reopened → 검토 시작
                                         (deploy.yaml 없음·빈 파일·형식 오류 → spec_intakes, review_api.intake)
                                         check_suite completed → review.resumed(ci_completed)
-    POST /webhooks/argocd               배포 Healthy·Degraded 기록, Healthy 면 baselines 갱신
+    POST /webhooks/argocd               배포 Healthy·Degraded 기록, Healthy 면 baselines 갱신, Degraded 면 판단 사례
     GET  /healthz
 """
 
@@ -36,6 +36,7 @@ from review_ai.messages import build_review_requested
 from review_ai.recommendations import resolve_human_decision
 from review_ai.spec.deploy_spec import REPOSITORY
 from review_api.argocd import ArgoCdEvent
+from review_api.cases import record_degraded_case
 from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spec, open_intake, process_intake,
                                sweep_stale_intakes)
 from review_common.github import GitHubError, SpecNotFound
@@ -219,6 +220,8 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
                 await deps_.repo.upsert_baseline(app=event.app, target_env=event.env, spec=row["final_spec"],
                                                  spec_ref=row["spec_ref"], merge_sha=row["merge_sha"],
                                                  observed_at=datetime.now(UTC))
+            if kind == "degraded":
+                await record_degraded_case(deps_.repo, row)
             return {"review_id": row["review_id"], "recorded": kind}
         return {"ignored": "이미지 태그와 맞는 병합 SHA 가 없다"}
 

@@ -20,6 +20,9 @@ check_ci 는 DB 를 waiting_ci 로 바꾼 **뒤에** 조회하므로, 그 뒤에
 고쳐서 통과하면(applied_ops 가 있으면) 원본 deploy.yaml 에 ops 를 적용해 PR 브랜치에 커밋하고, 그 커밋 SHA 를
 autofix_commit=True 새 검토로 넘긴다. 새 커밋이라 CI 가 다시 돌고, 앱 레포와 gitops 가 같은 명세를 갖는다.
 새 검토에서 또 fix 가 나오면 judge 가 needs_human(LOOP_EXHAUSTED) 으로 막는다 (review_ai PR #11).
+
+종료 지점(거절·commit_fix·사람 승인 뒤 committed)에서 판단 사례를 review_cases 에 남긴다 (review_ai.cases).
+다음 검토의 retrieve_evidence 가 같은 규칙의 사례를 근거로 붙인다. 기록 실패는 검토 결과를 바꾸지 않는다.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ import yaml
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from review_ai.cases import case_from_state
 from review_ai.errors import TransientError
 from review_ai.graph import apply_human_edits as ai_apply_human_edits
 from review_ai.graph import apply_patch
@@ -150,6 +154,15 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         await repo.update_review(review_id, status="failed", error=error[:2000])
         return Command(goto=END)
 
+    async def _record_case(state: dict[str, Any], *, human: dict[str, Any] | None = None) -> None:
+        """끝난 검토를 판단 사례로 남긴다. 실패해도 검토는 그대로 끝낸다 — 사례는 다음 검토의 보조 근거다."""
+        try:
+            case = case_from_state(state, human=human)
+            if case is not None:
+                await repo.insert_case(**case)
+        except Exception:
+            log.warning("review %s: 판단 사례 기록 실패", state["review_id"], exc_info=True)
+
     # --- 판단 -------------------------------------------------------------------------------------
 
     async def judge(state: dict[str, Any]) -> dict[str, Any]:
@@ -194,6 +207,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         rid = state["review_id"]
         if decision["decision"] == "rejected":
             await repo.update_review(rid, status="rejected", human_decision=decision)
+            await _record_case(state, human=decision)
             return Command(goto=END, update={"human_decision": decision, "status": "rejected"})
         try:
             decision = resolve_human_decision(state, decision)
@@ -259,6 +273,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             return await _fail(rid, f"commit_fix: {exc}")
         await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.model_dump_json().encode())
         await repo.update_review(rid, status="superseded", superseded_by=new_rid)
+        await _record_case(state)
         log.info("review %s: 수정 %d건을 %s 로 커밋 → 재검토 %s", rid, len(ops), new_sha, new_rid)
         return Command(goto=END)
 
@@ -327,6 +342,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
                 await asyncio.sleep(deps.retry_backoff_seconds * 2**attempt)
         await repo.update_review(state["review_id"], status=result["status"], deploy_result=result,
                                  gitops_commit_sha=result["commit_sha"] if result["status"] == "committed" else None)
+        if result["status"] == "committed" and state.get("human_decision"):  # 사람 없이 그대로 통과한 검토는 남길 판단이 없다
+            await _record_case(state)
         return {"deploy_result": result}
 
     graph = StateGraph(ReviewState)

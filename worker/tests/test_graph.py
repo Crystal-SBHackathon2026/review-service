@@ -6,12 +6,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 import yaml
+from langgraph.checkpoint.memory import InMemorySaver
 
 from review_ai.errors import TransientError
 from review_ai.judge.llm import LlmResponse
 from review_ai.messages import ReviewRequested
 from review_ai.verdict import applied_ops
 from review_common.github import GitHubError, RefConflict
+from review_worker.graph import build_graph
+from review_worker.handler import ReviewHandler
 from tests.conftest import FIX_SHA, HEAD, MERGE_SHA, Harness, load_sample, suite
 
 RID = "rv_20261008_test"
@@ -515,3 +518,104 @@ async def test_approval_after_ai_patch_round_commits_fix(harness: Harness) -> No
     assert harness.row("rv_paused")["status"] == "superseded"
     assert yaml.safe_load(harness.github.commits[0]["content"])["database"]["engine"] == "postgres"
     assert ReviewRequested.model_validate_json(harness.publisher.sent[0][2]).autofix_commit
+
+
+# --- 판단 사례(review_cases): 종료 지점에서 남기고 다음 검토의 근거로 붙는다 ------------------------
+
+SAMPLE_06 = "06-human-plaintext-secret.yaml"
+SAMPLE_09 = "09-human-arch-mismatch-aws.yaml"
+SECRET = "sample-not-a-real-token-0000"
+
+
+async def test_rejection_is_recorded_as_case_without_secret_value(harness: Harness) -> None:
+    await harness.request(load_sample(SAMPLE_06))
+    await harness.human(RID, "rejected")
+
+    [case] = harness.repo.cases.values()
+    assert (case["case_id"], case["outcome"], case["rule_ids"], case["ops"]) == (
+        f"{RID}.rejected", "rejected", ["SEC-001"], [])
+    assert "사람이 거절했다" in case["summary"]
+    assert SECRET not in case["summary"]
+
+
+async def test_autofix_is_recorded_once_and_clean_rereview_adds_none(harness: Harness) -> None:
+    await harness.request(load_sample(SAMPLE_05))
+    await harness.deliver_published()  # 수정 커밋 재검토 — finding 이 없어 남길 판단이 없다
+    await _finish_ci(harness, harness.row()["superseded_by"], sha=FIX_SHA)
+
+    [case] = harness.repo.cases.values()
+    assert (case["case_id"], case["outcome"], case["rule_ids"]) == (f"{RID}.auto_fixed", "auto_fixed", ["DB-002"])
+    assert case["ops"] == applied_ops(await _state(harness))
+    assert "적용한 값: /database/engine" in case["summary"]
+
+
+async def test_approval_with_recommendations_is_recorded_as_recommended(harness: Harness) -> None:
+    sample = load_sample(SAMPLE_04)
+    await _seed_baseline(harness, sample)
+    await harness.request(sample)
+    await harness.human(RID, "approved")
+
+    case = harness.repo.cases[f"{RID}.recommended"]
+    assert "DB-001" in case["rule_ids"]
+    assert {op["path"]: op["value"] for op in case["ops"]} == {"/database/engine": "postgres", "/database/version": "16"}
+    assert "IRREVERSIBLE" in case["summary"]
+
+
+async def test_plain_approval_is_recorded_when_gitops_commit_succeeds() -> None:
+    h, _ = _with_git()
+    await h.request(load_sample(SAMPLE_09))
+    await h.human(RID, "approved")
+    assert h.repo.cases == {}  # 아직 끝나지 않았다
+    await _finish_ci(h)
+
+    assert h.row()["status"] == "committed"
+    assert h.repo.cases[f"{RID}.human_approved"]["rule_ids"] == ["RUN-004"]
+
+
+async def test_pass_without_decision_records_no_case() -> None:
+    h, _ = _with_git()
+    await h.request(load_sample(SAMPLE_01))
+    await _finish_ci(h)
+
+    assert h.row()["status"] == "committed"
+    assert h.repo.cases == {}
+
+
+async def test_case_store_failure_does_not_change_review_result(harness: Harness) -> None:
+    async def broken(**_: Any) -> bool:
+        raise RuntimeError("db down")
+
+    harness.repo.insert_case = broken  # type: ignore[method-assign]
+    await harness.request(load_sample(SAMPLE_06))
+    await harness.human(RID, "rejected")
+
+    assert harness.row()["status"] == "rejected"
+    assert (await _state(harness))["_next"] == ()
+
+
+async def test_next_review_of_same_rule_gets_case_as_evidence() -> None:
+    from review_ai.judge.fake_llm import ScriptedLLM, oracle_review
+    from review_ai.retrieval.case_retriever import CaseRetriever, CompositeRetriever
+    from review_ai.retrieval.file_retriever import FileRetriever
+
+    prompts: list[str] = []
+
+    def recording(request: Any) -> dict[str, Any]:
+        prompts.append(request.user)
+        return oracle_review(request)
+
+    h = Harness(ScriptedLLM(recording))
+    h.deps.retriever = CompositeRetriever(FileRetriever(), CaseRetriever(h.repo))
+    h.graph = build_graph(h.deps, InMemorySaver())
+    h.handler = ReviewHandler(h.repo, h.graph)
+    await h.request(load_sample(SAMPLE_06), review_id="rv_first")
+    await h.human("rv_first", "rejected")
+
+    await h.request(load_sample(SAMPLE_06), review_id="rv_second")
+
+    docs = (await _state(h, "rv_second"))["retrieved_docs"]
+    case_docs = [d for d in docs if d["doc_type"] == "case"]
+    assert [d["chunk_id"] for d in case_docs] == ["case:rv_first.rejected"]
+    assert docs.index(case_docs[0]) > 0  # 규칙 문서가 먼저
+    assert "지난 검토 rv_first" in prompts[-1] and SECRET not in prompts[-1]
+    assert h.row("rv_second")["decision"]["validation"]["citations_ok"]
