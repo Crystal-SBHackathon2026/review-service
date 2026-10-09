@@ -50,7 +50,7 @@ rules:
     priority: P1
     providers: [any]
     title: 영속성이 필요한데 저장소가 없다
-    check: requirements.persistence 이고 engine == none 이며 persistent 볼륨도 없다
+    check: requirements.persistence 이고 engine == none 이며 persistent 볼륨도 버킷도 없다
     fix: 앱이 쓸 DB 나 볼륨을 사람이 정한다 (앱 코드와 맞물림)
 
   - id: DB-005
@@ -226,7 +226,7 @@ rules:
     priority: P1
     providers: [any]
     title: 기존 persistent 볼륨 제거
-    check: baseline 의 persistent 볼륨이 지금 명세에 없다
+    check: baseline 의 persistent 볼륨이 지금 명세에 없거나 persistent 가 false 로 바뀌었다
     fix: 볼륨을 되살리거나, 사람이 데이터 폐기를 승인한다
 
   # ── runtime (카테고리 추가 제안 — State 의 Finding.category Literal 에 'runtime' 필요) ──

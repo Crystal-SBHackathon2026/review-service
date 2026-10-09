@@ -44,13 +44,13 @@ def sqlite_without_persistent_volume(ctx: CheckContext) -> list[Hit]:
 
 
 def persistence_without_storage(ctx: CheckContext) -> list[Hit]:
-    """DB-004 — 재배포 뒤에도 데이터가 남아야 하는데 DB 도 persistent 볼륨도 없다."""
+    """DB-004 — 재배포 뒤에도 데이터가 남아야 하는데 DB·persistent 볼륨·버킷 어디에도 둘 곳이 없다."""
     spec = ctx.spec
     if not spec.requirements.persistence or spec.database.engine != "none":
         return []
-    if any(v.persistent for v in spec.storage.volumes):
+    if spec.storage.buckets or any(v.persistent for v in spec.storage.volumes):
         return []
-    return [Hit("/requirements/persistence", "persistence: true · database.engine none · persistent 볼륨 없음")]
+    return [Hit("/requirements/persistence", "persistence: true · database.engine none · persistent 볼륨·버킷 없음")]
 
 
 def managed_db_public(ctx: CheckContext) -> list[Hit]:

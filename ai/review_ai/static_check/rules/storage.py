@@ -50,15 +50,18 @@ def rwo_volume_replicated(ctx: CheckContext) -> list[Hit]:
 
 
 def persistent_volume_removed(ctx: CheckContext) -> list[Hit]:
-    """STO-006 — 이전 배포의 persistent 볼륨이 지금 명세에 없다. 지우면 데이터가 사라진다.
+    """STO-006 — 이전 배포의 persistent 볼륨이 지금 명세에 없거나 persistent 가 꺼졌다. 둘 다 PVC 가 렌더되지 않아 데이터가 사라진다.
 
-    지금 명세에는 그 볼륨의 자리가 없으므로 위치는 baseline 안의 이전 볼륨을 가리킨다.
+    지운 볼륨은 지금 명세에 자리가 없으므로 위치는 둘 다 baseline 안의 이전 볼륨을 가리킨다.
     """
     if ctx.previous is None:
         return []
-    current = {v.name for v in ctx.spec.storage.volumes}
-    return [
-        Hit(f"/baseline/spec/storage/volumes/{i}", f"{v.name} ({v.size}) 제거")
-        for i, v in enumerate(ctx.previous.storage.volumes)
-        if v.persistent and v.name not in current
-    ]
+    current = {v.name: v for v in ctx.spec.storage.volumes}
+    hits = []
+    for i, prev in enumerate(ctx.previous.storage.volumes):
+        now = current.get(prev.name)
+        if not prev.persistent or (now is not None and now.persistent):
+            continue
+        change = "제거" if now is None else "persistent: false 로 바뀜"
+        hits.append(Hit(f"/baseline/spec/storage/volumes/{i}", f"{prev.name} ({prev.size}) {change}"))
+    return hits

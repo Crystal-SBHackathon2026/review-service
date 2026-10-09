@@ -143,15 +143,17 @@ def test_db005_sqlite_needs_persistent_volume(volumes: list[dict[str, Any]]) -> 
         (True, {}, [{"name": "tmp", "mount_path": "/tmp/x", "size": "1Gi", "persistent": False}], True),
         (True, {}, [{"name": "data", "mount_path": "/data", "size": "1Gi"}], False),
         (True, {"engine": "postgres", "version": "16", "placement": "managed"}, [], False),
+        (True, {}, "bucket", False),
         (False, {}, [], False),
     ],
-    ids=["nothing", "ephemeral-only", "persistent-volume", "database", "not-required"],
+    ids=["nothing", "ephemeral-only", "persistent-volume", "database", "bucket", "not-required"],
 )
 def test_db004_persistence_needs_a_store(
-    sample_app: dict[str, Any], persistence: bool, db: dict[str, Any], volumes: list[dict[str, Any]], hit: bool
+    sample_app: dict[str, Any], persistence: bool, db: dict[str, Any], volumes: Any, hit: bool
 ) -> None:
+    storage = {"buckets": [{"name": "app-uploads"}]} if volumes == "bucket" else {"volumes": volumes}
     spec = {**sample_app, "requirements": {"persistence": persistence}, "database": db, "secrets": DB_SECRET,
-            "storage": {"volumes": volumes}, "target": {"env": "local", "region": "r"}}
+            "storage": storage, "target": {"env": "local", "region": "r"}}
     found = findings_of(spec, "DB-004")
     assert bool(found) is hit
     if hit:
@@ -327,6 +329,16 @@ def test_sto006_removed_persistent_volume_points_into_baseline(sample_app: dict[
     assert (f["autofix"], f["irreversible"]) == ("forbidden", True)
     assert f["location"]["spec_path"] == "/baseline/spec/storage/volumes/0"
     assert "STO-006" not in rule_ids({**spec, "storage": {"volumes": [UPLOADS]}})
+
+
+def test_sto006_turning_persistent_off_is_the_same_as_removing(sample_app: dict[str, Any]) -> None:
+    """이름이 남아도 persistent 를 끄면 PVC 대신 emptyDir 이 붙는다 — STO-005 는 크기만 본다."""
+    prev = _local(sample_app, storage={"volumes": [UPLOADS]})
+    spec = _local(sample_app, storage={"volumes": [{**UPLOADS, "persistent": False}]},
+                  baseline={"spec_ref": "prev", "spec": prev})
+    [f] = findings_of(spec, "STO-006")
+    assert (f["location"]["spec_path"], f["evidence"]) == ("/baseline/spec/storage/volumes/0",
+                                                          "uploads (1Gi) persistent: false 로 바뀜")
 
 
 def test_run002_missing_liveness_is_low(sample_app: dict[str, Any]) -> None:

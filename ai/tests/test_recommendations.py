@@ -266,6 +266,19 @@ def test_removed_volumes_are_restored_from_baseline_in_one_candidate() -> None:
     assert [v["name"] for v in restored] == ["data", "uploads", "cache"]
 
 
+def test_turned_off_volume_is_restored_in_place() -> None:
+    spec = load_sample_dict("02-pass-local-sqlite.yaml")
+    uploads = {"name": "uploads", "mount_path": "/uploads", "size": "2Gi", "persistent": True, "access_mode": "ReadWriteOnce"}
+    prev = copy.deepcopy(spec)
+    prev["storage"]["volumes"].append(uploads)
+    spec["storage"]["volumes"].append({**uploads, "persistent": False})
+    spec["baseline"] = {"spec_ref": "prev", "spec": prev}
+
+    [rec] = recommend(spec)
+
+    assert apply_ops(spec, rec["ops"])["storage"]["volumes"] == prev["storage"]["volumes"]  # 중복 없이 제자리
+
+
 async def test_sto006_unanswered_approval_restores_the_volume() -> None:
     spec = load_sample_dict("02-pass-local-sqlite.yaml")
     prev = copy.deepcopy(spec)

@@ -106,9 +106,12 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
         if ops:
             candidates.append({"finding_ids": [finding["finding_id"]], "source": source, "why": why, "ops": ops})
     if removed:
-        # 지운 볼륨을 한 op 로 되살린다 — storage·volumes 키가 없어도 되고, 여럿이어도 서로 덮지 않는다
+        # 이전 볼륨을 한 op 로 되살린다 — persistent 를 끈 것은 그 자리에서 바꾸고, 지운 것은 뒤에 붙인다.
+        # storage·volumes 키가 없어도 되고, 여럿이어도 서로 덮지 않는다
         storage = spec.get("storage") or {}
-        volumes = [*storage.get("volumes", []), *(v.model_dump(mode="json") for _, v in removed)]
+        restore = {v.name: v.model_dump(mode="json") for _, v in removed}
+        kept = [restore.pop(v["name"], v) for v in storage.get("volumes", [])]
+        volumes = [*kept, *restore.values()]
         candidates.append({"finding_ids": [fid for fid, _ in removed], "source": "baseline",
                            "why": "데이터를 유지하도록 이전 승인 명세의 볼륨을 되살림",
                            "ops": [{"op": "add", "path": "/storage", "value": {**storage, "volumes": volumes}}]})
