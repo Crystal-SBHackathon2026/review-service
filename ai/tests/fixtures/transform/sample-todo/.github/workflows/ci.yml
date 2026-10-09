@@ -1,0 +1,61 @@
+# CI: 문법 검사(+테스트가 있으면 실행) → 이미지 빌드 → 취약점 검사 → (main만) GHCR 푸시
+# gitops 등록(apps/sample-todo/base·Argo CD Application)은 아직 없다 — 등록되면 sample-app 처럼 태그 갱신 단계를 붙인다.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  IMAGE: ghcr.io/crystal-sbhackathon2026/sample-todo
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: 문법 검사
+        run: for f in $(git ls-files 'src/*.js' 'test/*.js'); do node --check "$f"; done
+      - name: 테스트 (있을 때만)
+        run: if npm run | grep -q '^  test$'; then npm test; else echo "test 스크립트 없음 — 건너뜀"; fi
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 이미지 빌드
+        run: docker build -t "$IMAGE:${{ github.sha }}" .
+
+      - name: 취약점 검사 (CRITICAL 발견 시 실패)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: GHCR 로그인
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 이미지 푸시
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker tag "$IMAGE:${{ github.sha }}" "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"

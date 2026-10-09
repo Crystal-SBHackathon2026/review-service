@@ -28,7 +28,8 @@ class FakeGitHub:
     def __init__(self) -> None:
         self.branch = HEAD
         self.parents: dict[str, str] = {}
-        self.contents: dict[str, str] = {}
+        self.contents: dict[str, str] = {}  # 커밋 → deploy.yaml 내용
+        self.files: dict[str, dict[str, str | None]] = {}  # 커밋 → 바꾼 파일 전부 (None = 삭제)
         self.statuses: list[dict[str, Any]] = []
         self.status_error: GitHubError | None = None
         self.commit_error: Exception | None = None
@@ -43,12 +44,13 @@ class FakeGitHub:
     async def get_file(self, repository: str, path: str, ref: str) -> str:
         return self.tree[path]
 
-    async def prepare_file_commit(self, repository: str, *, parent: str, path: str, content: str,
-                                  message: str) -> str:
+    async def prepare_files_commit(self, repository: str, *, parent: str, files: dict[str, str | None],
+                                   message: str) -> str:
         if self.commit_error:
             raise self.commit_error
         sha = f"{len(self.parents) + 1:x}".rjust(40, "f")
-        self.parents[sha], self.contents[sha] = parent, content
+        spec = next(c for p, c in files.items() if p.endswith((".yaml", ".yml")) and not p.startswith(".github/"))
+        self.parents[sha], self.contents[sha], self.files[sha] = parent, spec, dict(files)
         self.last_message = message
         return sha
 
@@ -68,7 +70,8 @@ class FakeGitHub:
 
 class IntakeEnv:
     def __init__(self, *, default_target: str | None = "aws/ap-northeast-2",
-                 intake_repositories: frozenset[str] = frozenset({REPO}), repair_llm: Any = None) -> None:
+                 intake_repositories: frozenset[str] = frozenset({REPO}), repair_llm: Any = None,
+                 transform_llm: Any = None, lockfile: Any = None) -> None:
         from review_common.repository import InMemoryReviewRepository
 
         self.repo = InMemoryReviewRepository()
@@ -78,7 +81,8 @@ class IntakeEnv:
         self.client = TestClient(create_app(ApiDeps(
             repo=self.repo, specs=self.specs, publisher=self.publisher, github_webhook_secret=SECRET,
             github=self.github, default_target=default_target, public_url="https://review.example/",
-            intake_repositories=intake_repositories, repair_llm=repair_llm)))
+            intake_repositories=intake_repositories, repair_llm=repair_llm, transform_llm=transform_llm,
+            **({"lockfile": lockfile} if lockfile else {}))))
 
     def put(self, text: str, sha: str = HEAD) -> None:
         self.specs.files[(REPO, "deploy.yaml", sha)] = text
@@ -406,7 +410,7 @@ async def test_stale_processing_row_is_resumed_with_its_commit(ienv: IntakeEnv) 
     await ienv.repo.insert_intake(intake_id="in_x", repository=REPO, head_repository=REPO, pr_number=5,
                                   head_sha=HEAD, head_ref="feature", path="deploy.yaml", kind="missing",
                                   errors=[], requested_by="octo-dev")
-    made = await ienv.github.prepare_file_commit(REPO, parent=HEAD, path="deploy.yaml", content="x", message="m")
+    made = await ienv.github.prepare_files_commit(REPO, parent=HEAD, files={"deploy.yaml": "x"}, message="m")
     await ienv.repo.link_intake("in_x", result_commit_sha=made)
     deps = ienv.client.app.state.deps
     assert await resume_stale_intakes(deps) == []  # 아직 다른 파드가 처리 중일 수 있다

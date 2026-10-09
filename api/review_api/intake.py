@@ -14,6 +14,8 @@
         - missing·empty: review_ai.intake.prepare_intake 가 생성. yaml_error·schema_error: PR head 의 원문을 읽어
           review_ai.intake.repair.repair_intake 가 LLM 으로 형식만 고친다(값은 코드 게이트가 원문과 대조).
           LLM 이 없으면(repair_llm None) REPAIR_UNAVAILABLE
+        - 새 앱이 대상 환경에서 그대로 못 돌면(SQLite 인데 볼륨 없음 등) review_ai.transform 이 코드 패치를 만든다
+          (LLM + 코드 게이트). 통과하면 package-lock.json 을 npm 으로 다시 만들어 코드·명세를 한 커밋에 올린다
         - 생성·복구하면 PR 브랜치에 커밋 → synchronize 웹훅이 그 SHA 를 일반 검토로
           시작한다 (autofix_commit 아님). 커밋 SHA 는 브랜치를 옮기기 전에 행에 남긴다 — 웹훅이 먼저 와도 연결된다
     PR 표시: 커밋 상태 review-service/intake. 토큰에 권한이 없으면 로그만 남기고 기록은 그대로 둔다.
@@ -25,17 +27,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 import yaml
 from pydantic import ValidationError
 
-from review_ai.intake import KIND_LABELS, commit_message, prepare_intake
+from review_ai.intake import KIND_LABELS, IntakeOutcome, commit_message, prepare_intake
 from review_ai.errors import TransientError
 from review_ai.intake.analyze import Finding, analyze_repository, files_to_read
+from review_ai.catalog import load_targets
 from review_ai.intake.repair import repair_intake
-from review_ai.preparation import GenerationContext
+from review_ai.preparation import GenerationContext, app_name
+from review_ai.transform import TransformOutcome, apply_to_context, plan_transform, transform_repository
+from review_api.lockfile import LockfileUnavailable
 from review_ai.spec.deploy_spec import Baseline, DeploySpec, Target
 from review_common.github import GitHubError, RefConflict
 from review_common.ids import new_intake_id
@@ -47,10 +53,13 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 STATUS_CONTEXT = "review-service/intake"
-STALE_AFTER = timedelta(minutes=2)  # LLM 복구(최대 수십 초)보다 넉넉하게
+STALE_AFTER = timedelta(minutes=5)  # LLM 복구(수십 초)·코드 패치(파일 전체 재작성, 1~2분)·npm 잠금 파일보다 넉넉하게
 SWEEP_EVERY_SECONDS = 60.0
 REPAIRABLE = ("yaml_error", "schema_error")
 READ_CONCURRENCY = 8  # 레포 분석 파일 읽기 — GitHub 은 동시 요청이 많으면 secondary rate limit 을 건다
+# 코드 패치가 풀 수 있는 미해결 항목 — 다른 항목이 남으면 어차피 생성하지 못하니 LLM 을 부르지 않는다
+TRANSFORM_RESOLVES = frozenset({"/database", "/requirements"})
+OTHER_LOCKFILES = ("yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json")
 
 
 class IntakeGitHub(Protocol):
@@ -60,6 +69,9 @@ class IntakeGitHub(Protocol):
 
     async def prepare_file_commit(self, repository: str, *, parent: str, path: str, content: str,
                                   message: str) -> str: ...
+
+    async def prepare_files_commit(self, repository: str, *, parent: str, files: dict[str, str | None],
+                                   message: str) -> str: ...
 
     async def update_branch(self, repository: str, branch: str, sha: str) -> None: ...
 
@@ -131,14 +143,22 @@ def _done(status: str, reason: str, message: str, details: Any = (), **extra: An
     return {"status": status, "reason": reason, "message": message, "details": list(details), **extra}
 
 
-Context = tuple[GenerationContext, Baseline | None, tuple[Finding, ...]]
+@dataclass(frozen=True)
+class RepoFiles:
+    """새 앱의 PR head — 레포 분석이 읽은 파일. 코드 패치가 같은 파일을 쓴다."""
+
+    tree: tuple[str, ...]
+    files: dict[str, str]
+
+
+Context = tuple[GenerationContext, Baseline | None, tuple[Finding, ...], RepoFiles | None]
 
 
 async def _context(deps: ApiDeps, github: IntakeGitHub, repository: str, head_sha: str) -> Context | None:
     row = await deps.repo.latest_baseline_for_repository(repository)
     if row is not None:
         baseline = Baseline.model_validate(baseline_for(row))
-        return GenerationContext(repository=repository, target=baseline.spec.target), baseline, ()
+        return GenerationContext(repository=repository, target=baseline.spec.target), baseline, (), None
     if not deps.default_target:
         return None
     env, _, region = deps.default_target.partition("/")
@@ -152,8 +172,56 @@ async def _context(deps: ApiDeps, github: IntakeGitHub, repository: str, head_sh
             return await github.get_file(repository, path, head_sha)
 
     texts = await asyncio.gather(*map(read, paths))
-    analysis = analyze_repository(base, tree, dict(zip(paths, texts, strict=True)))
-    return analysis.context, None, analysis.findings
+    files = dict(zip(paths, texts, strict=True))
+    analysis = analyze_repository(base, tree, files)
+    return analysis.context, None, analysis.findings, RepoFiles(tuple(tree), files)
+
+
+async def _transform(deps: ApiDeps, github: IntakeGitHub, row: dict[str, Any], context: GenerationContext,
+                     findings: tuple[Finding, ...], repo: RepoFiles) -> TransformOutcome | None:
+    """새 앱의 코드 패치. 필요 없거나 패치로 풀 수 없는 레포면 None — LLM 을 부르지 않는다."""
+    caps = load_targets()[context.target.env]
+    app = context.name or app_name(context.repository)
+    plan = plan_transform(app, caps, repo.tree, repo.files)
+    unresolved = {f.path for f in findings if not f.resolved}
+    if not plan.items or unresolved - (TRANSFORM_RESOLVES if plan.database else frozenset()):
+        return None
+    outcome = await transform_repository(app, caps, repo.tree, repo.files, deps.transform_llm)
+    if outcome.action != "patched" or "package.json" not in outcome.files:
+        return outcome
+    if other := [f for f in OTHER_LOCKFILES if f in repo.tree]:
+        return _lock_rejected(outcome, f"npm 이 아닌 잠금 파일({', '.join(other)})은 다시 만들 수 없다")
+    if "package-lock.json" not in repo.tree:
+        return outcome  # 잠금 파일 없는 레포 — CI 가 npm install 을 쓴다
+    lock = await github.get_file(row["repository"], "package-lock.json", row["head_sha"])
+    try:
+        new_lock = await deps.lockfile(outcome.files["package.json"] or "", lock)
+    except LockfileUnavailable as exc:
+        return _lock_rejected(outcome, str(exc))
+    return replace(outcome, files={**outcome.files, "package-lock.json": new_lock},
+                   details=outcome.details + ({"path": "package-lock.json", "source": "npm",
+                                               "reason": "바뀐 의존성으로 다시 만들었다 (--package-lock-only --ignore-scripts)"},))
+
+
+def _lock_rejected(outcome: TransformOutcome, why: str) -> TransformOutcome:
+    return replace(outcome, action="rejected", reason="LOCKFILE_UNAVAILABLE", files={},
+                   message=f"{outcome.message} — 코드 패치는 통과했지만 package-lock.json 을 다시 만들지 못했다",
+                   details=({"code": "LOCKFILE_UNAVAILABLE", "path": "package-lock.json", "message": why},))
+
+
+def _commit_files(outcome: IntakeOutcome, path: str, transform: TransformOutcome | None) -> dict[str, str | None]:
+    files: dict[str, str | None] = dict(transform.files) if transform and transform.action == "patched" else {}
+    files[path] = outcome.content
+    return files
+
+
+def _message(outcome: IntakeOutcome, transform: TransformOutcome | None) -> str:
+    if transform is None or transform.action != "patched":
+        return commit_message(outcome)
+    lines = [f"feat: {transform.message} — 코드 패치와 deploy.yaml 생성", "", "코드 패치 (review-service, LLM + 코드 게이트)"]
+    lines += [f"- {d['path']}: {d['reason']}" for d in transform.details]
+    lines += ["", "명세", *commit_message(outcome).splitlines()[2:]]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
@@ -170,17 +238,25 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
     found = await _context(deps, deps.github, repository, head_sha)
     if found is None:
         return _done("rejected", "NO_TARGET", "배포 대상 환경을 모른다 — 이전 배포(baseline)도 DEFAULT_TARGET 도 없다")
-    context, baseline, findings = found
+    context, baseline, findings, repo = found
+    transform: TransformOutcome | None = None
     if row["kind"] in REPAIRABLE:
         raw = await deps.github.get_file(repository, row["path"], head_sha)
         outcome = await repair_intake(row["kind"], raw, context=context, baseline=baseline, llm=deps.repair_llm)
     else:
+        if repo is not None:  # 다시 처리하는 행도 같은 판단을 다시 한다 (커밋은 아래에서 이미 만든 것을 쓴다)
+            transform = await _transform(deps, deps.github, row, context, findings, repo)
+            if transform is not None:
+                context, findings = apply_to_context(context, findings, transform)
         outcome = prepare_intake(row["kind"], context=context, baseline=baseline, findings=findings)
     if outcome.action == "rejected":
+        if transform is not None and transform.action == "rejected":  # 코드 패치가 막힌 이유가 더 정확하다
+            return _done("rejected", transform.reason, transform.message, transform.details)
         return _done("rejected", outcome.reason, outcome.message, outcome.details)
     # 다시 처리하는 행이면 이미 만든 커밋을 쓴다 — 같은 커밋으로 ref 를 옮기는 건 몇 번 해도 같다
-    commit = row["result_commit_sha"] or await deps.github.prepare_file_commit(
-        repository, parent=head_sha, path=row["path"], content=outcome.content, message=commit_message(outcome))
+    commit = row["result_commit_sha"] or await deps.github.prepare_files_commit(
+        repository, parent=head_sha, files=_commit_files(outcome, row["path"], transform),
+        message=_message(outcome, transform))
     await deps.repo.link_intake(row["intake_id"], result_commit_sha=commit)
     try:
         await deps.github.update_branch(repository, row["head_ref"], commit)
@@ -188,7 +264,11 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
         # GitHub 은 브랜치 보호로 막혀도 422 를 준다 — 둘 다 이 커밋에서는 더 할 게 없다
         return _done("rejected", "BRANCH_MOVED",
                      "PR 브랜치를 옮기지 못했다(그사이 새 커밋 또는 브랜치 보호) — 새 커밋이 오면 다시 판단한다")
-    return _done(outcome.action, outcome.reason, outcome.message, outcome.details, result_commit_sha=commit)
+    if transform is not None and transform.action == "patched":
+        return _done(outcome.action, "TRANSFORMED", f"{transform.message} — 코드 패치·deploy.yaml 커밋",
+                     transform.details + outcome.details, result_commit_sha=commit)
+    skipped = ({"path": "(코드 패치)", "source": transform.reason, "reason": transform.message},) if transform else ()
+    return _done(outcome.action, outcome.reason, outcome.message, outcome.details + skipped, result_commit_sha=commit)
 
 
 async def process_intake(deps: ApiDeps, intake_id: str) -> None:
