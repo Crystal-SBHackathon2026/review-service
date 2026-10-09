@@ -47,6 +47,9 @@ docker compose --profile app up -d --build
 | `DB_HOST` `DB_PORT` `DB_NAME` `DB_USERNAME` `DB_PASSWORD` | API·워커 | 업무 DB. 클러스터에서는 계정을 `review-db-credentials` Secret 에서 |
 | `DB_SSLMODE` | API·워커 | 기본 `prefer`. RDS 는 `require` |
 | `KAFKA_BOOTSTRAP` | API·워커 | MSK PLAINTEXT bootstrap (Terraform `infra/msk` output `bootstrap_brokers`) |
+| `KAFKA_SEND_TIMEOUT` | API·워커 | 발행 한 건을 기다리는 상한(초). 기본 `5` — GitHub 웹훅 10초 안에 503 으로 답한다 |
+| `REVIEW_STALE_AFTER` | API | review sweep 이 멈췄다고 볼 시간(초). 기본 `600` — judge 최악(약 8분)보다 길게 |
+| `WORKER_ALIVE_FILE` | 워커 | livenessProbe 가 보는 파일. 기본 `/tmp/worker-alive` |
 | `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기와 명세 생성 커밋(PR 브랜치 Contents 쓰기)·PR 커밋 상태(**Commit statuses 쓰기**, 없으면 표시만 빠진다). 워커는 CI 상태 조회·AI 수정 커밋·PR 병합·gitops overlay 커밋이라 앱 레포·gitops Contents·Pull requests **쓰기** 권한이 필요하다 (`oneaction/gitops-token`) |
 | `GITOPS_REPO` | 워커 | overlay 를 커밋할 gitops 레포. 기본 `Crystal-SBHackathon2026/gitops` |
 | `GITHUB_WEBHOOK_SECRET` | API | `/webhooks/github` HMAC 검증. 없으면 웹훅을 503 으로 거절 |
@@ -64,7 +67,11 @@ docker compose --profile app up -d --build
   - `pull_request` `opened`·`synchronize`·`reopened`, base 가 기본 브랜치인 PR 만 → head SHA 의 `deploy.yaml` 검토
   - `deploy.yaml` 이 없거나 비었거나 형식이 깨졌으면 검토 대신 **intake**(아래), 같은 레포·head SHA 검토가 있으면 `{"skipped": "already reviewed"}`
   - 새 검토를 만들면 그 PR 의 끝나지 않은 검토(`received`·`reviewing`·`needs_human`·`waiting_ci`)는 `superseded`
-- `POST /reviews` — 직접 요청 (PR 번호를 모르므로 superseded 대상이 아니다). 파일 없음 404, 빈 파일·형식 오류 422 — intake 를 만들지 않는다
+  - `pull_request` `closed`(병합 없이) → 그 PR 의 끝나지 않은 검토를 `superseded`(`error` "PR closed"). 승인 화면에서 빠진다. 다시 열면 같은 SHA 도 새로 검토
+  - 같은 레포·head SHA 검토는 `failed`·`superseded` 를 빼고 하나뿐이다(0008 부분 unique 인덱스) — 같은 웹훅이 동시에 와도 하나만 만든다.
+    `failed` 검토만 있는 SHA 가 다시 오면(발행 실패 뒤 재전송) 새로 검토한다
+- `POST /reviews` — 직접 요청 (PR 번호를 모르므로 superseded 대상이 아니다). 파일 없음 404, 빈 파일·형식 오류 422 — intake 를 만들지 않는다.
+  `spec_ref.commit` 은 40자 SHA 만 받는다 (병합에 전체 SHA 가 필요하다)
 
 ### 명세 없음·빈 명세·형식 오류 (`spec_intakes`, `api/review_api/intake.py`)
 
@@ -103,6 +110,26 @@ docker compose --profile app up -d --build
 상태 쓰기가 실패해도 검토는 진행한다. 단 병합 직전 `success` 는 3번 시도해도 못 쓰면 병합하지 않고 `failed`.
 토큰에 **Commit statuses: write** 권한이 필요하다.
 
+## 멈춘 검토 회수 (review sweep, `api/review_api/recovery.py`)
+
+워커가 처리 중이어야 하는 상태(`received`·`reviewing`·`merging`)가 `REVIEW_STALE_AFTER`(10분) 넘게 그대로면 API 가 1분마다 한 행씩
+조건부 UPDATE(`SKIP LOCKED`)로 가져가 다시 보낸다 — API 파드가 여럿이어도 한 곳만. 가져갈 때마다 `recover_count` 를 올리고 3번을 넘으면 `failed` + verify `failure`.
+
+| 상태 | 회수 |
+|---|---|
+| `received` | `review.requested` 다시 발행 (spec_ref 커밋의 deploy.yaml 로 다시 만든다) |
+| `reviewing` | `received` 로 되돌리고 다시 발행. 워커가 체크포인트를 보고 멈춘 노드부터 이어서·처음부터·사람 결정 대기로 되돌린다 |
+| `merging` + `merge_sha` | `review.resumed`(`retry_overlay`) — 워커가 `commit_overlay` 만 다시 한다 (병합 뒤 gitops 커밋 예외는 `failed` 가 아니라 `merging` 으로 남는다) |
+| `merging`, `merge_sha` 없음 | GitHub 에서 PR 병합 여부 확인 — 병합됐으면 `merge_sha` 기록 후 `retry_overlay`, 아니면 `waiting_ci` 로 되돌리고 CI 재확인 |
+
+`needs_human`·`waiting_ci` 는 사람·CI 를 기다리는 상태라 회수하지 않는다.
+
+## 헬스체크
+
+- API `GET /healthz` — 프로세스만 본다 (ALB 헬스체크, livenessProbe). `GET /readyz` — DB `SELECT 1`·Kafka 브로커 연결, 실패하면 503 (readinessProbe)
+- 워커 — 메인 루프가 poll 마다(1초) `/tmp/worker-alive` 를 갱신한다. 메시지 처리 중에는 30초마다, `max_poll_interval` 까지.
+  livenessProbe: `find /tmp/worker-alive -mmin -2 | grep -q .`
+
 ## 상태 흐름 (`reviews.status`)
 
 ```
@@ -116,6 +143,8 @@ received → reviewing ─┬─ needs_human ─┬─ (승인, 적용할 수정
 
 - **CI 대기:** waiting_ci 로 바꾼 뒤 GitHub check-suites 를 먼저 조회해 이미 끝났으면 기다리지 않는다(gitops#9).
   안 끝났으면 `check_suite` 웹훅으로 재개하고, 재개 때 다시 조회해 다른 suite 가 남았으면 계속 기다린다.
+  CI 결론은 언제나 check-suites 조회로 정한다 — 조회가 실패하면 웹훅 결론으로 병합하지 않고 다시 기다린다.
+  병합 직전(`confirm_ci`, guard_overlay 앞)에 한 번 더 조회해 전체 success 가 아니면 waiting_ci 로 돌아간다.
 - **AI 수정 커밋:** 고친 것이 있으면(`applied_ops`, 사람 수정 포함) 원본 deploy.yaml 에 적용해 PR 브랜치에 커밋한다.
   새 커밋은 `autofix_commit=True` 로 다시 검토하고, 거기서 또 fix 면 needs_human(LOOP_EXHAUSTED) 이다.
   포크 PR 은 커밋할 수 없어 failed. 커밋한 deploy.yaml 은 YAML 을 다시 쓰므로 원래 주석은 사라진다.
