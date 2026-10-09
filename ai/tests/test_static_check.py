@@ -365,3 +365,92 @@ async def test_node_returns_only_findings() -> None:
     out = await node({"deploy_spec": load_sample_dict("07-fix-public-bucket.yaml"), "target_env": "aws"})
     assert list(out) == ["findings"]
     assert [f["rule_id"] for f in out["findings"]] == ["STO-003"]
+
+
+# ── P1 나머지: DB-007·DB-008·SEC-002·SEC-003·NET-002·STO-004 ─────────────
+
+
+@pytest.mark.parametrize(
+    ("env", "db", "hit"),
+    [
+        ("aws", {**PG, "backup_retention_days": 0}, True),
+        ("aws", PG, False),  # 기본값 1
+        ("gcp", {"engine": "postgres", "version": "16", "placement": "in-cluster", "backup_retention_days": 0}, False),
+        ("local", {**PG, "backup_retention_days": 0}, False),  # aws·gcp 규칙
+    ],
+)
+def test_db007_managed_db_backup_off(sample_app: dict[str, Any], env: str, db: dict[str, Any], hit: bool) -> None:
+    spec = {**sample_app, "database": db, "secrets": DB_SECRET, "target": {"env": env, "region": "r"}}
+    found = findings_of(spec, "DB-007")
+    assert bool(found) is hit
+    if hit:
+        assert (found[0]["severity"], found[0]["autofix"], found[0]["location"]["spec_path"]) == (
+            "medium", "allowed", "/database/backup_retention_days")
+
+
+@pytest.mark.parametrize(
+    ("prev", "cur", "has_data", "hit"),
+    [
+        (PG, {**PG, "version": "15"}, True, True),
+        (PG, {**PG, "version": "15"}, None, True),  # 모르면 데이터 있음
+        (PG, {**PG, "version": "15"}, False, False),  # 데이터 없으면 새로 만들어도 된다
+        ({**PG, "version": "15"}, PG, True, False),  # 업그레이드
+        (PG, {**PG, "version": "16.4"}, True, False),  # 같은 메이저
+        (MYSQL, {**MYSQL, "version": "5.7"}, True, True),
+        (PG, {**PG, "version": None}, True, False),  # 버전을 모르면 판단하지 않는다
+        (PG, MYSQL, True, False),  # 엔진 변경은 DB-001
+    ],
+)
+def test_db008_major_version_downgrade(sample_app: dict[str, Any], prev: dict, cur: dict, has_data: bool | None,
+                                       hit: bool) -> None:
+    spec = _with_baseline({**sample_app, "database": cur, "secrets": DB_SECRET}, prev, has_data)
+    found = findings_of(spec, "DB-008")
+    assert bool(found) is hit
+    if hit:
+        f = found[0]
+        assert (f["autofix"], f["irreversible"], f["location"]["spec_path"]) == ("forbidden", True, "/database/version")
+        assert f["evidence"] == f"{cur['engine']} {prev['version']} → {cur['version']}"
+
+
+def test_sec002_secret_source_must_exist_on_target(sample_app: dict[str, Any]) -> None:
+    sample_app["secrets"] = [
+        {"name": "A_KEY", "source": "k8s-secret", "key": "a"},
+        {"name": "B_KEY", "source": "gcp-secret-manager", "key": "b"},
+    ]
+    [f] = findings_of(sample_app, "SEC-002")
+    assert (f["autofix"], f["location"]["spec_path"]) == ("forbidden", "/secrets/1/source")
+    sample_app["target"] = {"env": "gcp", "region": "r"}
+    assert "SEC-002" not in rule_ids(sample_app)
+
+
+def test_sec003_duplicate_secret_points_at_later_entries(sample_app: dict[str, Any]) -> None:
+    first = {"name": "API_TOKEN", "source": "k8s-secret", "key": "token"}
+    sample_app["secrets"] = [first, {"name": "OTHER", "source": "generated"}, first, {**first, "key": "token2"}]
+    found = findings_of(sample_app, "SEC-003")
+    assert [(f["autofix"], f["location"]["spec_path"]) for f in found] == [
+        ("allowed", "/secrets/2"), ("allowed", "/secrets/3")]
+    assert found[0]["evidence"] == "secrets[API_TOKEN] 중복 (처음: secrets/0)"
+
+
+@pytest.mark.parametrize(
+    ("ingress", "paths"),
+    [
+        ({"public": False, "allowed_cidrs": ["10.0.0.0/8", "0.0.0.0/0", "::/0"]},
+         ["/network/ingress/allowed_cidrs/1", "/network/ingress/allowed_cidrs/2"]),
+        ({"public": False, "allowed_cidrs": ["10.0.0.0/8"]}, []),
+        ({"public": True, "allowed_cidrs": ["0.0.0.0/0"]}, []),  # 공개 진입점은 원래 전체 대역이다
+    ],
+)
+def test_net002_internal_ingress_open_to_all(sample_app: dict[str, Any], ingress: dict, paths: list[str]) -> None:
+    sample_app["network"]["ingress"] = ingress
+    found = findings_of(sample_app, "NET-002")
+    assert [f["location"]["spec_path"] for f in found] == paths
+    assert all(f["autofix"] == "allowed" for f in found)
+
+
+def test_sto004_unencrypted_bucket(sample_app: dict[str, Any]) -> None:
+    sample_app["storage"] = {"buckets": [{"name": "uploads-a"}, {"name": "uploads-b", "encryption": False}]}
+    [f] = findings_of(sample_app, "STO-004")
+    assert (f["severity"], f["autofix"], f["location"]["spec_path"]) == ("medium", "allowed", "/storage/buckets/1/encryption")
+    sample_app["target"] = {"env": "local", "region": "r"}
+    assert "STO-004" not in rule_ids(sample_app)

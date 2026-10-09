@@ -291,3 +291,25 @@ async def test_sto006_unanswered_approval_restores_the_volume() -> None:
 
     assert final["status"] == "pass"
     assert [v["name"] for v in final["deploy_spec"]["storage"]["volumes"]] == ["data", "uploads"]
+
+
+def test_rule_recommendations_for_backup_encryption_and_dropped_entries() -> None:
+    spec = load_sample_dict("01-pass-sample-app-aws.yaml")
+    spec["database"] = {"engine": "postgres", "version": "16", "placement": "managed", "backup_retention_days": 0}
+    token = {"name": "API_TOKEN", "source": "k8s-secret", "key": "token"}
+    spec["secrets"] = [{"name": "DATABASE_URL", "source": "aws-secrets-manager", "key": "app/db"}, token, token, token]
+    spec["storage"] = {"buckets": [{"name": "uploads-a", "encryption": False}]}
+    spec["network"]["ingress"] = {"public": False, "allowed_cidrs": ["0.0.0.0/0", "10.0.0.0/8", "::/0"]}
+
+    recs = recommend(spec)
+    ops = {op["path"]: op for rec in recs for op in rec["ops"]}
+
+    assert ops["/database/backup_retention_days"]["value"] == 1
+    assert ops["/storage/buckets/0/encryption"]["value"] is True
+    drops = [[op["path"] for op in rec["ops"]] for rec in recs if rec["ops"][0]["op"] == "remove"]
+    assert sorted(drops) == [  # 규칙마다 한 후보로, 뒤에서부터 지운다
+        ["/network/ingress/allowed_cidrs/2", "/network/ingress/allowed_cidrs/0"], ["/secrets/3", "/secrets/2"]]
+    after = spec
+    for rec in recs:
+        after = apply_ops(after, rec["ops"])
+    assert run_static_check(DeploySpec.model_validate(after)) == []

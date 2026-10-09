@@ -26,9 +26,13 @@ RULE_PATCH_PATHS: dict[str, tuple[str, ...]] = {
     "DB-003": ("/runtime/replicas", *_DB_ENGINE, "/database/volume"),  # 엔진 필드는 allow_convert + 데이터 없음일 때 전환
     "DB-005": ("/storage/volumes", "/database/volume", "/database/placement"),
     "DB-006": ("/database/publicly_accessible",),
+    "DB-007": ("/database/backup_retention_days",),
+    "SEC-003": ("/secrets",),  # 겹친 항목만 지운다 (validate 가드) — 인덱스가 밀려 리스트 전체가 바뀐 것으로 보인다
     "SEC-004": ("/runtime/env/*",),  # 겹치는 env 항목을 지운다 — 적용 값은 뒤에 붙는 시크릿이라 그대로다
+    "NET-002": ("/network/ingress/allowed_cidrs",),  # 전체 대역 항목만 지운다 (validate 가드)
     "STO-002": ("/runtime/replicas",),
     "STO-003": ("/storage/buckets/*/public",),
+    "STO-004": ("/storage/buckets/*/encryption",),
     "RUN-005": ("/runtime/resources/cpu_limit", "/runtime/resources/memory_limit"),
 }
 

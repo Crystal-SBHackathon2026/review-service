@@ -22,6 +22,15 @@ def public_bucket(ctx: CheckContext) -> list[Hit]:
     ]
 
 
+def unencrypted_bucket(ctx: CheckContext) -> list[Hit]:
+    """STO-004 — 버킷 암호화가 꺼져 있다."""
+    return [
+        Hit(f"/storage/buckets/{i}/encryption", f"bucket {b.name}: encryption false")
+        for i, b in enumerate(ctx.spec.storage.buckets)
+        if not b.encryption
+    ]
+
+
 def volume_shrink(ctx: CheckContext) -> list[Hit]:
     """STO-005 — 이전 배포의 persistent 볼륨보다 작다. PVC 는 줄일 수 없다."""
     if ctx.previous is None:

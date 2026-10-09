@@ -33,3 +33,25 @@ def env_shadowed_by_secret(ctx: CheckContext) -> list[Hit]:
         for name in sorted(ctx.spec.runtime.env)
         if name in secret_names
     ]
+
+
+def unsupported_secret_source(ctx: CheckContext) -> list[Hit]:
+    """SEC-002 — 대상 환경에 없는 비밀 저장소를 참조한다. 값을 동기화할 주체가 없어 Secret 키가 비어 Pod 가 뜨지 않는다."""
+    supported = ctx.caps.secret_sources
+    return [
+        Hit(f"/secrets/{i}/source", f"{ctx.caps.env}: secrets[{s.name}] {s.source} 미지원 (지원: {sorted(supported)})")
+        for i, s in enumerate(ctx.spec.secrets)
+        if s.source not in supported
+    ]
+
+
+def duplicate_secret(ctx: CheckContext) -> list[Hit]:
+    """SEC-003 — secrets[].name 이 겹친다. 위치는 두 번째부터의 항목이다 (첫 항목을 남긴다)."""
+    first: dict[str, int] = {}
+    hits = []
+    for i, s in enumerate(ctx.spec.secrets):
+        if s.name in first:
+            hits.append(Hit(f"/secrets/{i}", f"secrets[{s.name}] 중복 (처음: secrets/{first[s.name]})"))
+        else:
+            first[s.name] = i
+    return hits
