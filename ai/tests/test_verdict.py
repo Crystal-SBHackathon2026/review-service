@@ -98,6 +98,16 @@ def test_low_score_when_no_exact_doc_and_weak_semantic_match() -> None:
     assert "LOW_SCORE" in decision["reasons"]
 
 
+def test_past_case_does_not_count_as_rule_evidence() -> None:
+    """규칙 문서 없이 지난 검토 사례만 있으면 근거 부족이다 — 사례는 보조 근거라 LOW_SCORE 를 풀지 않는다."""
+    findings = findings_for("07-fix-public-bucket.yaml")
+    cases = [Doc(chunk_id=f"case:r1.human_approved.{f['rule_id']}", rule_id=f["rule_id"], doc_type="case",
+                 provider="aws", score=1.0, match="exact_rule", source_uri="review://r1", text="")
+             for f in findings]
+    assert "LOW_SCORE" in decide(findings, docs=cases)["reasons"]
+    assert "LOW_SCORE" not in decide(findings, docs=exact_docs(findings) + cases)["reasons"]
+
+
 def test_loop_exhausted_after_max_rounds() -> None:
     findings = findings_for("07-fix-public-bucket.yaml")
     rounds = [{"finding_ids": ["other"]}] * MAX_PATCH_ROUNDS

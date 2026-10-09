@@ -153,7 +153,7 @@ S3·Qdrant 가 아니라 업무 DB 인 이유: 근거 문서(FileRetriever)는 �
 
 - **내용은 마스킹된 rounds·findings 에서만**: 규칙 ID·제목·경로·사람 확인 사유·적용한 값. finding `evidence`(값)는 넣지 않는다. ops 는 `/runtime/env`·`/secrets`·`/baseline`(과 그 위를 통째 교체하는 op)과 비밀처럼 보이는 값을 뺀다. 판단이 필요했던 finding(low 제외)이 없으면 남기지 않는다.
 - `case_id = <review_id>.<outcome>` 이라 같은 종료 지점이 다시 돌거나 Argo CD 가 Degraded 를 여러 번 보내도 한 번만 남는다.
-- **검색**(`retrieval.case_retriever`): ruleId 정확 매칭, 같은 대상 환경 먼저, 그 안에서 최근 3개. 문서는 `chunk_id=case:<case_id>`·`doc_type=case`·`rule_id`=걸린 규칙이라 인용 검증을 그대로 통과한다. 규칙 문서 뒤에 붙고, 저장소 오류면 경고 로그만 남기고 규칙 문서로 검토한다.
+- **검색**(`retrieval.case_retriever`): ruleId 정확 매칭, 같은 대상 환경 먼저, 그 안에서 최근 3개. 문서는 `chunk_id=case:<case_id>`·`doc_type=case`·`rule_id`=걸린 규칙이라 인용 검증을 그대로 통과한다. 규칙 문서 뒤에 붙고, 저장소 오류면 경고 로그만 남기고 규칙 문서로 검토한다. 다만 근거 부족 게이트(`LOW_SCORE`)에서는 규칙 문서로 치지 않는다 — 문서 없는 규칙이 사례만으로 자동 판정되지 않게.
 - judge 프롬프트(`judge-v3`)는 case 문서를 "지난 검토 기록, 규칙보다 우선하지 않고 참고로만"으로 다룬다.
 - **권장값에는 쓰지 않는다.** 규칙·baseline 으로 권장값을 못 만드는 항목(빌드 플랫폼·시크릿 출처)은 관측 없이 정할 수 없는 값이라, 다른 검토에서 사람이 고른 값을 옮겨도 이 배포의 근거가 아니다.
 
