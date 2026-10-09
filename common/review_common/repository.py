@@ -100,10 +100,11 @@ class ReviewRepository(Protocol):
         """같은 레포(spec_ref.repository)·같은 head SHA 검토. 가장 최근 것."""
         ...
 
-    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None) -> list[str]:
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None,
+                             error: str | None = None) -> list[str]:
         """그 PR 의 끝나지 않은 검토를 superseded 로 넘긴다 (superseded_by 자신은 빼고). 넘긴 review_id 들.
 
-        superseded_by=None — 새 커밋에 검토할 명세가 없다 (intake 로 갔다)."""
+        superseded_by=None — 새 커밋에 검토할 명세가 없다 (intake 로 갔다) 또는 PR 이 병합 없이 닫혔다(error="PR closed")."""
         ...
 
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]: ...
@@ -269,12 +270,14 @@ class PostgresReviewRepository:
             "SELECT * FROM reviews WHERE spec_ref->>'repository' = %s AND pr_head_sha = %s"
             " ORDER BY created_at DESC LIMIT 1", (repository, sha))
 
-    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None) -> list[str]:
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None,
+                             error: str | None = None) -> list[str]:
         rows = await self._fetchall(
-            "UPDATE reviews SET status = 'superseded', superseded_by = %s, updated_at = now()"
+            "UPDATE reviews SET status = 'superseded', superseded_by = %s, error = COALESCE(%s, error),"
+            " updated_at = now()"
             " WHERE spec_ref->>'repository' = %s AND pr_number = %s AND review_id IS DISTINCT FROM %s::text"
             " AND status = ANY(%s)"
-            " RETURNING review_id", (superseded_by, repository, pr_number, superseded_by, list(OPEN)))
+            " RETURNING review_id", (superseded_by, error, repository, pr_number, superseded_by, list(OPEN)))
         return [r["review_id"] for r in rows]
 
     async def waiting_ci_by_head_sha(self, sha: str) -> list[dict[str, Any]]:
@@ -471,12 +474,13 @@ class InMemoryReviewRepository:
         return self._latest(r for r in self.reviews.values()
                             if r["spec_ref"].get("repository") == repository and r["pr_head_sha"] == sha)
 
-    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None) -> list[str]:
+    async def supersede_open(self, *, repository: str, pr_number: int, superseded_by: str | None,
+                             error: str | None = None) -> list[str]:
         done = []
         for r in sorted(self.reviews.values(), key=lambda r: r["created_at"]):
             if (r["spec_ref"].get("repository") == repository and r["pr_number"] == pr_number
                     and r["review_id"] != superseded_by and r["status"] in OPEN):
-                r.update(status="superseded", superseded_by=superseded_by, updated_at=_now())
+                r.update(status="superseded", superseded_by=superseded_by, error=error or r["error"], updated_at=_now())
                 done.append(r["review_id"])
         return done
 

@@ -650,8 +650,57 @@ async def test_superseded_status_is_not_overwritten_by_worker(env: Env) -> None:
     assert (env.repo.reviews[rid]["status"], env.repo.reviews[rid]["verdict"]) == ("superseded", "pass")
 
 
+def closed_event(*, merged: bool, number: int = 5) -> dict[str, Any]:
+    body = pr_event("closed", number=number)
+    body["pull_request"]["merged"] = merged
+    return body
+
+
+async def test_closed_pr_supersedes_open_reviews_and_leaves_ui_list(env: Env) -> None:
+    """P2 — needs_human 검토가 있는 PR 을 결정 없이 닫으면 superseded, 승인 화면 목록(GET /reviews)에서 빠진다."""
+    env.put_spec(sample_text())
+    rid = send_pr(env, pr_event("opened")).json()["review_id"]
+    await env.set_status(rid, status="needs_human")
+    await env.repo.insert_review(review_id="rv_done", app="sample-app", target_env="aws", repo_id=REPO,
+                                 spec_ref={"repository": REPO, "commit": "c" * 40, "path": "deploy.yaml"},
+                                 pr_head_sha="c" * 40, requested_by="x", pr_number=5)
+    await env.set_status("rv_done", status="committed")
+    assert [r["review_id"] for r in env.client.get("/reviews", params={"status": "needs_human"}).json()] == [rid]
+
+    resp = send_pr(env, closed_event(merged=False))
+
+    assert resp.json() == {"closed": 5, "superseded": [rid]}
+    row = env.repo.reviews[rid]
+    assert (row["status"], row["error"], row["superseded_by"]) == ("superseded", "PR closed", None)
+    assert env.repo.reviews["rv_done"]["status"] == "committed"
+    assert env.client.get("/reviews", params={"status": "needs_human"}).json() == []
+    # 멈춘 그래프에 사람 결정이 와도 받지 않는다
+    resp = env.client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "h"})
+    assert resp.status_code == 409
+
+
+async def test_merged_close_does_nothing(env: Env) -> None:
+    env.put_spec(sample_text())
+    rid = send_pr(env, pr_event("opened")).json()["review_id"]
+    await env.set_status(rid, status="waiting_ci")
+
+    assert send_pr(env, closed_event(merged=True)).json() == {"ignored": "merged"}
+    assert env.repo.reviews[rid]["status"] == "waiting_ci"
+
+
+def test_reopened_after_close_reviews_same_sha_again(env: Env) -> None:
+    env.put_spec(sample_text())
+    first = send_pr(env, pr_event("opened")).json()["review_id"]
+    send_pr(env, closed_event(merged=False))
+
+    body = send_pr(env, pr_event("reopened")).json()
+
+    assert body["review_id"] != first
+    assert env.repo.reviews[body["review_id"]]["status"] == "received"
+    assert len(env.publisher.sent) == 2
+
+
 @pytest.mark.parametrize("body", [
-    pr_event("closed"),
     pr_event("edited"),
     pr_event("opened", base="release"),  # 기본 브랜치가 아닌 PR
 ])

@@ -8,6 +8,7 @@
     GET  /intakes/{intake_id}           명세 없음·빈 명세·형식 오류 처리 기록 (PR 커밋 상태의 링크)
     POST /reviews/{review_id}/decision  needs_human 검토에 사람 결정 → review.resumed(human_decision)  [Bearer REVIEW_API_TOKEN]
     POST /webhooks/github               pull_request opened·synchronize·reopened → 검토 시작
+                                        closed(병합 없이) → 그 PR 의 끝나지 않은 검토 superseded
                                         (deploy.yaml 없음·빈 파일·형식 오류 → spec_intakes, review_api.intake)
                                         check_suite completed → review.resumed(ci_completed)
     POST /webhooks/argocd               배포 Healthy·Degraded 기록, Healthy 면 baselines 갱신, Degraded 면 판단 사례
@@ -353,8 +354,13 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
       생성 커밋 위에 커밋이 더 올라와도 같다(명세는 여전히 레포 분석으로 만든 것). 판단 근거는 spec_intakes 기록뿐이다 —
       명세 파일 내용·커밋 메시지·PR 작성자처럼 PR 을 올린 사람이 바꿀 수 있는 표시는 보지 않는다
     - 포크 PR 은 {"skipped": "fork"} — 검토·intake 모두 하지 않는다
+    - 병합 없이 닫힌 PR(closed, merged=false)은 끝나지 않은 검토를 superseded(error "PR closed")로 넘긴다 →
+      승인 화면 목록에서 빠진다. 체크포인터에 멈춘 그래프는 그대로 둔다 — 상태가 바뀌어 재개 claim 이 실패한다.
+      다시 열면(reopened) 같은 head SHA 라도 새로 검토한다
     """
     action = payload.get("action")
+    if action == "closed":
+        return await on_pull_request_closed(deps, payload)
     if action not in PR_ACTIONS:
         return {"ignored": f"action {action}"}
     pr, repo = payload["pull_request"], payload["repository"]
@@ -364,7 +370,7 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
         return {"skipped": "fork"}
     repository, head_sha, number = repo["full_name"], pr["head"]["sha"], pr["number"]
     existing = await deps.repo.find_by_head(repository, head_sha)
-    if existing is not None:
+    if existing is not None and not (action == "reopened" and existing["status"] == "superseded"):
         return {"skipped": "already reviewed", "review_id": existing["review_id"]}
     taken = await deps.repo.find_intake_by_head(repository, head_sha)
     if taken is not None:
@@ -390,6 +396,22 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
         await deps.repo.link_intake(source["intake_id"], review_id=review_id)
         result["from_intake"] = source["intake_id"]
     return result
+
+
+PR_CLOSED = "PR closed"
+
+
+async def on_pull_request_closed(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, Any]:
+    """병합 없이 닫힌 PR — 그 PR 의 끝나지 않은 검토(received·reviewing·needs_human·waiting_ci)를 superseded 로.
+
+    병합으로 닫힌 것(워커 merge_pr 이 병합했다)은 아무것도 하지 않는다 — 검토는 merging 이후 상태라 OPEN 에도 없다.
+    """
+    pr = payload["pull_request"]
+    if pr.get("merged"):
+        return {"ignored": "merged"}
+    superseded = await deps.repo.supersede_open(repository=payload["repository"]["full_name"],
+                                                pr_number=pr["number"], superseded_by=None, error=PR_CLOSED)
+    return {"closed": pr["number"], "superseded": superseded}
 
 
 # 기본값(10분·재시도 2번)이면 처리 중인 intake 를 STALE_AFTER(2분) 뒤 sweep 이 다시 가져가 두 번 처리한다
