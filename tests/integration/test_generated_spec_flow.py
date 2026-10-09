@@ -65,12 +65,17 @@ class FakeGitHub:
         return list(self.trees[ref])
 
     # --- 쓰기 ---
-    async def prepare_file_commit(self, repository: str, *, parent: str, path: str, content: str,
-                                  message: str) -> str:
+    async def prepare_files_commit(self, repository: str, *, parent: str, files: dict[str, str | None],
+                                   message: str) -> str:
         sha = f"{len(self.parents) + 1:x}".rjust(40, "e")
-        self.trees[sha] = {**self.trees[parent], path: content}
+        tree = {**self.trees[parent], **files}
+        self.trees[sha] = {path: content for path, content in tree.items() if content is not None}
         self.parents[sha] = parent
         return sha
+
+    async def prepare_file_commit(self, repository: str, *, parent: str, path: str, content: str,
+                                  message: str) -> str:
+        return await self.prepare_files_commit(repository, parent=parent, files={path: content}, message=message)
 
     async def update_branch(self, repository: str, branch: str, sha: str) -> None:
         if self.parents.get(sha) != self.branch:
