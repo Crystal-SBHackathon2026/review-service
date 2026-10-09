@@ -105,6 +105,10 @@ class ReviewRepository(Protocol):
         """이미지 태그가 merge_sha 와 같은(짧은 SHA 면 앞부분이 같은) 검토. 가장 최근 것."""
         ...
 
+    async def find_by_merge_sha_exact(self, merge_sha: str) -> dict[str, Any] | None:
+        """merge_sha 가 정확히 같은 검토. 가장 최근 것 — baseline 이 어느 검토의 배포인지 찾는다."""
+        ...
+
     async def get_baseline(self, app: str, target_env: str) -> dict[str, Any] | None: ...
 
     async def upsert_baseline(self, *, app: str, target_env: str, spec: dict[str, Any], spec_ref: dict[str, Any],
@@ -112,6 +116,10 @@ class ReviewRepository(Protocol):
 
     async def add_deploy_event(self, *, review_id: str | None, app: str, target_env: str, kind: str,
                                image_tag: str | None, payload: dict[str, Any]) -> None: ...
+
+    async def has_deploy_event(self, *, review_id: str, kind: str, image_tag: str | None) -> bool:
+        """같은 (검토, healthy|degraded, 이미지 태그) 배포 알림을 이미 기록했는지. Argo CD 가 같은 알림을 다시 보낸다."""
+        ...
 
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
         """그 레포(spec_ref.repository)의 가장 최근 baseline — 명세가 없을 때 앱·대상 환경을 거기서 찾는다.
@@ -268,6 +276,10 @@ class PostgresReviewRepository:
             (app, target_env, image_tag),
         )
 
+    async def find_by_merge_sha_exact(self, merge_sha: str) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT * FROM reviews WHERE merge_sha = %s ORDER BY created_at DESC LIMIT 1", (merge_sha,))
+
     async def get_baseline(self, app: str, target_env: str) -> dict[str, Any] | None:
         return await self._fetchone("SELECT * FROM baselines WHERE app = %s AND target_env = %s", (app, target_env))
 
@@ -289,6 +301,11 @@ class PostgresReviewRepository:
             " VALUES (%s, %s, %s, %s, %s, %s)",
             (review_id, app, target_env, kind, image_tag, Jsonb(payload)),
         )
+
+    async def has_deploy_event(self, *, review_id: str, kind: str, image_tag: str | None) -> bool:
+        return await self._fetchone(
+            "SELECT 1 AS hit FROM deploy_events WHERE review_id = %s AND kind = %s"
+            " AND image_tag IS NOT DISTINCT FROM %s LIMIT 1", (review_id, kind, image_tag)) is not None
 
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
         return await self._fetchone(
@@ -453,6 +470,9 @@ class InMemoryReviewRepository:
                             if r["app"] == app and r["target_env"] == target_env
                             and tag_matches(r["merge_sha"], image_tag))
 
+    async def find_by_merge_sha_exact(self, merge_sha: str) -> dict[str, Any] | None:
+        return self._latest(r for r in self.reviews.values() if r["merge_sha"] == merge_sha)
+
     async def get_baseline(self, app: str, target_env: str) -> dict[str, Any] | None:
         row = self.baselines.get((app, target_env))
         return copy.deepcopy(row) if row else None
@@ -470,6 +490,10 @@ class InMemoryReviewRepository:
             "id": len(self.deploy_events) + 1, "review_id": review_id, "app": app, "target_env": target_env,
             "kind": kind, "image_tag": image_tag, "payload": copy.deepcopy(payload), "received_at": _now(),
         })
+
+    async def has_deploy_event(self, *, review_id: str, kind: str, image_tag: str | None) -> bool:
+        return any(e["review_id"] == review_id and e["kind"] == kind and e["image_tag"] == image_tag
+                   for e in self.deploy_events)
 
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
         rows = [b for b in self.baselines.values() if b["spec_ref"].get("repository") == repository]

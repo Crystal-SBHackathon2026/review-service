@@ -376,7 +376,7 @@ async def test_argocd_healthy_with_merge_sha_updates_baseline(env: Env) -> None:
     resp = env.client.post("/webhooks/argocd", json=argo("Healthy", MERGE[:7]),
                            headers={"Authorization": "Bearer argo-token"})
 
-    assert resp.json() == {"review_id": rid, "recorded": "healthy"}
+    assert resp.json() == {"review_id": rid, "recorded": "healthy", "baseline": "updated"}
     assert [e["kind"] for e in env.repo.deploy_events] == ["healthy"]
     baseline = env.repo.baselines[("sample-app", "aws")]
     assert (baseline["merge_sha"], baseline["database_has_data"]) == (MERGE, None)

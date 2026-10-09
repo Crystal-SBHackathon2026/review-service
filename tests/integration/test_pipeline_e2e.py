@@ -137,6 +137,11 @@ async def test_repository_on_postgres(pool: Any) -> None:
     assert (baseline["spec"], baseline["merge_sha"], baseline["database_has_data"]) == ({"v": 2}, "y", None)
     await repo.add_deploy_event(review_id="rv_1", app="sample-app", target_env="aws", kind="healthy",
                                 image_tag="c0ffee1", payload={"health": "Healthy"})
+    assert await repo.has_deploy_event(review_id="rv_1", kind="healthy", image_tag="c0ffee1")
+    assert not await repo.has_deploy_event(review_id="rv_1", kind="degraded", image_tag="c0ffee1")
+    assert not await repo.has_deploy_event(review_id="rv_1", kind="healthy", image_tag=None)
+    assert (await repo.find_by_merge_sha_exact(MERGE_SHA))["review_id"] == "rv_1"
+    assert await repo.find_by_merge_sha_exact(MERGE_SHA[:7]) is None  # 정확히 같을 때만
 
     with pytest.raises(psycopg.errors.CheckViolation):
         await repo.update_review("rv_1", status="nope")
@@ -362,7 +367,7 @@ async def test_api_to_kafka_to_worker(pool: Any) -> None:
             resp = await client.post("/webhooks/argocd", json={
                 "app": "sample-app", "env": "aws", "health": "Healthy",
                 "images": [f"ghcr.io/crystal-sbhackathon2026/sample-app:{MERGE_SHA}"]})
-            assert resp.json() == {"review_id": rid, "recorded": "healthy"}
+            assert resp.json() == {"review_id": rid, "recorded": "healthy", "baseline": "updated"}
             assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == MERGE_SHA
             detail = (await client.get(f"/reviews/{rid}")).json()
             assert (detail["verdict"], detail["merge_sha"]) == ("pass", MERGE_SHA)

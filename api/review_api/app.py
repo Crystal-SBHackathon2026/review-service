@@ -38,8 +38,7 @@ from review_ai.spec.deploy_spec import REPOSITORY
 from review_ai.state import REASON_MESSAGES
 from review_ai.transform import TRANSFORM_MAX_TOKENS
 from review_ai.transform.prompt import TransformOutput
-from review_api.argocd import ArgoCdEvent
-from review_api.cases import record_degraded_case
+from review_api.argocd import ArgoCdEvent, handle_deploy_event
 from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spec, open_intake, process_intake,
                                sweep_stale_intakes)
 from review_api.lockfile import regenerate_lockfile
@@ -216,23 +215,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         if deps_.argocd_webhook_token and not hmac.compare_digest(authorization,
                                                                   f"Bearer {deps_.argocd_webhook_token}"):
             raise HTTPException(401, "토큰이 맞지 않다")
-        kind = {"Healthy": "healthy", "Degraded": "degraded"}.get(event.health)
-        if kind is None:
-            return {"ignored": f"health {event.health}"}
-        for tag in event.image_tags():
-            row = await deps_.repo.find_by_merge_sha(app=event.app, target_env=event.env, image_tag=tag)
-            if row is None:
-                continue
-            await deps_.repo.add_deploy_event(review_id=row["review_id"], app=event.app, target_env=event.env,
-                                              kind=kind, image_tag=tag, payload=event.model_dump(mode="json"))
-            if kind == "healthy" and row.get("final_spec"):
-                await deps_.repo.upsert_baseline(app=event.app, target_env=event.env, spec=row["final_spec"],
-                                                 spec_ref=row["spec_ref"], merge_sha=row["merge_sha"],
-                                                 observed_at=datetime.now(UTC))
-            if kind == "degraded":
-                await record_degraded_case(deps_.repo, row)
-            return {"review_id": row["review_id"], "recorded": kind}
-        return {"ignored": "이미지 태그와 맞는 병합 SHA 가 없다"}
+        return await handle_deploy_event(deps_.repo, event)
 
     return app
 
