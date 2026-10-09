@@ -13,7 +13,7 @@
 | secrets | 소스가 읽는 환경변수 이름 — 비밀로 보이는 이름이 있으면 어디서 읽을지 몰라 비워 둔다 |
 | storage | Dockerfile VOLUME, 파일 쓰기 호출, 업로드·오브젝트 스토리지 의존성 |
 | requirements | DB 없음 + 저장소 없음일 때만 persistence=false |
-| smoke | 테스트 파일이 하나도 없을 때만 — readiness 경로 + 소스의 고정 GET 라우트 (Express·FastAPI·Flask·net/http·gin) |
+| smoke | 테스트 파일이 하나도 없을 때만 — readiness 경로 + 소스의 헬스·정보성 고정 GET 라우트 (Express·FastAPI·Flask·net/http·gin) |
 """
 
 from __future__ import annotations
@@ -117,6 +117,8 @@ GET_ROUTES = (
     re.compile(rf"\bHandleFunc\(\s*\"(?:GET\s+)?{_ROUTE_PATH}\""),  # net/http
     re.compile(rf"\.GET\(\s*\"{_ROUTE_PATH}\""),  # gin·echo
 )
+# 확인용으로 GET 해도 되는 경로 — 로그인·입력이 필요한 업무 경로(/api/todos 등)는 401·400 이라 확인에 쓰지 않는다
+PROBE_LIKE = re.compile(r"(?:^|/)(?:healthz?|livez?|liveness|readyz?|readiness|ping|status|version|info)$")
 MAX_SMOKE_PATHS = 5
 
 
@@ -397,7 +399,8 @@ def _smoke(tree: Sequence[str], runtime: Runtime | None, sources: Mapping[str, s
         more = f" 외 {len(tests) - 2}개" if len(tests) > 2 else ""
         return None, Finding(path, ", ".join(tests[:2]) + more, "테스트가 있어 배포 뒤 확인 경로를 만들지 않는다", True)
     readiness = runtime.health.readiness if runtime else None
-    routes = sorted({m.group(1) for text in sources.values() for pattern in GET_ROUTES for m in pattern.finditer(text)})
+    routes = sorted({m.group(1) for text in sources.values() for pattern in GET_ROUTES for m in pattern.finditer(text)
+                     if PROBE_LIKE.search(m.group(1))})
     paths = list(dict.fromkeys([*([readiness] if readiness else []), *routes]))[:MAX_SMOKE_PATHS]
     if not paths:
         return None, Finding(path, f"소스 {len(sources)}개", "테스트도, 확인할 GET 경로도 찾지 못했다", False)

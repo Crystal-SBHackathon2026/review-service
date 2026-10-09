@@ -21,6 +21,7 @@ from tests.test_overlay import needs_kubectl, write_rendered
 ROUTES_JS = """const app = require("express")();
 app.get("/healthz", (req, res) => res.send("ok"));
 app.get("/api/info", info);
+app.get("/api/todos", requireLogin, list);
 app.get("/todos/:id", one);
 app.post("/todos", create);
 """
@@ -51,20 +52,20 @@ def test_any_test_layout_counts_as_tests(test_file: str) -> None:
 def test_repo_without_tests_checks_readiness_and_fixed_get_routes() -> None:
     files = sample_files(**{"src/app.js": ROUTES_JS})
     analysis = analyze_repository(BASE, no_tests(files), files)
-    # readiness 가 먼저, 파라미터 경로(:id)·POST 는 빠진다, 중복은 한 번
+    # readiness 가 먼저, 업무 경로(/api/todos — 로그인 필요)·파라미터 경로(:id)·POST 는 빠진다, 중복은 한 번
     assert analysis.context.smoke == Smoke(paths=("/healthz", "/api/info"))
     assert "/healthz, /api/info" in smoke_finding(analysis)
 
 
 @pytest.mark.parametrize(("path", "source", "route"), [
-    ("app/main.py", '@app.get("/status")\ndef status(): ...\n', "/status"),
+    ("app/main.py", '@app.get("/status")\n@app.get("/items")\ndef status(): ...\n', "/status"),
     ("app/views.py", "@bp.route('/ping')\ndef ping(): ...\n", "/ping"),
-    ("main.go", 'http.HandleFunc("GET /livez", live)\n', "/livez"),
+    ("main.go", 'http.HandleFunc("GET /livez", live)\nhttp.HandleFunc("/orders", o)\n', "/livez"),
     ("server.go", 'r.GET("/v1/status", h)\n', "/v1/status"),
 ])
 def test_routes_in_other_stacks(path: str, source: str, route: str) -> None:
     files = {"Dockerfile": "FROM x\nEXPOSE 8080\n", path: source}
-    assert route in analyze_repository(BASE, list(files), files).context.smoke.paths  # type: ignore[union-attr]
+    assert analyze_repository(BASE, list(files), files).context.smoke.paths == (route,)  # type: ignore[union-attr]
 
 
 def test_no_tests_and_no_routes_leaves_smoke_empty_without_blocking() -> None:
