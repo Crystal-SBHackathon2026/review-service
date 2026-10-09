@@ -123,7 +123,7 @@ class Flow:
     def pr(self, action: str, sha: str) -> dict[str, Any]:
         event = {"action": action, "sender": {"login": "hyeyeon"}, "repository": {"full_name": REPO,
                                                                                     "default_branch": "main"},
-                 "pull_request": {"number": 11, "base": {"ref": "main"},
+                 "pull_request": {"number": 11, "base": {"ref": "main", "repo": {"full_name": REPO}},
                                   "head": {"sha": sha, "ref": "feature", "repo": {"full_name": REPO}}}}
         raw = json.dumps(event).encode()
         sig = "sha256=" + hmac.new(SECRET.encode(), raw, hashlib.sha256).hexdigest()
