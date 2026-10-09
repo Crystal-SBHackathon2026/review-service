@@ -79,6 +79,7 @@ async def run(argv: Sequence[str] | None = None) -> str:
 
 def main(argv: Sequence[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # Qdrant 요청마다 한 줄씩 남기지 않게
     print(asyncio.run(run(argv)), flush=True)
 
 

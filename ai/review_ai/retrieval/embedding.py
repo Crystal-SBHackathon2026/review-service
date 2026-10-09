@@ -10,6 +10,8 @@ from collections.abc import Sequence
 from typing import Protocol
 
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# 한 번에 임베딩할 문서 수. fastembed 기본(256)이면 170청크를 한 배치로 올려 색인 컨테이너가 1Gi 를 넘는다(OOM 실측)
+EMBED_BATCH_SIZE = 16
 
 
 class Embedder(Protocol):
@@ -19,14 +21,16 @@ class Embedder(Protocol):
 
 
 class FastEmbedder:
-    def __init__(self, model: str = DEFAULT_MODEL) -> None:
+    def __init__(self, model: str = DEFAULT_MODEL, *, batch_size: int = EMBED_BATCH_SIZE) -> None:
         from fastembed import TextEmbedding  # 무거운 import 는 실제로 쓸 때만
 
         self._model = TextEmbedding(model_name=model)
+        self._batch_size = batch_size
         self.dim = len(next(iter(self._model.embed(["dim"]))))
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        return await asyncio.to_thread(lambda: [v.tolist() for v in self._model.embed(list(texts))])
+        return await asyncio.to_thread(
+            lambda: [v.tolist() for v in self._model.embed(list(texts), batch_size=self._batch_size)])
 
 
 class HashEmbedder:
