@@ -5,6 +5,7 @@
 #   intake           명세가 없거나 깨진 PR. Review API 와 같은 순서로 deploy.yaml 을 만든 뒤 검토한다
 #     repo     eval/repos/<repo>.yaml — 레포 분석 대상 파일 (생성·복구 모두 이 분석 결과를 context 로 쓴다)
 #     file: missing  파일 없음 / raw: 원문 그대로 / sample + edit: 샘플 원문에 [찾을 글자, 바꿀 글자] 를 차례로 적용
+#     baseline  이미 배포한 앱 — 이 샘플을 마지막 승인 명세로 둔다. 있으면 레포를 분석하지 않는다 (Review API 와 같다)
 #     repair   복구 LLM 자리. reviewer(기본: --llm fake 면 정답 가짜, claude 면 실제 Claude) 또는
 #              review_ai/intake/fake_repair.py REPAIR_FAKES 의 일부러 틀린 가짜 — 복구 게이트가 버리는지 본다
 #   resume           sample 검토가 needs_human 에서 멈춘 뒤 사람 응답 {edited_ops, use_recommendations} 로 재개.
@@ -273,10 +274,11 @@ cases:
     intake: {repo: sample-app, file: missing}
     llm: reviewer
     expect: {intake_kind: missing, intake: generated, verdict: pass, findings: [], llm_calls: 0}
-  - id: e02-empty
-    intake: {repo: sample-app, raw: "# 나중에 채운다\n"}
+  - id: e02-empty                # 배포된 앱의 명세를 비운 PR — baseline 의 ingress·replicas·env 를 그대로 둔다 (sample-app #11)
+    intake: {repo: sample-app, raw: "# 나중에 채운다\n", baseline: 01-pass-sample-app-aws.yaml}
     llm: reviewer
-    expect: {intake_kind: empty, intake: generated, verdict: pass, findings: [], llm_calls: 0}
+    expect: {intake_kind: empty, intake: generated, verdict: pass, findings: [NET-001], llm_calls: 0,
+             values: {/network/ingress/public: true, /runtime/replicas: 2, /runtime/env/DEPLOY_ENV: aws}}
   - id: e03-yaml-syntax          # 들여쓰기가 한 칸 밀린 줄 — 앞 줄 값에 이어 붙어 YAML 이 깨진다
     intake: {repo: sample-app, sample: 01-pass-sample-app-aws.yaml, edit: [["  replicas: 2", "   replicas: 2"]]}
     llm: reviewer

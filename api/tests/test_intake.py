@@ -174,6 +174,28 @@ async def test_new_app_is_generated_from_repo_analysis(ienv: IntakeEnv) -> None:
     assert "- /runtime: Dockerfile — EXPOSE 8080, HEALTHCHECK /healthz" in ienv.github.last_message.splitlines()
 
 
+async def test_deleted_spec_before_deploy_report_keeps_committed_spec(ienv: IntakeEnv) -> None:
+    """Argo 웹훅 전이라 baselines 가 비어도 gitops 에 커밋한 검토가 있으면 그 명세로 만든다 (sample-app #11).
+
+    레포 분석으로 새로 만들면 ingress·replicas·env 가 빠진 명세가 통과해 overlay 의 ingress 가 지워졌다.
+    """
+    ienv.github.tree = dict(SAMPLE_TREE)
+    spec = yaml.safe_load(sample_text())
+    await ienv.repo.insert_review(review_id="r-old", app="sample-app", target_env="aws", repo_id=REPO,
+                                  spec_ref={"repository": REPO, "commit": "9" * 40, "path": "deploy.yaml"},
+                                  pr_head_sha="9" * 40, requested_by="test")
+    await ienv.repo.update_review("r-old", status="committed", final_spec=spec, merge_sha="c0ffee1" + "0" * 33)
+    send_pr(ienv, pr_event("opened"))
+
+    row = ienv.only_intake()
+    assert (row["status"], row["reason"]) == ("generated", "GENERATED")
+    generated = AppSpec.model_validate(yaml.safe_load(ienv.github.contents[row["result_commit_sha"]]))
+    previous = AppSpec.model_validate(spec)
+    assert (generated.network, generated.runtime) == (previous.network, previous.runtime)
+    assert generated.network.ingress is not None and generated.runtime.replicas == 2
+    assert row["baseline_used"] is True  # baseline 으로 만들었으니 #41 의 GENERATED_SPEC_UNVERIFIED 대상이 아니다
+
+
 # --- 배포 대상이 아닌 레포 ---------------------------------------------------------------------------
 
 def test_missing_spec_in_unknown_repo_is_skipped_quietly() -> None:
