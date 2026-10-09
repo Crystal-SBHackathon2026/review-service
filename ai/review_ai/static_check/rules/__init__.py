@@ -18,6 +18,7 @@ CHECKS: dict[str, Check] = {
     "DB-006": database.managed_db_public,
     "DB-007": database.managed_db_without_backup,
     "DB-008": database.version_downgrade,
+    "DB-009": database.sqlite_data_left_behind,
     "SEC-001": secret.plaintext_secret,
     "SEC-002": secret.unsupported_secret_source,
     "SEC-003": secret.duplicate_secret,

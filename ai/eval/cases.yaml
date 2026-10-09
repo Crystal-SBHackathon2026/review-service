@@ -241,6 +241,16 @@ cases:
     llm: reviewer
     expect: {verdict: pass, findings: [], llm_calls: 0, rounds: 0}
 
+  - id: plan-sqlite-data-left-behind
+    sample: 02-pass-local-sqlite.yaml
+    mutate:
+      - {op: add, path: /baseline, value: {spec_ref: prev, facts: {database_has_data: true}, spec: SELF}}
+      - {op: replace, path: /database, value: {engine: postgres, placement: in-cluster, version: "16",
+                                               migration: {command: [node, src/migrate.js], change: expand}}}
+      - {op: add, path: /secrets, value: [{name: DATABASE_URL, source: k8s-secret, key: database-url}]}
+    llm: reviewer
+    expect: {verdict: needs_human, reasons_include: [IRREVERSIBLE], findings: [DB-001, DB-009], rounds: 0}
+
   # ── 엣지케이스: 명세 없음·형식 오류·값 없는 승인 (plan 4-a) ──────────────────────
   - id: e01-missing
     intake: {repo: sample-app, file: missing}

@@ -93,3 +93,13 @@ def version_downgrade(ctx: CheckContext) -> list[Hit]:
     if new[:width] >= old[:width]:
         return []
     return [Hit("/database/version", f"{after.engine} {before.version} → {after.version}")]
+
+
+def sqlite_data_left_behind(ctx: CheckContext) -> list[Hit]:
+    """DB-009 — 데이터가 있는 SQLite 에서 다른 엔진으로 바꾸는데 옮길 계획(database.data_import)이 없다."""
+    previous = ctx.previous
+    if previous is None or not ctx.has_existing_data or previous.database.engine != "sqlite":
+        return []
+    if ctx.spec.database.engine == "sqlite" or ctx.spec.database.data_import is not None:
+        return []
+    return [Hit("/database/data_import", f"sqlite(볼륨 {previous.database.volume}) → {ctx.spec.database.engine}, 이전 계획 없음")]
