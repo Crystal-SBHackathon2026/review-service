@@ -29,6 +29,8 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Requ
 from pydantic import BaseModel, ConfigDict, Field
 
 from review_ai.graph import check_edited_ops
+from review_ai.intake.repair import RepairOutput
+from review_ai.judge.llm import CachedLLM, ClaudeLLM, LlmClient, LlmUnavailable
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.recommendations import resolve_human_decision
@@ -68,6 +70,7 @@ class ApiDeps:
     default_target: str | None = None   # "aws/ap-northeast-2" — baseline 없는 레포의 명세를 만들 대상
     public_url: str | None = None       # PR 커밋 상태 링크(/intakes/{id})의 앞부분
     intake_repositories: frozenset[str] = frozenset()  # baseline 이 없어도 deploy.yaml 없음을 intake 로 볼 레포
+    repair_llm: LlmClient | None = None  # 형식 오류 명세 복구. None 이면 yaml_error·schema_error 는 REPAIR_UNAVAILABLE
 
 
 class SpecRefIn(BaseModel):
@@ -305,6 +308,19 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
     return result
 
 
+# 기본값(10분·재시도 2번)이면 처리 중인 intake 를 STALE_AFTER(2분) 뒤 sweep 이 다시 가져가 두 번 처리한다
+REPAIR_CLIENT_OPTIONS: dict[str, Any] = {"timeout": 45.0, "max_retries": 1}
+
+
+def make_repair_llm() -> LlmClient | None:
+    """형식 오류 명세 복구용 Claude. 워커 judge 와 같은 키·모델, 출력 스키마만 RepairOutput."""
+    try:
+        return CachedLLM(ClaudeLLM(output=RepairOutput, client_options=REPAIR_CLIENT_OPTIONS))
+    except LlmUnavailable as exc:
+        log.warning("명세 복구 LLM 없이 시작 — 형식 오류 명세는 REPAIR_UNAVAILABLE 로 거절한다: %s", exc)
+        return None
+
+
 @asynccontextmanager
 async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
     import os
@@ -340,6 +356,7 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
         public_url=os.environ.get("REVIEW_API_PUBLIC_URL") or None,
         intake_repositories=frozenset(r.strip() for r in os.environ.get("INTAKE_REPOSITORIES", "").split(",")
                                       if r.strip()),
+        repair_llm=make_repair_llm(),
     )
     sweep = asyncio.create_task(sweep_stale_intakes(app.state.deps))
     try:

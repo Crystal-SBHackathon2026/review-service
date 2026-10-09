@@ -6,7 +6,8 @@
   자동 검토·병합·배포로 이어지지 않게. baseline 이 있으면 그 설정을 보존하므로 확인 항목이 없다.
   새 앱은 레포 분석(analyze.analyze_repository)이 근거가 분명한 값만 context 에 채운다. 그 근거(findings)는
   생성 커밋 메시지와 UNVERIFIED 사유에 그대로 쓴다.
-- yaml_error·schema_error → 아직 고치지 않는다(REPAIR_UNAVAILABLE). LLM 복구가 붙으면 repaired 가 된다.
+- yaml_error·schema_error → repair.repair_intake 가 LLM 으로 형식만 고치고 코드 게이트로 값을 대조한다(repaired).
+  LLM 이 없을 때 prepare_intake 로 오면 REPAIR_UNAVAILABLE.
 """
 
 from __future__ import annotations
@@ -28,11 +29,11 @@ KIND_LABELS: dict[str, str] = {"missing": "deploy.yaml 없음", "empty": "deploy
 
 @dataclass(frozen=True)
 class IntakeOutcome:
-    action: Literal["generated", "rejected"]
-    reason: str                              # GENERATED · REPAIR_UNAVAILABLE · UNVERIFIED · MASKED_VALUE
+    action: Literal["generated", "repaired", "rejected"]
+    reason: str  # GENERATED · REPAIRED · REPAIR_UNAVAILABLE · REPAIR_REJECTED · UNVERIFIED · MASKED_VALUE
     message: str                             # 사람이 읽는 한 줄 — PR 상태 설명·커밋 메시지 제목
     content: str | None = None               # 커밋할 deploy.yaml 원문 (generated 일 때만)
-    details: tuple[dict[str, str], ...] = ()  # generated: 권장값 출처, UNVERIFIED: 확인 안 된 항목
+    details: tuple[dict[str, str], ...] = ()  # generated·repaired: 값 출처, 거절: 확인 안 된 항목·게이트 위반
 
 
 def prepare_intake(kind: IntakeKind, *, context: GenerationContext, baseline: Baseline | None = None,
@@ -65,7 +66,7 @@ def _with_reason(item: dict[str, str], findings: Sequence[Finding]) -> dict[str,
 
 
 def commit_message(outcome: IntakeOutcome) -> str:
-    """생성 커밋 메시지 — 제목 + 어떤 값을 어디서 가져왔는지."""
-    lines = [f"chore: {outcome.message}", ""]
+    """생성·복구 커밋 메시지 — 제목 + 어떤 값을 어디서 가져왔는지(복구면 무엇을 왜 바꿨는지)."""
+    lines = [f"{'fix' if outcome.action == 'repaired' else 'chore'}: {outcome.message}", ""]
     lines += [f"- {d['path']}: {d['source']} — {d['reason']}" for d in outcome.details]
     return "\n".join(lines).rstrip() + "\n"

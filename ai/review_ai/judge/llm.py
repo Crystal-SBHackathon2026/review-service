@@ -1,4 +1,7 @@
-"""LLM 클라이언트. judge 노드는 LlmClient 프로토콜만 알고, 실제 Claude·가짜 구현은 팩토리로 주입한다."""
+"""LLM 클라이언트. judge 노드는 LlmClient 프로토콜만 알고, 실제 Claude·가짜 구현은 팩토리로 주입한다.
+
+명세 복구(review_ai.intake.repair)도 같은 클라이언트를 쓴다 — 출력 스키마만 다르다(ClaudeLLM(output=...)).
+"""
 
 from __future__ import annotations
 
@@ -9,7 +12,8 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from review_ai.errors import TransientError
-from review_ai.judge.prompt import JudgeRequest
+from pydantic import BaseModel
+
 from review_ai.judge.schema import LlmReview
 
 DEFAULT_MODEL = os.environ.get("REVIEW_LLM_MODEL", "claude-sonnet-5-5")
@@ -42,28 +46,43 @@ class LlmResponse:
     stop_reason: str | None = None  # max_tokens 면 출력이 잘려 스키마 검증에서 떨어진다
 
 
+class LlmRequest(Protocol):
+    """시스템 프롬프트(캐시 대상)·요청마다 바뀌는 user 메시지·캐시 키. judge·복구 요청이 모두 이 모양이다."""
+
+    @property
+    def system(self) -> str: ...
+
+    @property
+    def user(self) -> str: ...
+
+    @property
+    def input_hash(self) -> str: ...
+
+
 class LlmClient(Protocol):
     model: str
 
-    async def complete(self, request: JudgeRequest) -> LlmResponse: ...
+    async def complete(self, request: LlmRequest) -> LlmResponse: ...
 
 
 class ClaudeLLM:
-    """Claude API. structured outputs 로 LlmReview 스키마를 강제하고, 시스템 프롬프트는 캐시한다."""
+    """Claude API. structured outputs 로 output 스키마(기본 LlmReview)를 강제하고, 시스템 프롬프트는 캐시한다."""
 
-    def __init__(self, client: Any = None, model: str = DEFAULT_MODEL) -> None:
+    def __init__(self, client: Any = None, model: str = DEFAULT_MODEL,
+                 output: type[BaseModel] = LlmReview, client_options: dict[str, Any] | None = None) -> None:
+        """client_options 는 키가 있을 때 만드는 AsyncAnthropic 인자(timeout·max_retries 등)."""
         import anthropic
 
         if client is None:
             if not os.environ.get("ANTHROPIC_API_KEY"):
                 raise LlmUnavailable("ANTHROPIC_API_KEY 가 없다")
-            client = anthropic.AsyncAnthropic()
+            client = anthropic.AsyncAnthropic(**(client_options or {}))
         self._anthropic = anthropic
         self._client = client
-        self._schema = anthropic.transform_schema(LlmReview.model_json_schema())
+        self._schema = anthropic.transform_schema(output.model_json_schema())
         self.model = model
 
-    async def complete(self, request: JudgeRequest) -> LlmResponse:
+    async def complete(self, request: LlmRequest) -> LlmResponse:
         a = self._anthropic
         try:
             msg = await self._client.messages.create(
@@ -106,7 +125,7 @@ class CachedLLM:
         self._inflight: dict[str, asyncio.Future[LlmResponse]] = {}
         self.model = inner.model
 
-    async def complete(self, request: JudgeRequest) -> LlmResponse:
+    async def complete(self, request: LlmRequest) -> LlmResponse:
         key = request.input_hash
         if key in self._done:
             self._done.move_to_end(key)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -9,8 +10,11 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from review_ai.errors import TransientError
+from review_ai.judge.fake_llm import ScriptedLLM
+from review_ai.secrets_pattern import MASK
 from review_ai.spec.deploy_spec import AppSpec
-from review_api.app import ApiDeps, create_app
+from review_api.app import ApiDeps, create_app, make_repair_llm
 from review_api.intake import STALE_AFTER, STATUS_CONTEXT, resume_stale_intakes
 from review_common.github import GitHubError, RefConflict
 from tests.test_api import HEAD, REPO, SECRET, FakePublisher, FakeSpecs, pr_event, sample_text, send_pr
@@ -64,7 +68,7 @@ class FakeGitHub:
 
 class IntakeEnv:
     def __init__(self, *, default_target: str | None = "aws/ap-northeast-2",
-                 intake_repositories: frozenset[str] = frozenset({REPO})) -> None:
+                 intake_repositories: frozenset[str] = frozenset({REPO}), repair_llm: Any = None) -> None:
         from review_common.repository import InMemoryReviewRepository
 
         self.repo = InMemoryReviewRepository()
@@ -74,10 +78,12 @@ class IntakeEnv:
         self.client = TestClient(create_app(ApiDeps(
             repo=self.repo, specs=self.specs, publisher=self.publisher, github_webhook_secret=SECRET,
             github=self.github, default_target=default_target, public_url="https://review.example/",
-            intake_repositories=intake_repositories)))
+            intake_repositories=intake_repositories, repair_llm=repair_llm)))
 
     def put(self, text: str, sha: str = HEAD) -> None:
         self.specs.files[(REPO, "deploy.yaml", sha)] = text
+        if sha == HEAD:
+            self.github.tree["deploy.yaml"] = text  # 복구가 PR head 원문을 읽는다
 
     async def approve_baseline(self) -> dict[str, Any]:
         spec = yaml.safe_load(sample_text())
@@ -239,6 +245,80 @@ async def test_schema_error_keeps_validation_locations(ienv: IntakeEnv) -> None:
     assert (row["kind"], row["reason"]) == ("schema_error", "REPAIR_UNAVAILABLE")
     assert ["runtime", "replica"] in [e["loc"] for e in row["errors"]]
     assert all("input" not in e for e in row["errors"])
+
+
+# --- 형식 오류 → LLM 복구 커밋 -----------------------------------------------------------------------
+
+BROKEN = sample_text().replace("  port: 8080", "  port: [8080").replace(
+    "DEPLOY_REGION: ap-northeast-2}", "DEPLOY_REGION: ap-northeast-2, DB_PASSWORD: hunter2}")
+
+
+def repairing_llm(change: dict[str, Any] | None = None) -> ScriptedLLM:
+    """형식만 고친 sample 명세(비밀은 가린 채)를 돌려준다. change 가 있으면 runtime 값을 바꿔 쓴다."""
+
+    def produce(request: Any) -> dict[str, Any]:
+        assert "hunter2" not in request.user  # 프롬프트에 평문 비밀이 없다
+        spec = yaml.safe_load(sample_text())
+        spec["runtime"]["env"]["DB_PASSWORD"] = MASK
+        spec["runtime"].update(change or {})
+        return {"spec_json": json.dumps(spec), "changes": [{"path": "/runtime/port", "why": "닫히지 않은 괄호"}]}
+
+    return ScriptedLLM(produce)
+
+
+async def test_yaml_error_is_repaired_and_committed() -> None:
+    env = IntakeEnv(repair_llm=repairing_llm())
+    await env.approve_baseline()
+    env.put(BROKEN)
+    send_pr(env, pr_event("opened"))
+
+    row = env.only_intake()
+    commit = row["result_commit_sha"]
+    assert (row["kind"], row["status"], row["reason"], env.github.branch) == ("yaml_error", "repaired", "REPAIRED",
+                                                                               commit)
+    repaired = AppSpec.model_validate(yaml.safe_load(env.github.contents[commit]))
+    assert repaired.runtime.port == 8080 and repaired.runtime.env["DB_PASSWORD"] == "hunter2"
+    assert env.github.last_message.startswith("fix: deploy.yaml YAML 문법 오류")
+    assert "- /runtime/port: 원문 — 닫히지 않은 괄호" in env.github.last_message
+    assert env.states() == [(HEAD, "pending"), (HEAD, "success")]
+    assert "hunter2" not in env.client.get(f"/intakes/{row['intake_id']}").text
+
+
+async def test_repair_that_changes_values_is_rejected() -> None:
+    env = IntakeEnv(repair_llm=repairing_llm({"replicas": 5}))
+    env.put(BROKEN)
+    send_pr(env, pr_event("opened"))
+
+    row = env.only_intake()
+    assert (row["status"], row["reason"], row["result_commit_sha"]) == ("rejected", "REPAIR_REJECTED", None)
+    conflict = {"code": "VALUE_CONFLICT", "path": "/runtime/replicas", "message": "원문에 있던 값과 다르다"}
+    assert conflict in row["details"]
+    assert env.github.parents == {} and env.states() == [(HEAD, "pending"), (HEAD, "failure")]
+
+
+async def test_transient_llm_error_fails_with_retry_hint() -> None:
+    class FlakyLLM:
+        model = "fake-flaky"
+
+        async def complete(self, request: Any) -> Any:
+            raise TransientError("Claude API 529")
+
+    env = IntakeEnv(repair_llm=FlakyLLM())
+    env.put(BROKEN)
+    send_pr(env, pr_event("opened"))
+
+    row = env.only_intake()
+    assert (row["status"], row["reason"]) == ("failed", "ERROR") and "다시 처리한다" in row["message"]
+    assert env.states() == [(HEAD, "pending"), (HEAD, "error")]
+
+
+def test_repair_llm_finishes_before_stale_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    client = make_repair_llm()._inner._client  # type: ignore[union-attr]
+
+    assert client.timeout * (client.max_retries + 1) < STALE_AFTER.total_seconds()
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    assert make_repair_llm() is None
 
 
 async def test_fork_pr_is_not_committed(ienv: IntakeEnv) -> None:

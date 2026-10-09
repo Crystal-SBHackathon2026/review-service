@@ -11,7 +11,10 @@
         - 앱·대상: 그 레포의 가장 최근 baseline, 없으면 DEFAULT_TARGET(예 aws/ap-northeast-2). 둘 다 없으면 NO_TARGET
         - baseline 이 없는 새 앱은 PR head 의 Dockerfile·의존성·CI·소스를 읽어 확인된 값만 채운다
           (review_ai.intake.analyze). 하나라도 애매하면 UNVERIFIED 로 커밋하지 않는다
-        - review_ai.intake.prepare_intake 가 생성하면 PR 브랜치에 커밋 → synchronize 웹훅이 그 SHA 를 일반 검토로
+        - missing·empty: review_ai.intake.prepare_intake 가 생성. yaml_error·schema_error: PR head 의 원문을 읽어
+          review_ai.intake.repair.repair_intake 가 LLM 으로 형식만 고친다(값은 코드 게이트가 원문과 대조).
+          LLM 이 없으면(repair_llm None) REPAIR_UNAVAILABLE
+        - 생성·복구하면 PR 브랜치에 커밋 → synchronize 웹훅이 그 SHA 를 일반 검토로
           시작한다 (autofix_commit 아님). 커밋 SHA 는 브랜치를 옮기기 전에 행에 남긴다 — 웹훅이 먼저 와도 연결된다
     PR 표시: 커밋 상태 review-service/intake. 토큰에 권한이 없으면 로그만 남기고 기록은 그대로 둔다.
     파드가 처리 중에 죽으면 processing 행이 남는다 → resume_stale_intakes 가 STALE_AFTER 뒤에 다시 처리한다.
@@ -29,7 +32,9 @@ import yaml
 from pydantic import ValidationError
 
 from review_ai.intake import KIND_LABELS, commit_message, prepare_intake
+from review_ai.errors import TransientError
 from review_ai.intake.analyze import Finding, analyze_repository, files_to_read
+from review_ai.intake.repair import repair_intake
 from review_ai.preparation import GenerationContext
 from review_ai.spec.deploy_spec import Baseline, DeploySpec, Target
 from review_common.github import GitHubError, RefConflict
@@ -42,8 +47,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 STATUS_CONTEXT = "review-service/intake"
-STALE_AFTER = timedelta(minutes=2)
+STALE_AFTER = timedelta(minutes=2)  # LLM 복구(최대 수십 초)보다 넉넉하게
 SWEEP_EVERY_SECONDS = 60.0
+REPAIRABLE = ("yaml_error", "schema_error")
 READ_CONCURRENCY = 8  # 레포 분석 파일 읽기 — GitHub 은 동시 요청이 많으면 secondary rate limit 을 건다
 
 
@@ -158,11 +164,18 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
         return _done("rejected", "FORK_PR", "포크 PR 브랜치에는 커밋할 수 없다 — deploy.yaml 을 직접 추가해라")
     if deps.github is None:
         return _done("rejected", "COMMIT_UNAVAILABLE", "GitHub 쓰기 클라이언트가 없어 생성 커밋을 올릴 수 없다")
+    if row["kind"] in REPAIRABLE and deps.repair_llm is None:
+        return _done("rejected", "REPAIR_UNAVAILABLE",
+                     f"{KIND_LABELS[row['kind']]} — 자동 복구(LLM)가 설정되지 않았다. 오류를 고쳐 다시 올려라")
     found = await _context(deps, deps.github, repository, head_sha)
     if found is None:
         return _done("rejected", "NO_TARGET", "배포 대상 환경을 모른다 — 이전 배포(baseline)도 DEFAULT_TARGET 도 없다")
     context, baseline, findings = found
-    outcome = prepare_intake(row["kind"], context=context, baseline=baseline, findings=findings)
+    if row["kind"] in REPAIRABLE:
+        raw = await deps.github.get_file(repository, row["path"], head_sha)
+        outcome = await repair_intake(row["kind"], raw, context=context, baseline=baseline, llm=deps.repair_llm)
+    else:
+        outcome = prepare_intake(row["kind"], context=context, baseline=baseline, findings=findings)
     if outcome.action == "rejected":
         return _done("rejected", outcome.reason, outcome.message, outcome.details)
     # 다시 처리하는 행이면 이미 만든 커밋을 쓴다 — 같은 커밋으로 ref 를 옮기는 건 몇 번 해도 같다
@@ -175,7 +188,7 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any]:
         # GitHub 은 브랜치 보호로 막혀도 422 를 준다 — 둘 다 이 커밋에서는 더 할 게 없다
         return _done("rejected", "BRANCH_MOVED",
                      "PR 브랜치를 옮기지 못했다(그사이 새 커밋 또는 브랜치 보호) — 새 커밋이 오면 다시 판단한다")
-    return _done("generated", outcome.reason, outcome.message, outcome.details, result_commit_sha=commit)
+    return _done(outcome.action, outcome.reason, outcome.message, outcome.details, result_commit_sha=commit)
 
 
 async def process_intake(deps: ApiDeps, intake_id: str) -> None:
@@ -187,7 +200,7 @@ async def process_intake(deps: ApiDeps, intake_id: str) -> None:
         fields = await _decide(deps, row)
     except Exception as exc:  # 행을 processing 으로 두지 않는다 — 원인은 로그에
         log.exception("intake %s: 처리 실패", intake_id)
-        transient = isinstance(exc, GitHubError) and exc.transient
+        transient = isinstance(exc, TransientError) or isinstance(exc, GitHubError) and exc.transient
         fields = _done("failed", "ERROR", f"{KIND_LABELS[row['kind']]} — 처리 중 오류({type(exc).__name__})"
                        + (". 새 커밋을 올리면 다시 처리한다" if transient else ""))
     if await deps.repo.finish_intake(intake_id, **fields):
