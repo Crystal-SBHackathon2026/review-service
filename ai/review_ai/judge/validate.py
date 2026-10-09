@@ -9,7 +9,7 @@
    - persistent 볼륨을 없애거나 비영속으로 바꾸거나 줄이지 않는다
    - DB 를 없애거나(engine none) 외부 DB 로 돌리지 않고, 버킷을 지우지 않으며, 보호 설정을 약하게 바꾸지 않는다
      (허용 필드를 넓혀도 "지워서 고친" 패치가 통과하지 않게 따로 둔다)
-   - 비밀처럼 보이는 env 를 새로 넣지 않는다
+   - 비밀처럼 보이는 env 를 새로 넣지 않는다. env 는 SEC-004 대상 항목을 지우는 것 말고는 바꾸지 않는다
    - 적용한 명세를 다시 검사하면 대상 finding 이 사라지고 새 finding 이 생기지 않는다
 4. 자유 텍스트(why·extra_opinions)는 비밀처럼 보이는 부분을 가린다
 """
@@ -132,6 +132,14 @@ def _adds_secret_env(before: DeploySpec, after: DeploySpec) -> bool:
     return any(looks_secret(k, v) and old.get(k) != v for k, v in after.runtime.env.items())
 
 
+def _env_only_drops_shadowed(before: DeploySpec, after: DeploySpec, targets: Sequence[Finding]) -> bool:
+    """env 는 SEC-004 대상 항목을 지우는 것만 허용한다 — '/runtime/env/*' 허용 필드로 다른 env 값을 바꾸지 못하게."""
+    shadowed = {f["location"]["spec_path"].rsplit("/", 1)[1] for f in targets if f["rule_id"] == "SEC-004"}
+    old, new = before.runtime.env, after.runtime.env
+    changed = {k for k in old.keys() | new.keys() if old.get(k) != new.get(k)}
+    return all(k in shadowed and k not in new for k in changed)
+
+
 def _resolves_without_new(before_findings: Sequence[Finding], after: DeploySpec, targets: set[str]) -> bool:
     after_ids = {f["finding_id"] for f in run_static_check(after)}
     before_ids = {f["finding_id"] for f in before_findings}
@@ -168,6 +176,7 @@ def build_patch(llm_patch: LlmPatch, findings: Sequence[Finding], spec: dict[str
         _keeps_database(before, after),
         _keeps_buckets(before, after),
         not _adds_secret_env(before, after),
+        _env_only_drops_shadowed(before, after, [by_id[fid] for fid in targets]),
         _resolves_without_new(findings, after, targets),
     )
     if not all(guards):

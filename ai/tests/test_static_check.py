@@ -136,6 +136,47 @@ def test_db005_sqlite_needs_persistent_volume(volumes: list[dict[str, Any]]) -> 
     assert "DB-005" in rule_ids(spec)
 
 
+@pytest.mark.parametrize(
+    ("persistence", "db", "volumes", "hit"),
+    [
+        (True, {}, [], True),
+        (True, {}, [{"name": "tmp", "mount_path": "/tmp/x", "size": "1Gi", "persistent": False}], True),
+        (True, {}, [{"name": "data", "mount_path": "/data", "size": "1Gi"}], False),
+        (True, {"engine": "postgres", "version": "16", "placement": "managed"}, [], False),
+        (True, {}, "bucket", False),
+        (False, {}, [], False),
+    ],
+    ids=["nothing", "ephemeral-only", "persistent-volume", "database", "bucket", "not-required"],
+)
+def test_db004_persistence_needs_a_store(
+    sample_app: dict[str, Any], persistence: bool, db: dict[str, Any], volumes: Any, hit: bool
+) -> None:
+    storage = {"buckets": [{"name": "app-uploads"}]} if volumes == "bucket" else {"volumes": volumes}
+    spec = {**sample_app, "requirements": {"persistence": persistence}, "database": db, "secrets": DB_SECRET,
+            "storage": storage, "target": {"env": "local", "region": "r"}}
+    found = findings_of(spec, "DB-004")
+    assert bool(found) is hit
+    if hit:
+        assert (found[0]["autofix"], found[0]["location"]["spec_path"]) == ("forbidden", "/requirements/persistence")
+
+
+@pytest.mark.parametrize(
+    ("env", "db", "hit"),
+    [
+        ("aws", {**PG, "publicly_accessible": True}, True),
+        ("aws", PG, False),
+        ("gcp", {**PG, "placement": "in-cluster", "publicly_accessible": True}, False),  # 관리형만 공인 주소를 받는다
+        ("local", {**PG, "publicly_accessible": True}, False),  # aws·gcp 규칙
+    ],
+)
+def test_db006_public_managed_db(sample_app: dict[str, Any], env: str, db: dict[str, Any], hit: bool) -> None:
+    spec = {**sample_app, "database": db, "secrets": DB_SECRET, "target": {"env": env, "region": "r"}}
+    found = findings_of(spec, "DB-006")
+    assert bool(found) is hit
+    if hit:
+        assert (found[0]["autofix"], found[0]["location"]["spec_path"]) == ("allowed", "/database/publicly_accessible")
+
+
 # ── secret ───────────────────────────────────────────────────────
 
 
@@ -163,6 +204,16 @@ def test_sec005_db_without_connection_secret(sample_app: dict[str, Any]) -> None
     spec = {**sample_app, "database": PG}
     assert "SEC-005" in rule_ids(spec)
     assert "SEC-005" not in rule_ids({**spec, "secrets": DB_SECRET})
+
+
+def test_sec004_env_shadowed_by_secret_hides_value(sample_app: dict[str, Any]) -> None:
+    sample_app["runtime"]["env"]["UPSTREAM_URL"] = "https://old.example.com"
+    sample_app["secrets"] = [{"name": "UPSTREAM_URL", "source": "k8s-secret", "key": "upstream"}]
+    [f] = findings_of(sample_app, "SEC-004")
+    assert (f["autofix"], f["location"]["spec_path"]) == ("allowed", "/runtime/env/UPSTREAM_URL")
+    assert "old.example.com" not in f["evidence"]
+    sample_app["runtime"]["env"].pop("UPSTREAM_URL")
+    assert "SEC-004" not in rule_ids(sample_app)
 
 
 # ── network · storage · runtime ─────────────────────────────────
@@ -236,6 +287,74 @@ def test_run001_missing_readiness(sample_app: dict[str, Any]) -> None:
 def test_run004_multi_arch_image_is_fine(sample_app: dict[str, Any]) -> None:
     sample_app["image"]["platforms"] = ["arm64", "amd64"]
     assert "RUN-004" not in rule_ids(sample_app)
+
+
+def _local(spec: dict[str, Any], **changes: Any) -> dict[str, Any]:
+    return {**spec, "target": {"env": "local", "region": "r"}, **changes}
+
+
+UPLOADS = {"name": "uploads", "mount_path": "/uploads", "size": "1Gi"}
+
+
+@pytest.mark.parametrize(
+    ("volume", "replicas", "hit"),
+    [
+        ({}, 2, True),
+        ({}, 1, False),
+        ({"persistent": False}, 2, False),
+        ({"access_mode": "ReadWriteMany"}, 2, False),
+    ],
+    ids=["rwo-replicated", "single", "ephemeral", "rwx"],
+)
+def test_sto002_rwo_volume_shared_by_replicas(sample_app: dict[str, Any], volume: dict, replicas: int, hit: bool) -> None:
+    sample_app["runtime"]["replicas"] = replicas
+    spec = _local(sample_app, storage={"volumes": [{**UPLOADS, **volume}]})
+    found = findings_of(spec, "STO-002")
+    assert bool(found) is hit
+    if hit:
+        assert (found[0]["autofix"], found[0]["location"]["spec_path"]) == ("allowed", "/storage/volumes/0")
+
+
+def test_sto002_leaves_sqlite_volume_to_db003() -> None:
+    spec = load_sample_dict("02-pass-local-sqlite.yaml")
+    spec["runtime"]["replicas"] = 2
+    assert rule_ids(spec) == ["DB-003"]
+
+
+def test_sto006_removed_persistent_volume_points_into_baseline(sample_app: dict[str, Any]) -> None:
+    scratch = {**UPLOADS, "name": "scratch", "persistent": False}
+    prev = _local(sample_app, storage={"volumes": [UPLOADS, scratch]})
+    spec = _local(sample_app, baseline={"spec_ref": "prev", "spec": prev})
+    [f] = findings_of(spec, "STO-006")  # 비영속 볼륨을 뺀 것은 문제가 아니다
+    assert (f["autofix"], f["irreversible"]) == ("forbidden", True)
+    assert f["location"]["spec_path"] == "/baseline/spec/storage/volumes/0"
+    assert "STO-006" not in rule_ids({**spec, "storage": {"volumes": [UPLOADS]}})
+
+
+def test_sto006_turning_persistent_off_is_the_same_as_removing(sample_app: dict[str, Any]) -> None:
+    """이름이 남아도 persistent 를 끄면 PVC 대신 emptyDir 이 붙는다 — STO-005 는 크기만 본다."""
+    prev = _local(sample_app, storage={"volumes": [UPLOADS]})
+    spec = _local(sample_app, storage={"volumes": [{**UPLOADS, "persistent": False}]},
+                  baseline={"spec_ref": "prev", "spec": prev})
+    [f] = findings_of(spec, "STO-006")
+    assert (f["location"]["spec_path"], f["evidence"]) == ("/baseline/spec/storage/volumes/0",
+                                                          "uploads (1Gi) persistent: false 로 바뀜")
+
+
+def test_run002_missing_liveness_is_low(sample_app: dict[str, Any]) -> None:
+    sample_app["runtime"]["health"] = {"readiness": "/healthz"}
+    [f] = findings_of(sample_app, "RUN-002")
+    assert (f["severity"], f["autofix"]) == ("low", "forbidden")
+
+
+@pytest.mark.parametrize(
+    ("resources", "evidence"),
+    [({"cpu_limit": "250m"}, "memory_limit 없음"), ({}, "cpu_limit · memory_limit 없음")],
+)
+def test_run005_missing_resource_limits(sample_app: dict[str, Any], resources: dict, evidence: str) -> None:
+    sample_app["runtime"]["resources"] = resources
+    [f] = findings_of(sample_app, "RUN-005")
+    assert (f["severity"], f["autofix"], f["evidence"]) == ("low", "allowed", evidence)
 
 
 # ── 노드 ─────────────────────────────────────────────────────────

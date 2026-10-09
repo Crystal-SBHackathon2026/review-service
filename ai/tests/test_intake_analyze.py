@@ -10,7 +10,7 @@ import yaml
 from review_ai.intake import prepare_intake
 from review_ai.intake.analyze import MAX_SOURCE_FILES, RepoAnalysis, analyze_repository, files_to_read
 from review_ai.preparation import GenerationContext
-from review_ai.spec.deploy_spec import AppSpec, Database, Health, Image, Requirements, Runtime, Storage
+from review_ai.spec.deploy_spec import BASE_RESOURCES, AppSpec, Database, Health, Image, Requirements, Runtime, Storage
 
 REPO = "Crystal-SBHackathon2026/sample-app"
 BASE = GenerationContext(repository=REPO, target={"env": "aws", "region": "ap-northeast-2"})
@@ -73,7 +73,7 @@ def test_sample_app_is_fully_resolved_and_committable() -> None:
     assert analysis.unresolved == {}
     ctx = analysis.context
     assert ctx.image == Image(repository="ghcr.io/crystal-sbhackathon2026/sample-app", platforms=("amd64",))
-    assert ctx.runtime == Runtime(port=8080, health=Health(readiness="/healthz", liveness="/healthz"))
+    assert ctx.runtime == Runtime(port=8080, health=Health(readiness="/healthz", liveness="/healthz"), resources=BASE_RESOURCES)
     assert (ctx.database, ctx.storage, ctx.secrets, ctx.requirements) == (
         Database(), Storage(), (), Requirements(persistence=False))  # devDependencies 의 pg 는 실행에 없다
     assert "APP_VERSION, DEPLOY_ENV, FAIL_RATE, HEALTH_FAIL, NODE_ENV, PORT" in reason(analysis, "/secrets")
@@ -106,13 +106,13 @@ def test_unresolved_reasons_reach_unverified_details() -> None:
 # --- runtime --------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize(("dockerfile", "expected"), [
-    ("FROM node AS build\nEXPOSE 3000\nFROM node\nEXPOSE 8080/tcp 9229/udp\n", Runtime(port=8080)),
-    ("FROM x\nEXPOSE 8080\nHEALTHCHECK CMD curl -f http://localhost/ || exit 1\n", Runtime(port=8080)),
+    ("FROM node AS build\nEXPOSE 3000\nFROM node\nEXPOSE 8080/tcp 9229/udp\n", Runtime(port=8080, resources=BASE_RESOURCES)),
+    ("FROM x\nEXPOSE 8080\nHEALTHCHECK CMD curl -f http://localhost/ || exit 1\n", Runtime(port=8080, resources=BASE_RESOURCES)),
     ("FROM x\nEXPOSE 80\nHEALTHCHECK CMD curl -f http://localhost/ || exit 1\n",
-     Runtime(port=80, health=Health(readiness="/", liveness="/"))),
+     Runtime(port=80, health=Health(readiness="/", liveness="/"), resources=BASE_RESOURCES)),
     ("FROM x\n# EXPOSE 1\nEXPOSE \\\n  5000\nHEALTHCHECK --interval=5s \\\n  CMD wget -q http://[::1]:5000/ready?x=1\n",
-     Runtime(port=5000, health=Health(readiness="/ready", liveness="/ready"))),
-    ("FROM x\nEXPOSE 8080\nHEALTHCHECK NONE\n", Runtime(port=8080)),
+     Runtime(port=5000, health=Health(readiness="/ready", liveness="/ready"), resources=BASE_RESOURCES)),
+    ("FROM x\nEXPOSE 8080\nHEALTHCHECK NONE\n", Runtime(port=8080, resources=BASE_RESOURCES)),
 ])
 def test_runtime_from_final_stage(dockerfile: str, expected: Runtime) -> None:
     assert analyze(sample_files(Dockerfile=dockerfile)).context.runtime == expected

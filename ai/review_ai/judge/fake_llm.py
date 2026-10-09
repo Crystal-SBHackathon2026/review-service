@@ -13,10 +13,13 @@ from typing import Any
 from review_ai.catalog import load_targets
 from review_ai.judge.llm import LlmResponse, LlmUnavailable
 from review_ai.judge.prompt import JudgeRequest
+from review_ai.spec.deploy_spec import BASE_RESOURCES
 from review_ai.state import Finding
 
 FAKE_MODEL = "fake-oracle"
-FIX_KIND = {"SEC-001": "env", "RUN-001": "code", "RUN-004": "code", "DB-001": "none", "STO-005": "none", "STO-001": "none"}
+FIX_KIND = {"SEC-001": "env", "RUN-001": "code", "RUN-002": "code", "RUN-004": "code", "DB-004": "code",
+            "DB-001": "none", "STO-005": "none", "STO-006": "none", "STO-001": "none"}
+BASE_LIMITS = {"cpu_limit": BASE_RESOURCES.cpu_limit, "memory_limit": BASE_RESOURCES.memory_limit}
 
 
 def _op(op: str, path: str, value: Any = None) -> dict[str, Any]:
@@ -51,8 +54,17 @@ def _db005_ops(spec: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _ops_for(finding: Finding, spec: dict[str, Any], env: str) -> list[dict[str, Any]]:
     rule, path = finding["rule_id"], finding["location"]["spec_path"]
-    if rule == "DB-003":
+    if rule in {"DB-003", "STO-002"}:
         return [_op("replace", "/runtime/replicas", 1)]
+    if rule == "DB-006":
+        return [_op("replace", path, False)]
+    if rule == "SEC-004":
+        return [_op("remove", path)]
+    if rule == "RUN-005":
+        resources = spec["runtime"].get("resources")
+        if resources is None:
+            return [_op("add", "/runtime/resources", BASE_LIMITS)]
+        return [_op("add", f"/runtime/resources/{k}", v) for k, v in BASE_LIMITS.items() if not resources.get(k)]
     if rule == "DB-002":
         return _db002_ops(spec, env)
     if rule == "DB-005":

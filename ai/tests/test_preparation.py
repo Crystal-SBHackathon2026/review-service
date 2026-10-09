@@ -132,7 +132,7 @@ async def test_missing_readiness_returns_rag_explanation_and_candidate(sample_ap
 
     assert result.prepared.spec.runtime.port == 8080
     assert result.review["status"] == "needs_human"
-    assert [f["rule_id"] for f in result.review["findings"]] == ["RUN-001"]
+    assert [f["rule_id"] for f in result.review["findings"]] == ["RUN-001", "RUN-002"]  # probe 경로는 추측하지 않는다
     assert result.review["retrieved_docs"]
     assert result.review["decision"]["items"][0]["why"]
     assert not result.ready_to_commit

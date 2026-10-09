@@ -45,7 +45,7 @@ pip install "./ai[qdrant]"        # 이미지 빌드 — catalog/·knowledge/ �
 
 LLM 이 낸 패치는 아래를 모두 통과해야 `fix` 가 된다. 하나라도 어기면 패치를 버리고 `needs_human`(PATCH_OUT_OF_SCOPE)이다.
 
-1. 대상은 autofix allowed finding 만. 적용 전후 명세에서 **실제로 바뀐 말단 필드**가 전부 대상 규칙의 허용 필드(`judge/prompt.py` `RULE_PATCH_PATHS`, `*` = 리스트 인덱스) 아래여야 한다 — 객체를 통째로 replace 해도 다른 필드가 바뀌면 버린다. env·이미지·시크릿·네트워크·baseline 은 어떤 규칙으로도 못 바꾼다
+1. 대상은 autofix allowed finding 만. 적용 전후 명세에서 **실제로 바뀐 말단 필드**가 전부 대상 규칙의 허용 필드(`judge/prompt.py` `RULE_PATCH_PATHS`, `*` = 리스트 인덱스나 env 이름) 아래여야 한다 — 객체를 통째로 replace 해도 다른 필드가 바뀌면 버린다. 이미지·시크릿·네트워크·baseline 은 어떤 규칙으로도 못 바꾸고, env 는 SEC-004 대상 항목을 지우는 것만 된다(값을 바꾸거나 다른 env 를 건드리면 버린다)
 2. op 경로도 허용 필드와 겹쳐야 하고, op 값에 `***MASKED***` 가 없어야 한다 — State 명세는 가린 사본이라, 가린 값을 다시 쓰는 op 는 여기선 변화가 없어도 원본에 적용하면 실제 값을 덮는다
 3. 실제 명세에 적용되고 DeploySpec 형식을 통과한다 (allowed_cidrs 는 CIDR 형식 검사)
 4. DB 엔진·배치 변경은 데이터가 없고, `engine_policy: allow_convert` 이거나 대상이 DB-002 일 때만
@@ -110,7 +110,7 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
 ## 근거 문서 (knowledge/)
 
 S3 `review-docs` 버킷과 같은 구조다: `rules/{any,aws,gcp,local}/<ruleId>.md`, `incidents/K-*.md`(oneaction 리허설 카드 13장), `guides/*.md`, `warnings/<code>.md`(렌더러 경고 7개).
-문서의 `## ` 섹션 하나가 청크다. P0 규칙 12개(구현한 규칙 전부) 문서가 있고, 환경별 청크 수는 테스트로 30개 이상을 유지한다.
+문서의 `## ` 섹션 하나가 청크다. 구현한 규칙 19개(P0 12 + P1 7) 전부 문서가 있고, 환경별 청크 수는 테스트로 30개 이상을 유지한다.
 
 - 규칙 문서는 ruleId 정확 매칭(점수 1.0)으로 찾고, 사례·가이드는 의미 검색(dense cosine, 0.5 미만 버림)으로 보탠다.
 - 정확 매칭은 ruleId 당 최대 8청크이고 **규칙 문서를 먼저** 채운 뒤 related_rules 사례·가이드를 붙인다(`retrieval.exact_first`). 경로 순으로 자르면 사례가 많은 DB-003 은 규칙 문서가 통째로 빠졌다.
@@ -159,7 +159,7 @@ S3·Qdrant 가 아니라 업무 DB 인 이유: 근거 문서(FileRetriever)는 �
 
 ## 평가셋 (eval/cases.yaml)
 
-샘플 10개 + 제안서의 환각 케이스 12개 + 엣지케이스 10개(e01~e09). `reviewer` 자리에는 평가 대상 LLM 이, 나머지 자리에는 일부러 틀리는 가짜 LLM 이 들어가 코드 게이트가 잡는지 본다.
+샘플 10개 + 제안서의 환각 케이스 12개 + P1 규칙 8개(p1-*) + 엣지케이스 10개(e01~e09). `reviewer` 자리에는 평가 대상 LLM 이, 나머지 자리에는 일부러 틀리는 가짜 LLM 이 들어가 코드 게이트가 잡는지 본다.
 
 엣지케이스는 명세가 아니라 PR 상태에서 시작한다. 실행기(`evaluation.py`)가 Review API 와 같은 순서를 밟는다 — 원문 분류(`load_spec` 과 같은 기준) → 레포 분석(`eval/repos/sample-app.yaml`) → 생성(`prepare_intake`) 또는 LLM 복구(`repair_intake`) → 검토. 사람 응답 케이스는 승인 API 와 같은 검사(`resolve_human_decision` → `check_edited_ops`)를 거쳐 재개한다.
 
@@ -172,6 +172,9 @@ S3·Qdrant 가 아니라 업무 DB 인 이유: 근거 문서(FileRetriever)는 �
 | e07 | 없는 경로(`/database/enigne`) 승인 | 승인 거절(API 422), 상태 그대로 |
 | e08·e08b | 복구 LLM 이 env 를 지어내거나 포트를 바꿈 | 복구 게이트가 버림(INVENTED_VALUE·VALUE_CONFLICT), 검토 안 함 |
 | e09 | 깨진 YAML 안 평문 토큰 | 복구·judge 프롬프트에 토큰 없음, 커밋본엔 원문 값 복원, SEC-001 needs_human |
+| p1-db006·sec004·sto002·run005 | 관리형 DB 공개·env/secrets 중복·RWO 볼륨 + replicas 2·상한 없음 | 자동 수정 게이트 통과 → pass (SEC-004 는 겹친 env 삭제만) |
+| p1-sto006 | baseline 의 persistent 볼륨을 뺌 | needs_human(IRREVERSIBLE), 값 없이 승인하면 baseline 볼륨 복원 → pass |
+| p1-db004·low-only | 영속성 선언에 저장소 없음 · liveness·상한만 없음 | needs_human(AUTOFIX_FORBIDDEN) · LLM 없이 pass |
 
 복구 자리(`intake.repair`)는 `--llm fake` 면 정답(고치기 전 샘플)을 내는 가짜(`intake/fake_repair.py`), `--llm claude` 면 실제 Claude 다. 거절된 intake 의 verdict 는 `intake_rejected`(`/verify` 의 `intake_{status}` 와 같은 뜻).
 

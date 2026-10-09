@@ -33,3 +33,35 @@ def volume_shrink(ctx: CheckContext) -> list[Hit]:
         if prev is not None and size_mi(vol.size) < size_mi(prev.size):
             hits.append(Hit(f"/storage/volumes/{i}/size", f"{vol.name}: {prev.size} → {vol.size}"))
     return hits
+
+
+def rwo_volume_replicated(ctx: CheckContext) -> list[Hit]:
+    """STO-002 — DB 용이 아닌 persistent RWO 볼륨을 여러 replica 가 쓴다 (SQLite 볼륨은 DB-003 이 맡는다)."""
+    replicas = ctx.spec.runtime.replicas
+    if replicas <= 1:
+        return []
+    db = ctx.spec.database
+    db_volume = db.volume if db.engine == "sqlite" else None
+    return [
+        Hit(f"/storage/volumes/{i}", f"{v.name}: ReadWriteOnce + replicas {replicas}")
+        for i, v in enumerate(ctx.spec.storage.volumes)
+        if v.persistent and v.access_mode == "ReadWriteOnce" and v.name != db_volume
+    ]
+
+
+def persistent_volume_removed(ctx: CheckContext) -> list[Hit]:
+    """STO-006 — 이전 배포의 persistent 볼륨이 지금 명세에 없거나 persistent 가 꺼졌다. 둘 다 PVC 가 렌더되지 않아 데이터가 사라진다.
+
+    지운 볼륨은 지금 명세에 자리가 없으므로 위치는 둘 다 baseline 안의 이전 볼륨을 가리킨다.
+    """
+    if ctx.previous is None:
+        return []
+    current = {v.name: v for v in ctx.spec.storage.volumes}
+    hits = []
+    for i, prev in enumerate(ctx.previous.storage.volumes):
+        now = current.get(prev.name)
+        if not prev.persistent or (now is not None and now.persistent):
+            continue
+        change = "제거" if now is None else "persistent: false 로 바뀜"
+        hits.append(Hit(f"/baseline/spec/storage/volumes/{i}", f"{prev.name} ({prev.size}) {change}"))
+    return hits

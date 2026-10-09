@@ -83,6 +83,11 @@ class Resources(_Frozen):
     memory_limit: str | None = Field(default=None, pattern=SIZE_QUANTITY)
 
 
+# gitops base rollout.yaml 과 같은 값. overlay 는 컨테이너를 통째로 바꾸므로 상한을 비워 두면 상한 없이 배포된다(RUN-005).
+# 생성한 명세와 RUN-005 권장값이 이 값을 쓴다
+BASE_RESOURCES = Resources(cpu_limit="250m", memory_limit="128Mi")
+
+
 class Runtime(_Frozen):
     port: int = Field(ge=1, le=65535)
     replicas: int = Field(default=1, ge=1, le=10)

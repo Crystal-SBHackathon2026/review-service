@@ -41,3 +41,21 @@ def sqlite_without_persistent_volume(ctx: CheckContext) -> list[Hit]:
         return []
     state = "없음" if volume is None else "persistent: false"
     return [Hit("/database/volume", f"database.volume={db.volume!r} ({state})")]
+
+
+def persistence_without_storage(ctx: CheckContext) -> list[Hit]:
+    """DB-004 — 재배포 뒤에도 데이터가 남아야 하는데 DB·persistent 볼륨·버킷 어디에도 둘 곳이 없다."""
+    spec = ctx.spec
+    if not spec.requirements.persistence or spec.database.engine != "none":
+        return []
+    if spec.storage.buckets or any(v.persistent for v in spec.storage.volumes):
+        return []
+    return [Hit("/requirements/persistence", "persistence: true · database.engine none · persistent 볼륨·버킷 없음")]
+
+
+def managed_db_public(ctx: CheckContext) -> list[Hit]:
+    """DB-006 — 관리형 DB 가 인터넷에 열려 있다."""
+    db = ctx.spec.database
+    if db.placement != "managed" or not db.publicly_accessible:
+        return []
+    return [Hit("/database/publicly_accessible", f"managed {db.engine}: publicly_accessible true")]

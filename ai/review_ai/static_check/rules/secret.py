@@ -23,3 +23,13 @@ def missing_db_secret(ctx: CheckContext) -> list[Hit]:
     if any(s.name == db.env_var for s in ctx.spec.secrets):
         return []
     return [Hit("/secrets", f"secrets 에 {db.env_var} 없음")]
+
+
+def env_shadowed_by_secret(ctx: CheckContext) -> list[Hit]:
+    """SEC-004 — 같은 이름이 runtime.env 와 secrets 에 둘 다 있다. 값은 비밀일 수 있어 evidence 에 남기지 않는다."""
+    secret_names = {s.name for s in ctx.spec.secrets}
+    return [
+        Hit(f"/runtime/env/{name}", f"runtime.env.{name} 와 secrets[{name}] 중복")
+        for name in sorted(ctx.spec.runtime.env)
+        if name in secret_names
+    ]
