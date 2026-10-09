@@ -1,0 +1,107 @@
+{
+  "schema_version": "deployment.result/v1",
+  "event_type": "deployed",
+  "app": "sample-app",
+  "env": "aws",
+  "argocd_app": "sample-app-aws",
+  "cluster_id": "https://kubernetes.default.svc",
+  "namespace": "sample-app",
+  "health": "Healthy",
+  "health_message": null,
+  "sync_status": "Synced",
+  "images": [
+    "ghcr.io/crystal-sbhackathon2026/sample-app:b60ebc2b38c9386b325fd8a14471995c93db8c13"
+  ],
+  "revision": "ff0f31044de41e0075d212ac6466c78feb7f6966",
+  "observed_at": "2026-10-09T10:49:52Z",
+  "operation": {
+    "phase": "Succeeded",
+    "message": "successfully synced (all tasks run)",
+    "revision": "ad946b199878dc156ec3172dced7c7f89ff01ee9",
+    "started_at": "2026-10-09T10:18:31Z",
+    "finished_at": "2026-10-09T10:18:34Z",
+    "resources": [
+      {
+        "group": "",
+        "hookPhase": "Running",
+        "kind": "Service",
+        "message": "service/sample-app unchanged",
+        "name": "sample-app",
+        "namespace": "sample-app",
+        "status": "Synced",
+        "syncPhase": "Sync",
+        "version": "v1"
+      },
+      {
+        "group": "networking.k8s.io",
+        "hookPhase": "Running",
+        "kind": "Ingress",
+        "message": "ingress.networking.k8s.io/sample-app unchanged",
+        "name": "sample-app",
+        "namespace": "sample-app",
+        "status": "Synced",
+        "syncPhase": "Sync",
+        "version": "v1"
+      },
+      {
+        "group": "argoproj.io",
+        "hookPhase": "Running",
+        "images": [
+          "ghcr.io/crystal-sbhackathon2026/sample-app:b60ebc2b38c9386b325fd8a14471995c93db8c13"
+        ],
+        "kind": "Rollout",
+        "message": "rollout.argoproj.io/sample-app configured",
+        "name": "sample-app",
+        "namespace": "sample-app",
+        "status": "Synced",
+        "syncPhase": "Sync",
+        "version": "v1alpha1"
+      },
+      {
+        "group": "argoproj.io",
+        "hookPhase": "Running",
+        "kind": "AnalysisTemplate",
+        "message": "analysistemplate.argoproj.io/sample-app-health unchanged",
+        "name": "sample-app-health",
+        "namespace": "sample-app",
+        "status": "Synced",
+        "syncPhase": "Sync",
+        "version": "v1alpha1"
+      }
+    ]
+  },
+  "conditions": [],
+  "resources": [
+    {
+      "kind": "Service",
+      "name": "sample-app",
+      "namespace": "sample-app",
+      "status": "Synced",
+      "version": "v1"
+    },
+    {
+      "group": "argoproj.io",
+      "kind": "AnalysisTemplate",
+      "name": "sample-app-health",
+      "namespace": "sample-app",
+      "status": "Synced",
+      "version": "v1alpha1"
+    },
+    {
+      "group": "argoproj.io",
+      "kind": "Rollout",
+      "name": "sample-app",
+      "namespace": "sample-app",
+      "status": "Synced",
+      "version": "v1alpha1"
+    },
+    {
+      "group": "networking.k8s.io",
+      "kind": "Ingress",
+      "name": "sample-app",
+      "namespace": "sample-app",
+      "status": "Synced",
+      "version": "v1"
+    }
+  ]
+}

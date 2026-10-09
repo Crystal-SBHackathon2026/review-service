@@ -45,7 +45,7 @@ INTAKE_KINDS = {"missing": "deploy.yaml 없음", "empty": "빈 deploy.yaml", "ya
                 "schema_error": "명세 형식 오류"}
 INTAKE_STATUSES = {"processing": "처리 중", "generated": "명세 생성", "repaired": "형식 복구", "rejected": "거절",
                    "failed": "실패"}
-HEALTH = {"healthy": "Healthy", "degraded": "Degraded"}
+HEALTH = {"healthy": "Healthy", "degraded": "Degraded", "sync_failed": "SyncFailed"}
 STAGE_AT = {"review": "judged_at", "human": "human_decided_at", "merge": "merged_at",
             "gitops": "gitops_committed_at"}  # 끝난 단계의 시각 (0009). 그 전 행은 None
 
@@ -55,6 +55,20 @@ def review_view(row: dict[str, Any]) -> dict[str, Any]:
     reasons = row.get("reasons") or []
     return {**{k: row.get(k) for k in REVIEW_KEYS},
             "reason_messages": {code: REASON_MESSAGES[code] for code in reasons if code in REASON_MESSAGES}}
+
+
+async def deployment_summary(repo, row):
+    events = [e for e in await repo.list_deployments(row["review_id"], limit=50)
+              if e["target_env"] == row["target_env"]]
+    failed = await repo.has_failed_deployment(row["review_id"])
+    latest = next((e for e in events if e["kind"] != "deployed"), None) if failed else (events[0] if events else None)
+    verified_success = (latest is not None and latest["kind"] == "deployed"
+                        and latest["payload"].get("health") == "Healthy"
+                        and latest["payload"].get("sync_status") == "Synced"
+                        and (latest["payload"].get("operation") or {}).get("phase") == "Succeeded")
+    return {"status": "failed" if failed else "healthy" if verified_success else "unknown",
+            "event_id": latest["event_id"] if latest else None,
+            "analysis_status": latest["analysis_status"] if latest else None}
 
 
 def _envs(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -212,6 +226,10 @@ def _deploy_state(cards: list[dict[str, Any]]) -> tuple[str, str, Any]:
         parts.append(f"{card['env']} {HEALTH.get(deploy['kind'], deploy['kind'])}")
         (healthy if deploy["kind"] == "healthy" else degraded).append(deploy["received_at"])
     detail = " · ".join(parts)
+    target_failure = next((c["deploy"] for c in real if c.get("is_target") and c.get("deploy")
+                           and c["deploy"]["kind"] in {"degraded", "sync_failed"}), None)
+    if target_failure:
+        return "failed", detail, target_failure["received_at"]
     if healthy:
         return "done", detail, min(healthy)
     if degraded:
@@ -346,7 +364,8 @@ async def build_progress(repo: ReviewRepository, review_id: str, settings: Progr
                                                "created_at")} if intake_row else None)
     cards = env_cards(row, await repo.deploy_events_for(review_id), settings)
     return {
-        "review": review_view(row),
+        "review": {**review_view(row), "deployment": await deployment_summary(repo, row),
+                   "case_advice_status": (row.get("case_advice") or {}).get("status", "not_checked")},
         "chain": [{"review_id": r["review_id"], "status": r["status"], "verdict": r["verdict"],
                    "created_at": r["created_at"], "autofix": _is_autofix(r)} for r in chain],
         "latest_review_id": latest_review_id,

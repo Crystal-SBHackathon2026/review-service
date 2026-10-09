@@ -39,6 +39,9 @@ from review_worker.commit_overlay import make_commit_overlay, make_overlay_guard
 from review_worker.graph import Deps, build_graph
 from review_worker.handler import ReviewHandler
 from review_worker.metrics import DEFAULT_METRICS_PORT, LAST_HEARTBEAT, MeteredLLM, report_lag, safe
+from review_worker.deployment_analysis import DeploymentAnalysisHandler
+from review_ai.deployment_analysis import Diagnosis
+from review_common.deployment import TOPIC as ANALYSIS_TOPIC, sweep_analysis
 
 log = logging.getLogger("review_worker")
 GROUP_ID = "review-worker"
@@ -82,13 +85,24 @@ async def keep_alive_while(alive: AliveFile, work: Awaitable[Any], limit_seconds
             alive.touch()
 
 
+class RoutedHandler:
+    def __init__(self, review_handler, analysis_handler):
+        self.review_handler, self.analysis_handler = review_handler, analysis_handler
+
+    async def handle(self, topic, value):
+        if topic == ANALYSIS_TOPIC:
+            await self.analysis_handler.handle(value)
+        else:
+            await self.review_handler.handle(topic, value)
+
+
 class Consumer(Protocol):
     async def getmany(self, *, timeout_ms: int) -> dict[Any, list[Any]]: ...
 
     async def commit(self) -> None: ...
 
 
-async def consume(consumer: Consumer, handler: ReviewHandler, stop: asyncio.Event, alive: AliveFile,
+async def consume(consumer: Consumer, handler: ReviewHandler | RoutedHandler, stop: asyncio.Event, alive: AliveFile,
                   handle_limit_seconds: float) -> None:
     """메인 루프. poll 마다 alive 를 갱신하고, 메시지를 하나씩 처리한 뒤 오프셋을 커밋한다."""
     while not stop.is_set():
@@ -100,6 +114,15 @@ async def consume(consumer: Consumer, handler: ReviewHandler, stop: asyncio.Even
                 await consumer.commit()
 
 
+def make_analysis_llm():
+    try:
+        client = ClaudeLLM(output=Diagnosis, client_options={"timeout": 90.0, "max_retries": 0}, max_tokens=4000)
+        return CachedLLM(MeteredLLM(client, purpose="deployment_analysis"))
+    except LlmUnavailable:
+        log.warning("deployment diagnosis LLM unavailable")
+        return None
+
+
 async def run() -> None:
     start_http_server(int(os.environ.get("METRICS_PORT") or DEFAULT_METRICS_PORT))
     conninfo = db_conninfo()
@@ -109,7 +132,7 @@ async def run() -> None:
     github = GitHubClient()
     max_poll_interval_ms = int(os.environ.get("KAFKA_MAX_POLL_INTERVAL_MS", "900000"))  # judge 재시도까지 기다린다
     consumer = AIOKafkaConsumer(
-        REQUESTED_TOPIC, RESUMED_TOPIC,
+        REQUESTED_TOPIC, RESUMED_TOPIC, ANALYSIS_TOPIC,
         bootstrap_servers=kafka_bootstrap(),
         group_id=GROUP_ID,
         enable_auto_commit=False,
@@ -123,6 +146,7 @@ async def run() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
+    outbox = None
     try:
         checkpointer = AsyncPostgresSaver(pool)
         await checkpointer.setup()
@@ -138,15 +162,20 @@ async def run() -> None:
                     public_url=os.environ.get("REVIEW_API_PUBLIC_URL") or None)
         graph = build_graph(deps, checkpointer)
         handler = ReviewHandler(repo, graph, files=github)
+        analysis_handler = DeploymentAnalysisHandler(repo, make_analysis_llm(), retriever)
+        outbox = asyncio.create_task(sweep_analysis(repo, KafkaPublisher(producer)))
         await consumer.start()
         log.info("review-worker 시작: %s", consumer.subscription())
         alive = AliveFile(os.environ.get("WORKER_ALIVE_FILE") or ALIVE_FILE)
         lag = asyncio.create_task(report_lag(consumer))
         try:
-            await consume(consumer, handler, stop, alive, max_poll_interval_ms / 1000)
+            await consume(consumer, RoutedHandler(handler, analysis_handler), stop, alive, max_poll_interval_ms / 1000)
         finally:
             lag.cancel()
     finally:
+        if outbox is not None:
+            outbox.cancel()
+            await asyncio.gather(outbox, return_exceptions=True)
         await consumer.stop()
         await producer.stop()
         await github.aclose()

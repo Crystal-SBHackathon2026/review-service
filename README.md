@@ -231,3 +231,7 @@ received → reviewing ─┬─ needs_human ─┬─ (승인, 적용할 수정
   입력한 값이 우선이며, 기존 명세 그대로 승인하려면 `use_recommendations: false`를 명시한다. 권장값이 없으면 값 없는 승인은 그대로 승인이다. [응답 기본값 안내](ai/docs/human-recommendations.md).
 - 종료 지점(거절·AI 수정 커밋·사람 승인 뒤 committed)과 Argo CD Degraded 에서 판단 사례를 `review_cases` 에 남기고, 다음 검토가 같은 규칙에 걸리면 근거 문서로 붙인다. 기록 실패는 검토 결과를 바꾸지 않는다. [판단 사례](ai/docs/review-ai.md#판단-사례-review_cases)
 - `commit_overlay`(성진님, `worker/review_worker/commit_overlay.py`)가 원본 명세 + `applied_ops` → overlay 를 gitops main 에 커밋한다. 렌더러 blocking 경고면 커밋하지 않고 `blocked`. gitops ref 충돌은 main 을 다시 읽어 최대 5회.
+
+### 배포 실패 분석
+
+Argo CD 오류 수신, 별도 Kafka 진단, 다음 요청의 실패 사례 비교와 운영자 UI는 [배포 실패 분석 문서](ai/docs/deployment-failure-analysis.md)를 참고하세요. 신규 송신 계약은 [JSON Schema](api/schema/deployment.result.v1.schema.json)에 있습니다.

@@ -14,11 +14,13 @@ from tests.test_graph import RID, SAMPLE_01, SAMPLE_04, _finish_ci, _seed_baseli
 
 def break_record_result_once(h: Harness) -> list[dict[str, Any]]:
     """record_result 의 DB 쓰기가 한 번 실패한다 (DB 순간 장애). 그때 handler 의 failed 기록도 실패해 프로세스가 내려간다."""
-    original, calls = h.repo.update_review, []
+    original, calls, failed_writes = h.repo.update_review, [], 0
 
     async def update_review(review_id: str, **fields: Any) -> None:
+        nonlocal failed_writes
         calls.append(fields)
-        if len(calls) <= 2 and ("verdict" in fields or fields.get("status") == "failed"):
+        if failed_writes < 2 and ("verdict" in fields or fields.get("status") == "failed"):
+            failed_writes += 1
             raise ConnectionError("DB 연결 끊김")
         await original(review_id, **fields)
 
