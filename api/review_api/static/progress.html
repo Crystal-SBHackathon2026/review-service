@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>배포 진행</title>
+<!--
+  배포 진행 화면 (읽기 전용). Review API 가 GET /ui/reviews/{id}·/ui/reviews 로 직접 서빙한다.
+  - PR 커밋 상태 review-service/verify 의 Details 가 /ui/reviews/{id} 로 연다
+  - GET /reviews/{id}/progress 하나만 폴링한다. 3초, 끝난 상태(final)면 30초. superseded 면 최신 검토로 주소를 바꾼다
+  - 토큰 입력 없음. 승인은 /ui 승인 화면에서
+  - 서버 값은 사용자 입력이라 innerHTML 을 쓰지 않고 textContent 로만 그린다. 링크는 http(s) 만
+-->
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5b6470; --border: #d9dde3;
+  --accent: #2557d6; --accent-text: #ffffff; --hover: #eef2fb;
+  --warn-bg: #fff4d6; --warn-text: #7a4b00; --warn-border: #f0c75e;
+  --danger: #c62828; --danger-bg: #fde8e8; --ok: #1e7b3a; --ok-bg: #e3f4e8;
+  --info-bg: #e6eefc; --info-text: #1d4aa8; --gray-bg: #eceef1; --gray-text: #4b5360;
+  --code-bg: #f1f3f6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418; --panel: #1a1e24; --text: #e6e9ee; --muted: #9aa3ae; --border: #2e353f;
+    --accent: #5b8cff; --accent-text: #0b0e12; --hover: #222833;
+    --warn-bg: #3a2e10; --warn-text: #f3cf73; --warn-border: #6b5418;
+    --danger: #ff7b7b; --danger-bg: #3a1c1c; --ok: #6fd18f; --ok-bg: #173523;
+    --info-bg: #1b2a48; --info-text: #9dbaff; --gray-bg: #262c35; --gray-text: #b4bcc7;
+    --code-bg: #232831;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between;
+  padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
+header h1 { font-size: 16px; margin: 0; overflow-wrap: anywhere; }
+.title { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; min-width: 0; }
+.conn { font-size: 12px; color: var(--muted); }
+.conn.bad { color: var(--danger); }
+.wrap { padding: 16px; display: grid; gap: 16px; }
+main { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 16px; align-items: start; }
+@media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+section.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+  min-width: 0; }
+h2 { font-size: 15px; margin: 0 0 8px; }
+h3 { font-size: 14px; margin: 16px 0 6px; }
+a { color: var(--accent); }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+pre { background: var(--code-bg); padding: 8px; border-radius: 6px; margin: 4px 0; white-space: pre-wrap;
+  word-break: break-all; }
+.muted { color: var(--muted); }
+.meta { font-size: 12px; color: var(--muted); }
+.row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.row .grow { flex: 1; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap;
+  background: var(--gray-bg); color: var(--gray-text); }
+.badge.needs_human, .badge.high { background: var(--warn-bg); color: var(--warn-text); }
+.badge.reviewing, .badge.waiting_ci, .badge.merging, .badge.received, .badge.medium { background: var(--info-bg);
+  color: var(--info-text); }
+.badge.committed, .badge.healthy { background: var(--ok-bg); color: var(--ok); }
+.badge.rejected, .badge.failed, .badge.blocked, .badge.degraded { background: var(--danger-bg); color: var(--danger); }
+.badge.high { font-weight: 600; }
+.chip { display: inline-block; padding: 0 6px; border: 1px solid var(--border); border-radius: 4px; font-size: 12px;
+  color: var(--muted); white-space: nowrap; }
+.chip.rule { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--text);
+  background: var(--code-bg); }
+.notice { padding: 8px 10px; border-radius: 6px; }
+.notice.ok { background: var(--ok-bg); color: var(--ok); }
+.notice.err { background: var(--danger-bg); color: var(--danger); white-space: pre-wrap; }
+.notice.info { background: var(--info-bg); color: var(--info-text); }
+.notice.warn { background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border); }
+.band { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; }
+.band a { font-weight: 600; overflow-wrap: anywhere; }
+.empty { color: var(--muted); padding: 16px 0; text-align: center; }
+
+/* 단계 — 세로 목록, 원형 아이콘 */
+ol.steps { list-style: none; margin: 0; padding: 0; }
+ol.steps li { display: grid; grid-template-columns: 24px 1fr; gap: 0 10px; position: relative; padding-bottom: 14px; }
+ol.steps li:not(:last-child)::before { content: ""; position: absolute; left: 11px; top: 24px; bottom: 0;
+  border-left: 2px solid var(--border); }
+ol.steps li.done:not(:last-child)::before { border-left-color: var(--ok); }
+.icon { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 13px;
+  font-weight: 700; border: 2px solid var(--border); background: var(--panel); color: var(--muted); }
+.done .icon { background: var(--ok); border-color: var(--ok); color: var(--panel); }
+.failed .icon { background: var(--danger); border-color: var(--danger); color: var(--panel); }
+.running .icon { border-color: var(--info-bg); border-top-color: var(--accent); animation: spin 1s linear infinite; }
+.skipped .icon { border-style: dashed; }
+.skipped .label, .waiting .label { color: var(--muted); }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .running .icon { animation: none; border-color: var(--accent); } }
+.label { font-weight: 600; display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }
+.detail { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+
+/* 환경별 카드 */
+.envs { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.env { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  min-width: 0; }
+.env.target { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.env.planned { background: transparent; border-style: dashed; color: var(--muted); }
+.env h3 { margin: 0 0 6px; font-size: 14px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; margin: 0; font-size: 13px; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+
+/* 검토 보고서 */
+.card { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; }
+.why { border-left: 3px solid var(--accent); padding-left: 8px; margin-top: 6px; }
+.fix { border-left: 3px solid var(--ok); padding-left: 8px; margin-top: 6px; }
+.button { display: inline-block; padding: 6px 12px; border-radius: 6px; background: var(--accent);
+  color: var(--accent-text); text-decoration: none; font-weight: 600; }
+
+/* 목록 */
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); vertical-align: top;
+  overflow-wrap: anywhere; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--hover); }
+</style>
+</head>
+<body>
+<header>
+  <div class="title" id="title"><h1>배포 진행</h1></div>
+  <div class="row"><span id="conn" class="conn"></span><a href="/ui/reviews" class="meta">최근 검토</a></div>
+</header>
+<div class="wrap" id="root" aria-live="polite"><p class="empty">불러오는 중…</p></div>
+
+<script>
+"use strict";
+(function () {
+  const FAST_MS = 3000, SLOW_MS = 30000;
+  const STATUS_LABEL = {
+    received: "접수", reviewing: "검토 중", needs_human: "사람 확인 필요", waiting_ci: "CI 대기",
+    merging: "병합 중", committed: "배포 커밋됨", blocked: "막힘", rejected: "거절됨", failed: "실패",
+    superseded: "새 검토로 대체됨",
+  };
+  const ENV_LABEL = {aws: "AWS", local: "로컬", gcp: "GCP"};
+  const HEALTH_LABEL = {healthy: "Healthy", degraded: "Degraded"};
+  const ICON = {done: "✓", failed: "!", running: "", waiting: "", skipped: "–"};
+  const STATE_LABEL = {done: "완료", failed: "실패", running: "진행 중", waiting: "대기", skipped: "건너뜀"};
+  const LIST_STATUSES = Object.keys(STATUS_LABEL).filter((s) => s !== "superseded");
+
+  // --- DOM: textContent 로만 그린다 ---
+  function el(tag, props, children) {
+    const node = document.createElement(tag);
+    if (props) {
+      for (const [k, v] of Object.entries(props)) {
+        if (v === undefined || v === null || v === false) continue;
+        if (k === "text") node.textContent = String(v);
+        else if (k === "class") node.className = v;
+        else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+        else node.setAttribute(k, v === true ? "" : String(v));
+      }
+    }
+    for (const c of [].concat(children || [])) {
+      if (c === null || c === undefined || c === false) continue;
+      node.append(c instanceof Node ? c : document.createTextNode(String(c)));
+    }
+    return node;
+  }
+  const $ = (id) => document.getElementById(id);
+  const badge = (status) => el("span", {class: "badge " + status, text: STATUS_LABEL[status] || status});
+  const envName = (e) => ENV_LABEL[e] || e;
+  const short = (sha) => String(sha || "").slice(0, 7);
+  const valueText = (v) => (typeof v === "string" ? v : JSON.stringify(v));
+  function safeUrl(url) {
+    return typeof url === "string" && /^https?:\/\/[^\s"'<>]+$/.test(url) ? url : null;
+  }
+  function link(url, text) {
+    const href = safeUrl(url);
+    return href ? el("a", {href, target: "_blank", rel: "noopener noreferrer", text: text || href}) : null;
+  }
+  function ago(iso) {
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return "";
+    const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (s < 60) return s + "초 전";
+    if (s < 3600) return Math.floor(s / 60) + "분 전";
+    if (s < 86400) return Math.floor(s / 3600) + "시간 " + Math.floor((s % 3600) / 60) + "분 전";
+    return Math.floor(s / 86400) + "일 전";
+  }
+  function clock(iso) {
+    const t = Date.parse(iso);
+    return Number.isNaN(t) ? "" : new Date(t).toLocaleTimeString();
+  }
+  function localTime(iso) {
+    const t = Date.parse(iso);
+    return Number.isNaN(t) ? String(iso || "") : new Date(t).toLocaleString();
+  }
+  function kv(pairs) {
+    return el("dl", {class: "kv"}, pairs.filter(([, v]) => v !== null && v !== undefined && v !== "")
+      .flatMap(([k, v]) => [el("dt", {text: k}), el("dd", {}, [v])]));
+  }
+  function setConn(ok) {
+    $("conn").textContent = ok ? "" : "서버 연결 끊김 — 다시 시도 중";
+    $("conn").className = "conn" + (ok ? "" : " bad");
+  }
+  async function getJson(url) {
+    const res = await fetch(url, {headers: {Accept: "application/json"}, cache: "no-store"});
+    if (!res.ok) { const err = new Error("HTTP " + res.status); err.status = res.status; throw err; }
+    return res.json();
+  }
+
+  // --- 주소: /ui/reviews/{id} 면 상세, /ui/reviews 면 목록 ---
+  const match = location.pathname.match(/^\/ui\/reviews\/([^/]+)\/?$/);
+  let reviewId = match ? decodeURIComponent(match[1]) : "";
+  let movedFrom = "";  // superseded 에서 넘어온 검토
+  let lastJson = "", timer = 0;
+
+  function schedule(ms) { clearTimeout(timer); timer = setTimeout(tick, ms); }
+  function tick() { (reviewId ? pollProgress : pollList)(); }
+
+  // --- 목록 (데모용 입구) ---
+  async function pollList() {
+    const qs = LIST_STATUSES.map((s) => "status=" + s).join("&") + "&limit=20";
+    try {
+      const rows = await getJson("/reviews?" + qs);
+      setConn(true);
+      const text = JSON.stringify(rows);
+      if (text !== lastJson) { lastJson = text; renderList(rows); }
+    } catch (e) { setConn(false); }
+    schedule(FAST_MS * 2);
+  }
+  function renderList(rows) {
+    document.title = "최근 검토";
+    $("title").replaceChildren(el("h1", {text: "최근 검토"}));
+    if (!rows.length) { $("root").replaceChildren(el("p", {class: "empty", text: "검토가 없습니다."})); return; }
+    const open = (id) => { location.href = "/ui/reviews/" + encodeURIComponent(id); };
+    const body = rows.map((r) => {
+      const repo = (r.spec_ref || {}).repository || "-";
+      return el("tr", {tabindex: "0", onclick: () => open(r.review_id),
+                       onkeydown: (e) => { if (e.key === "Enter") open(r.review_id); }}, [
+        el("td", {text: repo}),
+        el("td", {text: Number.isInteger(r.pr_number) ? "#" + r.pr_number : "-"}),
+        el("td", {}, [el("strong", {text: r.app}), " ", el("span", {class: "chip", text: envName(r.target_env)})]),
+        el("td", {}, [badge(r.status)]),
+        el("td", {title: localTime(r.created_at), text: ago(r.created_at)}),
+      ]);
+    });
+    $("root").replaceChildren(el("section", {class: "panel"}, [
+      el("h2", {text: "최근 검토 " + rows.length + "건"}),
+      el("p", {class: "meta", text: "PR 체크의 Details 로도 들어올 수 있습니다. 새 커밋으로 대체된 검토는 빼고 보여 줍니다."}),
+      el("div", {class: "table-wrap"}, [el("table", {}, [
+        el("thead", {}, [el("tr", {}, ["레포", "PR", "앱", "상태", "시각"].map((h) => el("th", {text: h})))]),
+        el("tbody", {}, body),
+      ])]),
+    ]));
+  }
+
+  // --- 상세 ---
+  async function pollProgress() {
+    const id = reviewId;
+    let body;
+    try {
+      body = await getJson("/reviews/" + encodeURIComponent(id) + "/progress");
+    } catch (e) {
+      if (e.status === 404) {
+        setConn(true);
+        $("root").replaceChildren(el("p", {class: "notice err", text: "검토가 없습니다: " + id}));
+        return;  // 없는 검토는 다시 묻지 않는다
+      }
+      setConn(false);
+      schedule(FAST_MS);
+      return;
+    }
+    setConn(true);
+    if (body.latest_review_id && body.latest_review_id !== id) {  // AI 수정 커밋 등으로 넘어갔다 — 최신으로
+      movedFrom = movedFrom || id;
+      reviewId = body.latest_review_id;
+      history.replaceState(null, "", "/ui/reviews/" + encodeURIComponent(reviewId));
+      lastJson = "";
+      tick();
+      return;
+    }
+    const text = JSON.stringify(body);
+    if (text !== lastJson) { lastJson = text; render(body); }
+    schedule(body.final ? SLOW_MS : FAST_MS);
+  }
+
+  function render(p) {
+    const r = p.review;
+    currentLinks = p.links || {};
+    document.title = r.app + " 배포 진행";
+    const repo = (r.spec_ref || {}).repository || "";
+    const prText = repo + (Number.isInteger(r.pr_number) ? " #" + r.pr_number : "");
+    $("title").replaceChildren(
+      el("h1", {text: r.app}),
+      link(p.links.pr, prText) || el("span", {class: "muted", text: prText || "PR 없음"}),
+      el("span", {class: "chip", title: "배포 대상 (deploy.yaml)", text: "대상 " + envName(r.target_env)}),
+      badge(r.status),
+    );
+    const out = [];
+    if (movedFrom) {
+      out.push(el("p", {class: "notice info", text: "검토 " + movedFrom + " 는 새 커밋으로 넘어가 최신 검토를 보여 줍니다."}));
+    }
+    out.push(resultBand(p));
+    out.push(el("div", {class: "envs"}, p.envs.map(envCard)));
+    out.push(el("main", {}, [stepsPanel(p), reportPanel(p)]));
+    $("root").replaceChildren(...out.filter(Boolean));
+  }
+
+  function resultBand(p) {
+    const r = p.review;
+    const live = p.envs.filter((c) => !c.planned && c.deploy && c.deploy.kind === "healthy");
+    if (live.length) {
+      const links = live.map((c) => el("span", {}, [envName(c.env) + " ", link(c.app_url) || el("span", {class: "muted", text: "주소 미설정"})]));
+      return el("div", {class: "notice ok band"}, [el("strong", {text: "배포 완료"}), ...links]);
+    }
+    if (["rejected", "failed", "blocked"].includes(r.status)) {
+      const failed = p.steps.find((s) => s.state === "failed");
+      return el("div", {class: "notice err"}, [el("strong", {text: STATUS_LABEL[r.status] + " — "}), failed ? failed.label + ": " + failed.detail : r.error || ""]);
+    }
+    if (r.status === "needs_human") {
+      return el("div", {class: "notice warn band"}, [el("strong", {text: "사람 확인을 기다립니다"}),
+        el("a", {class: "button", href: "/ui#" + encodeURIComponent(r.review_id), text: "승인 화면에서 결정하기"})]);
+    }
+    const degraded = p.envs.find((c) => !c.planned && c.deploy && c.deploy.kind === "degraded");
+    if (degraded) return el("div", {class: "notice err", text: envName(degraded.env) + " 배포가 Degraded 입니다."});
+    return null;
+  }
+
+  function deployBadge(deploy) {
+    if (!deploy) return el("span", {class: "badge", text: "알림 대기"});
+    return el("span", {class: "badge " + deploy.kind, text: HEALTH_LABEL[deploy.kind] || deploy.kind});
+  }
+
+  function envCard(c) {
+    if (c.planned) {
+      return el("div", {class: "env planned"}, [
+        el("h3", {}, [envName(c.env), el("span", {class: "chip", text: "계획"})]),
+        el("p", {class: "meta", text: "이 환경 에이전트는 계획 단계입니다."}),
+      ]);
+    }
+    const rows = [];
+    if (c.is_target) {
+      const render = c.render;
+      rows.push(["렌더", render
+        ? el("span", {}, [el("span", {class: "badge " + render.status, text: render.status === "committed" ? "커밋됨" : "막힘"}),
+                          render.reason ? " " + render.reason : ""])
+        : el("span", {class: "muted", text: "아직 없음"})]);
+      if (render && render.gitops_commit_sha) {
+        rows.push(["gitops", link(currentLinks.gitops_commit, short(render.gitops_commit_sha)) || el("code", {text: short(render.gitops_commit_sha)})]);
+      }
+    }
+    rows.push(["배포", deployBadge(c.deploy)]);
+    if (c.deploy) {
+      rows.push(["이미지", el("code", {text: short(c.deploy.image_tag)})]);
+      rows.push(["알림", clock(c.deploy.received_at) + " (" + ago(c.deploy.received_at) + ")"]);
+    }
+    if (c.app_url) rows.push(["주소", link(c.app_url)]);
+    return el("div", {class: "env" + (c.is_target ? " target" : "")}, [
+      el("h3", {}, [envName(c.env), c.is_target ? el("span", {class: "chip", text: "대상"}) : null]),
+      kv(rows),
+    ]);
+  }
+  let currentLinks = {};  // render 가 먼저 채운다 — 환경 카드의 gitops 링크
+
+  function stepsPanel(p) {
+    const items = p.steps.map((s) => el("li", {class: s.state}, [
+      el("span", {class: "icon", "aria-hidden": "true", text: ICON[s.state] || ""}),
+      el("div", {}, [
+        el("div", {class: "label"}, [s.label, el("span", {class: "meta", text: STATE_LABEL[s.state] || s.state}),
+                                      s.at ? el("span", {class: "meta", title: localTime(s.at), text: clock(s.at)}) : null]),
+        s.detail ? el("div", {class: "detail", text: s.detail}) : null,
+      ]),
+    ]));
+    const extra = [];
+    const linkRows = [
+      ["PR", link(p.links.pr, "GitHub PR")],
+      ["병합 커밋", link(p.links.merge_commit, short(p.review.merge_sha))],
+      ["gitops 커밋", link(p.links.gitops_commit, short(p.review.gitops_commit_sha))],
+    ].filter(([, v]) => v);
+    if (linkRows.length) extra.push(el("h3", {text: "링크"}), kv(linkRows));
+    if (p.chain.length > 1) {
+      extra.push(el("h3", {text: "검토 이력"}));
+      extra.push(el("ol", {class: "meta"}, p.chain.map((c) => el("li", {}, [
+        c.review_id === p.review.review_id ? el("strong", {text: c.review_id}) : el("a", {href: "/ui/reviews/" + encodeURIComponent(c.review_id), text: c.review_id}),
+        " · " + (STATUS_LABEL[c.status] || c.status) + (c.verdict ? " · " + c.verdict : "") + (c.autofix ? " · 자동 수정 커밋" : ""),
+      ]))));
+    }
+    if (p.intake) {
+      extra.push(el("p", {class: "meta"}, ["명세 처리 기록 ", el("a", {href: "/intakes/" + encodeURIComponent(p.intake.intake_id), text: p.intake.intake_id})]));
+    }
+    return el("section", {class: "panel", "aria-labelledby": "steps-title"}, [
+      el("h2", {id: "steps-title", text: "배포 진행"}),
+      el("ol", {class: "steps"}, items),
+      ...extra,
+      el("p", {class: "meta", text: "검토 " + p.review.review_id + " · " + (p.final ? "30초" : "3초") + "마다 갱신"}),
+    ]);
+  }
+
+  // findings 는 회차 기록(rounds)에서도 모은다 — 고쳐서 통과하면 최종 findings 는 비어 있다
+  function collectFindings(p) {
+    const byId = new Map();
+    const add = (f, item, fixOps, round) => {
+      const prev = byId.get(f.finding_id) || {finding: f, item: null, fixes: [], rounds: new Set()};
+      if (item && !prev.item) prev.item = item;
+      if (fixOps && fixOps.length) prev.fixes.push(...fixOps);
+      if (round !== null && round !== undefined) prev.rounds.add(round);
+      byId.set(f.finding_id, prev);
+    };
+    for (const r of p.rounds || []) {
+      const items = new Map((r.items || []).map((i) => [i.finding_id, i]));
+      const patch = r.patch || {};
+      const targets = new Set(patch.target_finding_ids || []);
+      for (const f of r.findings || []) {
+        add(f, items.get(f.finding_id), targets.has(f.finding_id) && !r.human ? patch.ops : null, r.round);
+      }
+    }
+    const items = new Map(((p.decision || {}).items || []).map((i) => [i.finding_id, i]));
+    for (const f of p.findings || []) add(f, items.get(f.finding_id), null, null);
+    return [...byId.values()];
+  }
+
+  function opRow(op) {
+    return el("div", {}, [el("code", {text: op.op + " " + op.path}),
+      op.op === "remove" ? el("span", {class: "muted", text: " (삭제)"}) : [" → ", el("code", {text: valueText(op.value)})]].flat());
+  }
+
+  function reportPanel(p) {
+    const r = p.review;
+    const out = [el("h2", {text: "검토 보고서"})];
+    out.push(kv([
+      ["판정", r.verdict || "-"],
+      ["사유", (r.reasons || []).length ? el("div", {}, r.reasons.map((c) => el("div", {}, [el("code", {text: c}),
+        (r.reason_messages || {})[c] ? " — " + r.reason_messages[c] : ""]))) : null],
+      ["요청", (r.requested_by || "-") + " · " + localTime(r.created_at)],
+      ["명세", r.spec_ref ? el("code", {text: short(r.spec_ref.commit) + ":" + (r.spec_ref.path || "")}) : null],
+    ]));
+    if (r.status === "needs_human") {
+      out.push(el("p", {}, [el("a", {class: "button", href: "/ui#" + encodeURIComponent(r.review_id), text: "승인 화면에서 결정하기"})]));
+    }
+
+    const findings = collectFindings(p);
+    out.push(el("h3", {text: "걸린 규칙 (" + findings.length + ")"}));
+    if (!findings.length) out.push(el("p", {class: "muted", text: "걸린 규칙 없음"}));
+    for (const {finding: f, item, fixes} of findings) {
+      out.push(el("div", {class: "card"}, [
+        el("div", {class: "row"}, [
+          el("span", {class: "chip rule", text: f.rule_id}),
+          el("span", {class: "badge " + f.severity, text: f.severity}),
+          el("span", {class: "grow", text: f.title || ""}),
+        ]),
+        el("div", {class: "meta"}, [
+          "위치 ", el("code", {text: (f.location || {}).spec_path || "-"}),
+          f.irreversible ? " · 되돌릴 수 없음" : "", f.autofix === "forbidden" ? " · 자동 수정 금지" : "",
+        ]),
+        f.evidence ? el("pre", {text: f.evidence}) : null,
+        item && item.why ? el("div", {class: "why"}, [el("strong", {text: "AI 설명 "}), el("div", {text: item.why})]) : null,
+        fixes.length ? el("div", {class: "fix"}, [el("strong", {text: "자동 수정"}), ...fixes.map(opRow)]) : null,
+        item && (item.cited_rule_ids || []).length
+          ? el("div", {class: "meta"}, ["근거 문서 ", ...item.cited_rule_ids.map((c) => el("span", {class: "chip rule", text: c}))])
+          : null,
+      ]));
+    }
+    const docs = [...new Set((p.rounds || []).flatMap((x) => x.doc_ids || []))];
+    if (docs.length) {
+      out.push(el("p", {class: "meta"}, ["회차 근거 문서 ", ...docs.map((d) => el("span", {class: "chip", text: d}))]));
+    }
+    const opinions = (p.decision || {}).extra_opinions || [];
+    if (opinions.length) {
+      out.push(el("h3", {text: "참고 의견"}));
+      out.push(el("ul", {}, opinions.map((o) => el("li", {text: o}))));
+    }
+
+    const human = r.human_decision;
+    if (human) {
+      out.push(el("h3", {text: "사람 결정"}));
+      const defaulted = human.defaulted_ops || [];
+      const keyOf = (op) => op.op + " " + op.path;
+      const defaultedKeys = new Set(defaulted.map(keyOf));
+      const edited = (human.edited_ops || []).filter((op) => !defaultedKeys.has(keyOf(op)));
+      out.push(el("div", {class: "card"}, [
+        el("div", {class: "row"}, [
+          el("span", {class: "badge " + (human.decision === "approved" ? "committed" : "rejected"),
+                      text: human.decision === "approved" ? "승인" : "거절"}),
+          el("strong", {text: human.approver || "-"}),
+        ]),
+        human.decision === "approved" && !edited.length && !defaulted.length
+          ? el("div", {class: "meta", text: "작성한 명세 그대로 승인"}) : null,
+        defaulted.length ? el("div", {class: "fix"}, [el("strong", {text: "권장값 적용"}), ...defaulted.map(opRow)]) : null,
+        edited.length ? el("div", {class: "fix"}, [el("strong", {text: "사람이 고친 값"}), ...edited.map(opRow)]) : null,
+      ]));
+    }
+    return el("section", {class: "panel", "aria-label": "검토 보고서"}, out);
+  }
+
+  tick();
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+})();
+</script>
+</body>
+</html>
