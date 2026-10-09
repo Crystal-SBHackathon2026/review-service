@@ -31,6 +31,9 @@ INTAKE_FIELDS = ("intake_id", "repository", "head_repository", "pr_number", "hea
 INTAKE_FINISH = frozenset({"status", "reason", "message", "details", "result_commit_sha"})
 GENERATED_KINDS = ("missing", "empty")  # intake 가 명세를 새로 만든 경우. 형식 오류 복구(repaired)는 원문 값을 지킨다
 
+LIST_FIELDS = ("review_id", "app", "target_env", "spec_ref", "status", "verdict", "reasons", "requested_by", "created_at",
+               "updated_at", "pr_number")  # list_reviews — 승인 화면 목록. findings·decision 같은 큰 JSON 은 빼고
+
 CASE_FIELDS = ("case_id", "review_id", "app", "target_env", "rule_ids", "outcome", "summary", "ops")
 
 
@@ -88,6 +91,10 @@ class ReviewRepository(Protocol):
         ...
 
     async def latest_by_head_sha(self, sha: str) -> dict[str, Any] | None: ...
+
+    async def list_reviews(self, statuses: Sequence[str], limit: int) -> list[dict[str, Any]]:
+        """status 가 statuses 중 하나인 검토 limit 개, 최신(created_at) 순. statuses 가 비면 전부. 필드는 LIST_FIELDS."""
+        ...
 
     async def find_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
         """같은 레포(spec_ref.repository)·같은 head SHA 검토. 가장 최근 것."""
@@ -249,6 +256,13 @@ class PostgresReviewRepository:
     async def latest_by_head_sha(self, sha: str) -> dict[str, Any] | None:
         return await self._fetchone(
             "SELECT * FROM reviews WHERE pr_head_sha = %s ORDER BY created_at DESC LIMIT 1", (sha,))
+
+    async def list_reviews(self, statuses: Sequence[str], limit: int) -> list[dict[str, Any]]:
+        where = " WHERE status = ANY(%s)" if statuses else ""
+        params: list[Any] = [list(statuses)] if statuses else []
+        return await self._fetchall(
+            f"SELECT {', '.join(LIST_FIELDS)} FROM reviews{where} ORDER BY created_at DESC, review_id DESC LIMIT %s",
+            (*params, limit))
 
     async def find_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
         return await self._fetchone(
@@ -447,6 +461,11 @@ class InMemoryReviewRepository:
 
     async def latest_by_head_sha(self, sha: str) -> dict[str, Any] | None:
         return self._latest(r for r in self.reviews.values() if r["pr_head_sha"] == sha)
+
+    async def list_reviews(self, statuses: Sequence[str], limit: int) -> list[dict[str, Any]]:
+        rows = [r for r in self.reviews.values() if not statuses or r["status"] in statuses]
+        rows.sort(key=lambda r: (r["created_at"], r["review_id"]), reverse=True)
+        return [copy.deepcopy({k: r[k] for k in LIST_FIELDS}) for r in rows[:limit]]
 
     async def find_by_head(self, repository: str, sha: str) -> dict[str, Any] | None:
         return self._latest(r for r in self.reviews.values()

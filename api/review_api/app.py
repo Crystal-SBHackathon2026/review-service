@@ -1,7 +1,9 @@
 """Review API — 검토 요청을 받아 review.requested 를 발행하고, 사람 결정·CI·배포 결과를 받아 검토를 이어 간다.
 
     POST /reviews                       deploy.yaml 검토 요청 → 202 {review_id}  [Bearer REVIEW_API_TOKEN]
+    GET  /reviews?status=..&limit=50    검토 목록, 최신순. status 는 여러 번 줄 수 있다 (사람 승인 화면)
     GET  /reviews/{review_id}           상태·verdict·사유·rounds·deploy_result
+    GET  /ui                            needs_human 승인 화면 (static/index.html). 토큰은 화면에서 입력받는다
     GET  /verify?sha=<PR head SHA>      그 SHA 의 검토가 통과했는지 (CI 용). 명세가 없거나 깨진 SHA 는 intake 상태
     GET  /intakes/{intake_id}           명세 없음·빈 명세·형식 오류 처리 기록 (PR 커밋 상태의 링크)
     POST /reviews/{review_id}/decision  needs_human 검토에 사람 결정 → review.resumed(human_decision)  [Bearer REVIEW_API_TOKEN]
@@ -26,9 +28,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Any, Protocol, get_args
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from review_ai.graph import check_edited_ops
@@ -47,7 +51,7 @@ from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spe
 from review_api.lockfile import regenerate_lockfile
 from review_common.github import GitHubError, SpecNotFound
 from review_common.ids import new_review_id
-from review_common.repository import ReviewRepository
+from review_common.repository import ReviewDbStatus, ReviewRepository
 from review_common.resumed import TOPIC as RESUMED_TOPIC
 from review_common.resumed import CiCompletedResumed, CiResult, HumanDecisionModel, HumanDecisionResumed
 
@@ -55,6 +59,18 @@ log = logging.getLogger(__name__)
 
 PASSED_STATUSES = frozenset({"waiting_ci", "merging", "committed"})  # 검토를 통과(사람 승인 포함)한 뒤의 상태
 INTAKE_FAILED = frozenset({"rejected", "failed"})
+REVIEW_STATUSES = frozenset(get_args(ReviewDbStatus))
+
+UI_PAGE = Path(__file__).parent / "static" / "index.html"
+# 화면은 같은 주소의 API 만 부른다. 인라인 스크립트·스타일 한 장이라 외부 리소스는 막는다
+UI_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';"
+                               " connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self';"
+                               " frame-ancestors 'none'",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+}
 
 
 class SpecSource(Protocol):
@@ -132,6 +148,18 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             raise HTTPException(404, str(exc)) from exc
         return {"review_id": review_id}
 
+    @app.get("/reviews")
+    async def list_reviews(request: Request, status: list[str] = Query(default=[]),
+                           limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
+        unknown = sorted(set(status) - REVIEW_STATUSES)
+        if unknown:
+            raise HTTPException(422, f"모르는 status: {', '.join(unknown)}")
+        return await d(request).repo.list_reviews(status, limit)
+
+    @app.get("/ui", include_in_schema=False)
+    async def ui() -> FileResponse:
+        return FileResponse(UI_PAGE, media_type="text/html; charset=utf-8", headers=UI_HEADERS)
+
     @app.get("/reviews/{review_id}")
     async def get_review(review_id: str, request: Request) -> dict[str, Any]:
         row = await d(request).repo.get_review(review_id)
@@ -139,7 +167,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             raise HTTPException(404, "검토가 없다")
         keys = ("review_id", "app", "target_env", "spec_ref", "status", "verdict", "reasons", "findings", "decision",
                 "rounds", "human_decision", "deploy_result", "merge_sha", "gitops_commit_sha", "error",
-                "superseded_by", "requested_by", "created_at", "updated_at")
+                "superseded_by", "requested_by", "created_at", "updated_at", "pr_number")
         reasons = row.get("reasons") or []
         return {**{k: row.get(k) for k in keys},
                 "reason_messages": {code: REASON_MESSAGES[code] for code in reasons if code in REASON_MESSAGES}}

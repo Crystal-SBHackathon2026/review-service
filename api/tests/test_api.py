@@ -166,6 +166,61 @@ def test_unknown_review_and_sha_are_404(env: Env) -> None:
     assert env.client.get("/verify", params={"sha": "b" * 40}).status_code == 404
 
 
+# --- GET /reviews, /ui (사람 승인 화면) -------------------------------------------------------------
+
+async def _listed(env: Env, statuses: list[str]) -> list[str]:
+    """statuses 순서대로 검토를 만든다. created_at 은 한 시간씩 뒤 — 마지막이 가장 최근."""
+    ids = []
+    for i, status in enumerate(statuses):
+        rid = f"rv_20261009_{i:08x}"
+        await env.repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id=REPO,
+                                     spec_ref={"repository": REPO, "commit": HEAD, "path": "deploy.yaml"},
+                                     pr_head_sha=HEAD, requested_by="hyeyeon", pr_number=5)
+        env.repo.reviews[rid]["created_at"] = datetime(2026, 10, 9, i, tzinfo=UTC)
+        await env.set_status(rid, status=status)
+        ids.append(rid)
+    return ids
+
+
+async def test_list_reviews_filters_status_newest_first(env: Env) -> None:
+    ids = await _listed(env, ["needs_human", "committed", "waiting_ci", "needs_human", "reviewing"])
+    anonymous = TestClient(env.app)  # 읽기는 토큰 없이
+
+    one = anonymous.get("/reviews", params={"status": "needs_human"})
+    many = anonymous.get("/reviews", params=[("status", "needs_human"), ("status", "waiting_ci")])
+
+    assert one.status_code == 200
+    assert [r["review_id"] for r in one.json()] == [ids[3], ids[0]]
+    assert [r["review_id"] for r in many.json()] == [ids[3], ids[2], ids[0]]
+    assert [r["review_id"] for r in anonymous.get("/reviews").json()] == ids[::-1]
+    assert set(one.json()[0]) == {"review_id", "app", "target_env", "spec_ref", "status", "verdict", "reasons",
+                                  "requested_by", "created_at", "updated_at", "pr_number"}
+    assert one.json()[0]["pr_number"] == 5
+    assert anonymous.get(f"/reviews/{ids[0]}").json()["pr_number"] == 5  # 상세 화면의 PR 링크
+
+
+async def test_list_reviews_limit(env: Env) -> None:
+    ids = await _listed(env, ["needs_human"] * 4)
+
+    assert [r["review_id"] for r in env.client.get("/reviews", params={"limit": 2}).json()] == [ids[3], ids[2]]
+    assert env.client.get("/reviews", params={"limit": 0}).status_code == 422
+    assert env.client.get("/reviews", params={"limit": 201}).status_code == 422
+
+
+def test_list_reviews_unknown_status_is_422(env: Env) -> None:
+    assert env.client.get("/reviews", params={"status": "needs-human"}).status_code == 422
+
+
+def test_ui_serves_html_without_token(env: Env) -> None:
+    resp = TestClient(env.app).get("/ui")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "<!doctype html>" in resp.text.lower()
+    assert "/decision" in resp.text
+    assert "connect-src 'self'" in resp.headers["content-security-policy"]
+
+
 # --- POST /reviews/{id}/decision -------------------------------------------------------------------
 
 async def test_decision_only_when_needs_human(env: Env) -> None:

@@ -31,7 +31,7 @@ from review_ai.retrieval.file_retriever import FileRetriever
 from review_api.app import ApiDeps, create_app
 from review_common.github import SpecNotFound
 from review_common.migrate import migrate
-from review_common.repository import PostgresReviewRepository, make_pool
+from review_common.repository import LIST_FIELDS, PostgresReviewRepository, make_pool
 from review_worker.graph import Deps, build_graph
 from review_worker.handler import ReviewHandler
 
@@ -174,6 +174,13 @@ async def test_repository_on_postgres(pool: Any) -> None:
     assert (await repo.get_review("rv_c"))["status"] == "waiting_ci"
     assert await repo.supersede_open(repository=REPO, pr_number=10, superseded_by=None) == ["rv_c"]  # intake 로 간 커밋
     assert (await repo.get_review("rv_c"))["superseded_by"] is None
+
+    # 승인 화면 목록: 상태 필터, 최신순, limit, 목록 필드만
+    listed = await repo.list_reviews(["committed", "received"], 10)
+    assert [r["review_id"] for r in listed] == ["rv_b", "rv_2"]
+    assert set(listed[0]) == set(LIST_FIELDS) and listed[0]["pr_number"] == 9
+    assert [r["review_id"] for r in await repo.list_reviews(["committed", "received"], 1)] == ["rv_b"]
+    assert [r["review_id"] for r in await repo.list_reviews([], 2)] == ["rv_c", "rv_b"]
 
 
 async def test_spec_intakes_on_postgres(pool: Any) -> None:
