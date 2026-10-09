@@ -8,9 +8,9 @@
 | 항목 | 근거 |
 |---|---|
 | image | CI 워크플로의 ghcr.io 이미지 경로, platforms·--platform (없으면 ubuntu 러너 = amd64) |
-| runtime | Dockerfile 최종 스테이지 EXPOSE(하나), HEALTHCHECK 의 http://localhost:<그 포트>/경로 |
+| runtime | Dockerfile 최종 스테이지 EXPOSE(하나), HEALTHCHECK 의 http://localhost:<그 포트>/경로 — 없으면 소스의 /readyz·/livez·/healthz 같은 헬스 라우트 |
 | database | package.json·requirements.txt·pyproject.toml·go.mod 의 DB 드라이버. 드라이버가 있으면 배치를 몰라 비워 둔다 |
-| secrets | 소스가 읽는 환경변수 이름 — 비밀로 보이는 이름이 있으면 어디서 읽을지 몰라 비워 둔다 |
+| secrets | 소스가 읽는 환경변수 이름(구조 분해 포함) — 비밀로 보이는 이름이 있으면 어디서 읽을지 몰라 비워 둔다. 세션·쿠키·CSRF·JWT 서명 키는 generated |
 | storage | Dockerfile VOLUME, 파일 쓰기 호출, 업로드·오브젝트 스토리지 의존성 |
 | requirements | DB 없음 + 저장소 없음일 때만 persistence=false |
 | smoke | 테스트 파일이 하나도 없을 때만 — readiness 경로 + 소스의 헬스·정보성 고정 GET 라우트 (Express·FastAPI·Flask·net/http·gin) |
@@ -29,7 +29,7 @@ from typing import Any
 from review_ai.preparation import GenerationContext
 from review_ai.secrets_pattern import is_secret_name
 from review_ai.spec.deploy_spec import (
-    BASE_RESOURCES, Database, Health, Image, Requirements, Runtime, Smoke, Storage,
+    BASE_RESOURCES, Database, Health, Image, Requirements, Runtime, SecretRef, Smoke, Storage,
 )
 
 MANIFESTS = ("package.json", "requirements.txt", "pyproject.toml", "go.mod")
@@ -90,6 +90,10 @@ ENV_READS = (
     re.compile(r"os\.getenv\(\s*['\"](\w+)['\"]"),
     re.compile(r"os\.(?:Getenv|LookupEnv)\(\s*\"(\w+)\""),
 )
+# const { A, B: b, C = 'x' } = process.env — 이름이 코드에 있는 읽기. ...rest 는 이름을 모른다
+ENV_DESTRUCTURE = re.compile(r"(?:const|let|var)\s*\{([^{}]*)\}\s*=\s*process\.env\b(?!\s*[.\[])")
+# 배포마다 무작위로 만들어도 되는 앱 내부 서명 키 — 외부 서비스 키(STRIPE_SECRET_KEY 등)는 사람이 값을 정한다
+GENERATABLE_SECRET = re.compile(r"(?:SESSION|COOKIE|CSRF|JWT)_(?:SECRET|KEY)")
 # 이름을 코드에서 알 수 없는 읽기 — process.env 통째로 넘기기, 변수 키, 설정 클래스
 DYNAMIC_ENV = re.compile(
     r"process\.env(?![.\[\w])|process\.env\[\s*[^'\"\s]|os\.environ(?!\s*\[\s*['\"]|\.get\(\s*['\"]|\w)"
@@ -318,7 +322,15 @@ def _image(repository: str, workflows: Mapping[str, str]) -> Decision:
     return Image(repository=usable[0], platforms=tuple(arches)), Finding(path, source, f"{usable[0]}, {how}", True)
 
 
-def _runtime(docker: _Docker | None) -> Decision:
+READINESS_ROUTES = ("/readyz", "/readiness", "/ready", "/healthz", "/health")
+LIVENESS_ROUTES = ("/livez", "/liveness", "/live", "/healthz", "/health")
+
+
+def _get_routes(sources: Mapping[str, str]) -> set[str]:
+    return {m.group(1) for text in sources.values() for pattern in GET_ROUTES for m in pattern.finditer(text)}
+
+
+def _runtime(docker: _Docker | None, sources: Mapping[str, str]) -> Decision:
     path = "/runtime"
     if docker is None:
         return None, Finding(path, "-", "루트 Dockerfile 이 없어 포트를 알 수 없다", False)
@@ -328,7 +340,15 @@ def _runtime(docker: _Docker | None) -> Decision:
     port = docker.ports[0]
     url = LOCAL_URL.search(docker.healthcheck or "")
     if url is None or int(url.group(1) or 80) != port:
-        note = "HEALTHCHECK 에 이 포트의 HTTP 경로가 없어 probe 는 비워 둔다"
+        # HEALTHCHECK 가 없으면 소스에 이름이 분명한 헬스 라우트가 있을 때만 쓴다 (/readyz·/livez 등)
+        routes = _get_routes(sources)
+        readiness = next((r for r in READINESS_ROUTES if r in routes), None)
+        liveness = next((r for r in LIVENESS_ROUTES if r in routes), None)
+        if readiness or liveness:
+            found = " · ".join(f"{k} {v}" for k, v in (("readiness", readiness), ("liveness", liveness)) if v)
+            return (Runtime(port=port, health=Health(readiness=readiness, liveness=liveness), resources=BASE_RESOURCES),
+                    Finding(path, "Dockerfile, 소스", f"EXPOSE {port}, 소스 라우트 {found}", True))
+        note = "HEALTHCHECK·소스 헬스 라우트에 이 포트의 HTTP 경로가 없어 probe 는 비워 둔다"
         return Runtime(port=port, resources=BASE_RESOURCES), Finding(path, "Dockerfile", f"EXPOSE {port} — {note}", True)
     probe = url.group(2) or "/"
     return (Runtime(port=port, health=Health(readiness=probe, liveness=probe), resources=BASE_RESOURCES),
@@ -369,6 +389,21 @@ def _storage(docker: _Docker | None, deps: _Deps, sources: Mapping[str, str], ga
     return Storage(), Finding(path, f"소스 {len(sources)}개", "VOLUME·파일 쓰기·스토리지 의존성이 없다", True)
 
 
+def _env_reads(text: str) -> tuple[set[str], bool]:
+    """소스 하나가 읽는 환경변수 이름, 그리고 이름을 알 수 없는 읽기가 있는지."""
+    names = {m.group(1) for pattern in ENV_READS for m in pattern.finditer(text)}
+    dynamic = False
+    for m in ENV_DESTRUCTURE.finditer(text):
+        for item in m.group(1).split(","):
+            item = item.strip()
+            if item.startswith("..."):
+                dynamic = True
+            elif ident := re.match(r"[A-Za-z_]\w*", item):
+                names.add(ident.group(0))
+    rest = ENV_DESTRUCTURE.sub("", text)
+    return names, dynamic or bool(DYNAMIC_ENV.search(rest))
+
+
 def _secrets(docker: _Docker | None, deps: _Deps, sources: Mapping[str, str], gap: str | None) -> Decision:
     path = "/secrets"
     if gap:
@@ -376,14 +411,19 @@ def _secrets(docker: _Docker | None, deps: _Deps, sources: Mapping[str, str], ga
     if libs := _matches(deps.names, ENV_LIBS):
         return None, Finding(path, ", ".join(deps.manifests),
                              f"설정 라이브러리 {_bare(libs)} 가 환경변수를 읽는다 — 필요한 시크릿을 알 수 없다", False)
-    if dynamic := [p for p, text in sources.items() if DYNAMIC_ENV.search(text)]:
+    reads = {p: _env_reads(text) for p, text in sources.items()}
+    if dynamic := [p for p, (_, unknown) in reads.items() if unknown]:
         return None, Finding(path, ", ".join(dynamic), "환경변수를 이름 없이 읽는다 — 필요한 시크릿을 알 수 없다", False)
-    names = {m.group(1) for text in sources.values() for pattern in ENV_READS for m in pattern.finditer(text)}
-    names |= set(docker.env_names if docker else ())
-    if secret := sorted(n for n in names if is_secret_name(n)):
+    names = {n for found, _ in reads.values() for n in found} | set(docker.env_names if docker else ())
+    secret = sorted(n for n in names if is_secret_name(n))
+    if undecided := [n for n in secret if not GENERATABLE_SECRET.fullmatch(n)]:
         return None, Finding(path, f"소스 {len(sources)}개",
-                             f"비밀로 보이는 환경변수 {', '.join(secret)} — 어디서 읽을지(source·key)를 정해야 한다", False)
+                             f"비밀로 보이는 환경변수 {', '.join(undecided)} — 어디서 읽을지(source·key)를 정해야 한다", False)
     read = ", ".join(sorted(names)) or "없음"
+    if secret:
+        refs = tuple(SecretRef(name=n, source="generated") for n in secret)
+        why = f"읽는 환경변수({read}) 중 {', '.join(secret)} 는 앱 내부 서명 키라 배포 때 무작위로 만든다(generated)"
+        return refs, Finding(path, f"소스 {len(sources)}개", why, True)
     return (), Finding(path, f"소스 {len(sources)}개", f"읽는 환경변수({read}) 중 비밀로 보이는 이름이 없다", True)
 
 
@@ -399,8 +439,7 @@ def _smoke(tree: Sequence[str], runtime: Runtime | None, sources: Mapping[str, s
         more = f" 외 {len(tests) - 2}개" if len(tests) > 2 else ""
         return None, Finding(path, ", ".join(tests[:2]) + more, "테스트가 있어 배포 뒤 확인 경로를 만들지 않는다", True)
     readiness = runtime.health.readiness if runtime else None
-    routes = sorted({m.group(1) for text in sources.values() for pattern in GET_ROUTES for m in pattern.finditer(text)
-                     if PROBE_LIKE.search(m.group(1))})
+    routes = sorted(r for r in _get_routes(sources) if PROBE_LIKE.search(r))
     paths = list(dict.fromkeys([*([readiness] if readiness else []), *routes]))[:MAX_SMOKE_PATHS]
     if not paths:
         return None, Finding(path, f"소스 {len(sources)}개", "테스트도, 확인할 GET 경로도 찾지 못했다", False)
@@ -441,7 +480,7 @@ def analyze_repository(base: GenerationContext, tree: Iterable[str], files: Mapp
     workflows = {p: text for p, text in files.items() if _is_workflow(p)}
 
     image, f_image = _image(base.repository, workflows)
-    runtime, f_runtime = _runtime(docker)
+    runtime, f_runtime = _runtime(docker, sources)
     database, f_database = _database(deps, sources, gap)
     storage, f_storage = _storage(docker, deps, sources, gap)
     secrets, f_secrets = _secrets(docker, deps, sources, gap)
