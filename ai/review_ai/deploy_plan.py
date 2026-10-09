@@ -25,11 +25,18 @@ def migration_hook(change: SchemaChange) -> Hook:
     return "PostSync" if change == "contract" else "PreSync"
 
 
+def is_breaking(spec: AppSpec) -> bool:
+    """선언이 breaking 이거나, 파이프라인이 본 새 SQL 이 breaking 이다(선언과 무관하게 — RUN-008 이 선언을 고친다)."""
+    migration = spec.database.migration
+    observed = getattr(spec, "observed", None)
+    return (migration is not None and migration.change == "breaking") or (
+        observed is not None and observed.schema_change == "breaking")
+
+
 def mixed_versions_unsafe(spec: AppSpec, previous: AppSpec | None) -> str | None:
     """옛 버전과 새 버전이 함께 돌면 안 되는 이유. 함께 돌아도 되면 None."""
-    migration = spec.database.migration
-    if migration is not None and migration.change == "breaking":
-        return "스키마를 옛 코드와 호환되지 않게 바꾼다 (database.migration.change: breaking)"
+    if is_breaking(spec):
+        return "스키마를 옛 코드와 호환되지 않게 바꾼다 (breaking)"
     if previous is None or previous.database.engine == "none":
         return None
     old, new = previous.database, spec.database

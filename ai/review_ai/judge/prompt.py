@@ -35,6 +35,7 @@ RULE_PATCH_PATHS: dict[str, tuple[str, ...]] = {
     "STO-004": ("/storage/buckets/*/encryption",),
     "RUN-005": ("/runtime/resources/cpu_limit", "/runtime/resources/memory_limit"),
     "RUN-007": ("/rollout/strategy",),
+    "RUN-008": ("/database/migration/change",),
 }
 
 SYSTEM_PROMPT = f"""당신은 Kubernetes 배포 명세(deploy_spec) 검토 보조자다. 정적 검사가 이미 찾은 문제(findings)를 설명하고,

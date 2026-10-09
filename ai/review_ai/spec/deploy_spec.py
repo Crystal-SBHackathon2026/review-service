@@ -276,10 +276,28 @@ class Baseline(_Frozen):
     facts: BaselineFacts = BaselineFacts()
 
 
+class Observed(_Frozen):
+    """파이프라인이 이번 커밋에서 관측한 사실 — 배포된 커밋 이후 새로 생긴 마이그레이션 SQL 의 판정 (review_ai.migrations)."""
+
+    schema_change: SchemaChange
+    migrations: tuple[str, ...] = ()   # 새 마이그레이션 파일 경로
+    evidence: tuple[str, ...] = ()     # 판정에 쓴 문 ("<파일>: <판정> <문 앞부분>")
+
+
+# 사용자가 쓰지 않고 파이프라인이 채우는 최상위 필드 — 사람·LLM 이 고칠 수 없고, 최종 명세·메시지에 싣지 않는다
+PIPELINE_FIELDS = ("baseline", "observed")
+
+
+def user_fields(spec: dict) -> dict:  # type: ignore[type-arg]
+    """파이프라인 필드를 뺀 명세 — 앱 레포 deploy.yaml·업무 DB final_spec·Kafka 메시지에 들어가는 모양."""
+    return {k: v for k, v in spec.items() if k not in PIPELINE_FIELDS}
+
+
 class DeploySpec(AppSpec):
-    """State.deploy_spec 에 들어가는 전체. baseline 은 파이프라인이 채운다."""
+    """State.deploy_spec 에 들어가는 전체. baseline·observed 는 파이프라인이 채운다."""
 
     baseline: Baseline | None = None
+    observed: Observed | None = None
 
     @model_validator(mode="after")
     def _baseline_same_app(self) -> DeploySpec:

@@ -9,7 +9,7 @@ from typing import Any
 
 from review_ai.patching import PatchError, apply_ops, parse_pointer, path_under
 from review_ai.secrets_pattern import MASK
-from review_ai.spec.deploy_spec import BASE_RESOURCES, DeploySpec, Volume
+from review_ai.spec.deploy_spec import BASE_RESOURCES, PIPELINE_FIELDS, DeploySpec, Volume
 from review_ai.state import Finding, Patch
 from review_ai.static_check import run_static_check
 
@@ -102,6 +102,9 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
         elif rule == "RUN-005":
             ops = _resource_limit_ops(spec, before)
             why = "gitops base 와 같은 리소스 상한(250m / 128Mi)을 채움"
+        elif rule == "RUN-008" and path.endswith("/change") and before.observed is not None:
+            ops = [{"op": "replace", "path": path, "value": before.observed.schema_change}]
+            why = "새 마이그레이션 SQL 판정에 맞춰 스키마 변경 종류를 고침 — 실행 시점·전략이 따라온다"
         elif rule == "RUN-007":
             ops = [{"op": "add", "path": "/rollout", "value": {**spec.get("rollout", {}), "strategy": "bluegreen"}}]
             why = "두 버전이 섞여 요청을 받지 않도록 미리보기 확인 뒤 한 번에 전환(bluegreen)"
@@ -171,8 +174,8 @@ def resolve_human_decision(state: dict[str, Any], human: dict[str, Any]) -> dict
     unanswered: list[str] = []
     for op in human.get("edited_ops") or []:
         path = op["path"]
-        if parse_pointer(path)[0] == "baseline":
-            raise PatchError("baseline은 사람이 수정할 수 없다")
+        if parse_pointer(path)[0] in PIPELINE_FIELDS:
+            raise PatchError(f"{parse_pointer(path)[0]}은 사람이 수정할 수 없다")
         if op["op"] != "remove" and ("value" not in op or isinstance(op["value"], str) and not op["value"].strip()):
             unanswered.append(path)
         else:
@@ -195,8 +198,8 @@ def resolve_human_decision(state: dict[str, Any], human: dict[str, Any]) -> dict
     defaults = [op for op in defaults if not any(path_under(op["path"], given["path"]) for given in supplied)]
     ops = defaults + supplied
     for op in ops:
-        if parse_pointer(op["path"])[0] == "baseline":
-            raise PatchError("baseline은 수정할 수 없다")
+        if parse_pointer(op["path"])[0] in PIPELINE_FIELDS:
+            raise PatchError(f"{parse_pointer(op['path'])[0]}은 수정할 수 없다")
     DeploySpec.model_validate(apply_ops(state["deploy_spec"], ops))
     return {**copy.deepcopy(human), "edited_ops": ops,
             "defaulted_ops": copy.deepcopy(human.get("defaulted_ops", defaults))}

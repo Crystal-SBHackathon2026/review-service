@@ -9,7 +9,7 @@
 |---|---|
 | `review_ai/spec/deploy_spec.py` | Pydantic 모델(정본). 형식 검사와 `load_spec()` |
 | `schema/deploy_spec.schema.json` | 위 모델에서 내보낸 JSON Schema. 파이프라인 쪽 FastAPI 나 다른 언어가 쓸 수 있다 |
-| `catalog/rules.yaml` | 정적 검사 규칙 28개 (P0 12 + P1 16, 전부 구현 — RUN-003 은 10/09 폐기) |
+| `catalog/rules.yaml` | 정적 검사 규칙 29개 (P0 12 + P1 17, 전부 구현 — RUN-003 은 10/09 폐기) |
 | `catalog/targets.yaml` | 대상 환경 능력표 (aws·gcp·local). aws 만 실측(10/08) |
 | `samples/*.yaml` | 샘플 명세 10개 |
 | `samples/cases.yaml` | 샘플별 기대 finding·verdict·사유 |
@@ -41,6 +41,7 @@ storage:  {volumes: [{name, mount_path, size, persistent, access_mode}], buckets
 rollout:  {strategy: canary|bluegreen}         # 생략하면 canary
 smoke:    {paths: [/healthz, ..]} | null        # 배포 뒤 클러스터 안에서 GET 할 경로 (최대 10)
 baseline: {spec_ref, spec: <이전 명세>, facts: {database_has_data, observed_at}} | null   # 파이프라인이 채움
+observed: {schema_change, migrations: [..], evidence: [..]} | null   # 파이프라인이 채움 — 배포된 커밋 이후 새 SQL 판정
 ```
 
 필드 이름은 State 와 맞춰 snake_case 로 했다. 카테고리(database·secret·network·storage)가 그대로 블록이라
@@ -71,6 +72,9 @@ baseline: {spec_ref, spec: <이전 명세>, facts: {database_has_data, observed_
 - 마이그레이션 Job 은 앱과 같은 이미지로 돈다 — kustomize `replacements` 가 Rollout 컨테이너 이미지(CI 가 태그를 쓴 값)를 복사한다.
   재시도 없음(`backoffLimit: 0`), 5분 제한, env·시크릿은 앱 컨테이너와 같다.
 - 생성 명세(prepare_spec)도 같은 함수(`choose_strategy`)로 전략을 고른다.
+- 워커는 검토 전에 배포된 커밋(baseline merge_sha) 이후 새로 생긴 `migrations/*.sql` 을 문장별로 판정해 `observed` 에 넣는다
+  (`review_ai/migrations.py` — 추가만 expand, 제거만 contract, 이름·타입 변경·NOT NULL·제약 추가·삭제 문·모르는 문은 breaking,
+  섞이면 breaking). 선언과 다르면 RUN-008 이 선언을 고치고(자동 수정), SQL 이 breaking 이면 RUN-006·007 이 바로 걸린다.
 - `database.data_import` 가 있으면 PreSync Job(sync-wave 1, 마이그레이션 다음)이 볼륨의 SQLite 파일(+WAL)을 복사해 CSV 로 덤프하고
   Postgres 에 있는 테이블만 외래 키 순서로 한 트랜잭션에서 옮긴다(id 시퀀스 맞춤). `data_import_log` 표식으로 한 번만 옮긴다.
   데이터 있는 SQLite 에서 엔진을 바꾸는데 이 값이 없으면 DB-009 (사람 확인).
@@ -91,9 +95,9 @@ evidence 에도 값을 남기지 않는다. `source: generated` 는 배포 시 �
 | secret | SEC-001 평문 비밀 · SEC-005 DB 접속 시크릿 없음 | SEC-002 대상 환경에 없는 비밀 저장소 · SEC-003 시크릿 이름 중복 · SEC-004 env·secrets 이름 중복 |
 | network | NET-001 TLS 없음 (low) | NET-002 내부 전용인데 전체 대역 허용 |
 | storage | STO-001 접근 모드 미지원 · STO-003 공개 버킷 · STO-005 볼륨 축소 | STO-002 RWO 볼륨 복제 · STO-004 버킷 암호화 꺼짐 · STO-006 persistent 볼륨 제거 |
-| runtime | RUN-001 readiness 없음 · RUN-004 아키텍처 불일치 | RUN-002 liveness 없음 (low) · RUN-005 리소스 상한 없음 (low) · RUN-006 호환 안 되는 스키마 변경 · RUN-007 두 버전이 함께 돌면 안 되는데 canary |
+| runtime | RUN-001 readiness 없음 · RUN-004 아키텍처 불일치 | RUN-002 liveness 없음 (low) · RUN-005 리소스 상한 없음 (low) · RUN-006 호환 안 되는 스키마 변경 · RUN-007 두 버전이 함께 돌면 안 되는데 canary · RUN-008 마이그레이션 SQL 과 선언 불일치 |
 
-카탈로그의 규칙 28개를 모두 구현했다. RUN-003(이미지 digest 고정 없음)은 폐기했다 — 배포 이미지는 CI 가 gitops base 에
+카탈로그의 규칙 29개를 모두 구현했다. RUN-003(이미지 digest 고정 없음)은 폐기했다 — 배포 이미지는 CI 가 gitops base 에
 커밋 SHA 태그로 고정하고 명세의 `image.tag`·`digest` 는 렌더러가 쓰지 않는다. 병합 전 PR 에는 digest 가 아직 없어 모든 검토에 고칠 수 없는 경고가 붙는다.
 
 `autofix` 는 규칙에 `allowed` / `forbidden` / `when_no_data` 로 적고, Finding 을 만들 때 인스턴스마다 `allowed` 나 `forbidden` 으로 확정한다.

@@ -292,7 +292,7 @@ rules:
     priority: P1
     providers: [any]
     title: 옛 코드와 함께 돌 수 없는 스키마 변경을 한 번에 배포
-    check: database.migration.change 가 breaking 이다 (이름·타입 변경 등)
+    check: database.migration.change 가 breaking 이거나, 파이프라인이 본 새 마이그레이션 SQL(observed)이 breaking 이다 (이름·타입 변경 등)
     fix: expand(새 컬럼 추가·양쪽 쓰기) → contract(옛 컬럼 제거) 두 배포로 나눈다. 한 번에 해야 하면 bluegreen 으로 바꾸고 전환 전 오류 구간을 사람이 승인한다
 
   - id: RUN-007
@@ -302,5 +302,15 @@ rules:
     priority: P1
     providers: [any]
     title: 두 버전이 함께 돌면 안 되는데 canary 배포
-    check: rollout.strategy 가 canary 이고, migration.change 가 breaking 이거나 이전 배포와 DB 엔진·배치가 다르다
+    check: rollout.strategy 가 canary 이고, 스키마 변경이 breaking(선언 또는 새 SQL)이거나 이전 배포와 DB 엔진·배치가 다르다
     fix: rollout.strategy 를 bluegreen 으로 — 미리보기에서 확인한 뒤 한 번에 전환해 두 버전이 섞이는 구간을 없앤다
+
+  - id: RUN-008
+    category: runtime
+    severity: high
+    autofix: allowed
+    priority: P1
+    providers: [any]
+    title: 마이그레이션 SQL 과 선언한 스키마 변경이 다르다
+    check: observed.schema_change(배포된 커밋 이후 새 migrations/*.sql 판정)가 database.migration.change 와 다르다 (선언이 breaking 이면 통과). postgres·mysql 인데 migration 이 없으면 사람 확인
+    fix: database.migration.change 를 SQL 판정 값으로 — 실행 시점(PreSync·PostSync)과 전략(RUN-006·007)이 그 값을 따른다

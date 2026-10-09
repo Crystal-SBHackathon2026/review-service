@@ -82,6 +82,8 @@ def _ops_for(finding: Finding, spec: dict[str, Any], env: str) -> list[dict[str,
         return _db005_ops(spec)
     if rule == "RUN-007":
         return _bluegreen_ops(spec)
+    if rule == "RUN-008" and path.endswith("/change"):
+        return [_op("replace", path, spec["observed"]["schema_change"])]
     return []
 
 

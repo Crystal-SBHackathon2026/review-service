@@ -75,7 +75,7 @@ async def run() -> None:
                     commit_overlay=make_commit_overlay(GitHubGitClient(github)),  # gitops 레포: GITOPS_REPO
                     ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None)
         graph = build_graph(deps, checkpointer)
-        handler = ReviewHandler(repo, graph)
+        handler = ReviewHandler(repo, graph, files=github)
         await consumer.start()
         log.info("review-worker 시작: %s", consumer.subscription())
         while not stop.is_set():
