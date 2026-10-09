@@ -13,18 +13,24 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Mapping, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Protocol
 
 import yaml
 from pydantic import ValidationError
 
-from review_ai.overlay import render_overlay
+from review_ai.overlay import RenderedOverlay, render_overlay
 from review_ai.patching import apply_ops
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.state import DeployResult, ReviewState
 from review_ai.verdict import applied_ops
 
-__all__ = ["GitClient", "make_commit_overlay", "commit_message"]
+__all__ = ["GitClient", "make_commit_overlay", "make_overlay_guard", "commit_message", "removed_protected",
+           "PROTECTED_OVERLAY_FILES", "OVERLAY_RESOURCE_REMOVED"]
+
+# 지금 배포에 있는데 렌더 결과에서 사라지면 안 되는 overlay 파일. 사라지면 Argo CD prune 이 실제 리소스를 지운다.
+# 10/09 sample-app#11: network: {} 명세 → ingress.yaml 삭제 → ALB 삭제(10분 장애, 주소 변경). 볼륨(pvc-*) 등은 여기에 더한다.
+PROTECTED_OVERLAY_FILES: tuple[str, ...] = ("ingress.yaml",)
+OVERLAY_RESOURCE_REMOVED = "OVERLAY_RESOURCE_REMOVED"
 
 
 class GitClient(Protocol):
@@ -32,6 +38,10 @@ class GitClient(Protocol):
 
     async def read_file(self, repository: str, path: str, ref: str) -> str:
         """앱 레포의 특정 커밋에서 파일 내용을 읽는다. 없으면 FileNotFoundError."""
+        ...
+
+    async def list_files(self, directory: str) -> list[str]:
+        """gitops 레포 main 의 directory 바로 아래 파일 이름. 디렉터리가 없으면 빈 목록."""
         ...
 
     async def commit_files(
@@ -68,47 +78,83 @@ def _committed(sha: str) -> dict[str, Any]:
     return {"deploy_result": result}
 
 
+def removed_protected(existing: Iterable[str], rendered_files: Mapping[str, str]) -> list[str]:
+    """지금 overlay 에 있는데 렌더 결과에는 없는 보호 파일."""
+    present = set(existing)
+    return [name for name in PROTECTED_OVERLAY_FILES if name in present and name not in rendered_files]
+
+
+def removed_reason(removed: list[str]) -> str:
+    return f"{OVERLAY_RESOURCE_REMOVED}: {', '.join(removed)}"
+
+
+async def _render(git: GitClient, state: ReviewState) -> tuple[RenderedOverlay, DeploySpec] | dict[str, Any]:
+    """원본 명세 + applied_ops → overlay. 렌더링까지 못 가면 _blocked 결과를 돌려준다."""
+    spec_ref = state["spec_ref"]
+    repository, source_commit, path = spec_ref["repository"], spec_ref["commit"], spec_ref["path"]
+
+    # ① 수정 지시서. state["patch"] 는 fix 루프를 돌면 비어 있으므로 쓰지 않는다.
+    ops = applied_ops(state)
+
+    # ② 원본 명세. Kafka 메시지의 명세는 비밀값이 가려져 있어 렌더러가 거절한다.
+    try:
+        raw = await git.read_file(repository, path, source_commit)
+    except FileNotFoundError:
+        return _blocked(f"명세 파일을 찾을 수 없습니다: {repository}@{source_commit[:7]}:{path}")
+
+    # ③ ops 적용 → 명세 검증 → overlay 렌더링
+    try:
+        spec = DeploySpec.model_validate(apply_ops(yaml.safe_load(raw), ops))
+    except ValidationError as e:
+        # 검토를 통과한 ops 가 형식에 안 맞는 명세를 만든 경우다. 배포를 멈추고
+        # 사유를 돌려준다. 워커가 죽지 않고 대시보드에 이유가 남는 쪽을 택했다.
+        return _blocked(f"수정을 적용한 명세가 형식에 맞지 않습니다: {e.error_count()}건")
+    return render_overlay(spec), spec
+
+
+def make_overlay_guard(git: GitClient) -> Callable[[ReviewState], Awaitable[str | None]]:
+    """병합 전 검사 — 지금 배포 중인 보호 리소스(ingress 등)를 지우는 명세면 사유, 아니면 None.
+
+    병합 뒤 commit_overlay 에서야 막으면 앱 레포는 병합됐는데 배포는 안 된 상태가 남는다. 그래서 merge_pr 전에 본다.
+    렌더링까지 못 가는 명세(파일 없음·형식 오류)는 여기서 막지 않는다 — commit_overlay 가 같은 사유로 blocked 한다.
+    """
+
+    async def guard(state: ReviewState) -> str | None:
+        out = await _render(git, state)
+        if isinstance(out, dict):
+            return None
+        rendered, _ = out
+        removed = removed_protected(await git.list_files(rendered.directory), rendered.files)
+        return removed_reason(removed) if removed else None
+
+    return guard
+
+
 def make_commit_overlay(
     git: GitClient,
 ) -> Callable[[ReviewState], Awaitable[dict[str, Any]]]:
     """그래프에 끼울 commit_overlay 노드를 만든다. 바뀐 필드(deploy_result)만 돌려준다."""
 
     async def commit_overlay(state: ReviewState) -> dict[str, Any]:
-        spec_ref = state["spec_ref"]
-        repository, source_commit, path = (
-            spec_ref["repository"],
-            spec_ref["commit"],
-            spec_ref["path"],
-        )
-
-        # ① 수정 지시서. state["patch"] 는 fix 루프를 돌면 비어 있으므로 쓰지 않는다.
-        ops = applied_ops(state)
-
-        # ② 원본 명세. Kafka 메시지의 명세는 비밀값이 가려져 있어 렌더러가 거절한다.
-        try:
-            raw = await git.read_file(repository, path, source_commit)
-        except FileNotFoundError:
-            return _blocked(f"명세 파일을 찾을 수 없습니다: {repository}@{source_commit[:7]}:{path}")
-
-        # ③ ops 적용 → 명세 검증 → overlay 렌더링
-        try:
-            spec = DeploySpec.model_validate(apply_ops(yaml.safe_load(raw), ops))
-        except ValidationError as e:
-            # 검토를 통과한 ops 가 형식에 안 맞는 명세를 만든 경우다. 배포를 멈추고
-            # 사유를 돌려준다. 워커가 죽지 않고 대시보드에 이유가 남는 쪽을 택했다.
-            return _blocked(f"수정을 적용한 명세가 형식에 맞지 않습니다: {e.error_count()}건")
-
-        rendered = render_overlay(spec)
+        out = await _render(git, state)
+        if isinstance(out, dict):
+            return out
+        rendered, spec = out
 
         # ④ 배포가 깨지거나 명세가 요구한 보호가 빠지는 경고가 있으면 커밋하지 않는다.
         if rendered.blocking:
             reason = " / ".join(f"[{w.code}] {w}" for w in rendered.blocking)
             return _blocked(reason)
 
+        # ⑤ 지금 배포 중인 보호 리소스를 지우는 커밋은 하지 않는다. 병합 전에도 보지만, 그 뒤 gitops 가 바뀌었을 수 있다.
+        removed = removed_protected(await git.list_files(rendered.directory), rendered.files)
+        if removed:
+            return _blocked(removed_reason(removed))
+
         sha = await git.commit_files(
             rendered.directory,
             rendered.files,
-            commit_message(spec.metadata.name, spec.target.env, source_commit),
+            commit_message(spec.metadata.name, spec.target.env, state["spec_ref"]["commit"]),
         )
         return _committed(sha)
 

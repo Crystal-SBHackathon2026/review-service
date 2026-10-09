@@ -131,3 +131,17 @@ async def test_read_file_missing_is_file_not_found() -> None:
 
 def test_blob_sha_matches_git() -> None:
     assert git_blob_sha("hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"  # git hash-object
+
+
+async def test_list_files_only_direct_children_of_directory() -> None:
+    api = FakeGitHubApi({f"{DIR}/kustomization.yaml": "k", f"{DIR}/ingress.yaml": "i", f"{DIR}/sub/x.yaml": "x",
+                         "apps/sample-app/base/rollout.yaml": "r"})
+    assert await client(api).list_files(DIR) == ["ingress.yaml", "kustomization.yaml"]
+    assert await client(api).list_files("apps/new-app/overlays/aws") == []
+
+
+async def test_list_files_server_error_is_transient() -> None:
+    api = FakeGitHubApi({})
+    api.server_errors = 1
+    with pytest.raises(TransientError):
+        await client(api).list_files(DIR)

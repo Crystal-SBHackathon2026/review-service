@@ -475,9 +475,13 @@ async def test_graph_exception_marks_failed() -> None:
 class FakeGitClient:
     """GitClient — 앱 레포는 FakeGitHub 파일, gitops 커밋은 메모리. 처음 fail_times 번은 TransientError."""
 
-    def __init__(self, github: Any, fail_times: int = 0) -> None:
+    def __init__(self, github: Any, fail_times: int = 0, existing: list[str] | None = None) -> None:
         self.github, self.fail_times = github, fail_times
         self.commits: list[tuple[str, dict[str, str], str]] = []
+        self.existing = existing or []  # gitops 에 지금 있는 overlay 파일 (기본: 새 앱)
+
+    async def list_files(self, directory: str) -> list[str]:
+        return list(self.existing)
 
     async def read_file(self, repository: str, path: str, ref: str) -> str:
         return self.github.files[ref]
@@ -659,3 +663,67 @@ async def test_next_review_of_same_rule_gets_case_as_evidence() -> None:
     assert docs.index(case_docs[0]) > 0  # 규칙 문서가 먼저
     assert "지난 검토 rv_first" in prompts[-1] and SECRET not in prompts[-1]
     assert h.row("rv_second")["decision"]["validation"]["citations_ok"]
+
+
+# --- 배포 중인 ingress 를 지우는 변경 막기 (10/09 sample-app#11 장애) -----------------------------------
+
+def _guarded(existing: list[str]) -> tuple[Harness, FakeGitClient]:
+    from review_worker.commit_overlay import make_commit_overlay, make_overlay_guard
+
+    h = Harness()
+    git = FakeGitClient(h.github, existing=existing)
+    h.deps.commit_overlay = make_commit_overlay(git)
+    h.deps.overlay_guard = make_overlay_guard(git)
+    return h, git
+
+
+def _without_ingress() -> dict[str, Any]:
+    spec = load_sample(SAMPLE_01)
+    spec["network"] = {}  # intake 가 만든 명세처럼 — 공개 진입점이 빠졌다
+    return spec
+
+
+async def test_spec_dropping_live_ingress_is_not_merged() -> None:
+    h, git = _guarded(existing=["ingress.yaml", "kustomization.yaml"])
+    await h.request(_without_ingress())
+    await _finish_ci(h)
+
+    row = h.row()
+    assert (row["status"], row["error"]) == ("blocked", "OVERLAY_RESOURCE_REMOVED: ingress.yaml")
+    assert row["deploy_result"] == {"status": "blocked", "commit_sha": None,
+                                    "reason": "OVERLAY_RESOURCE_REMOVED: ingress.yaml"}
+    assert h.github.merged == [] and git.commits == []  # 앱 레포도 gitops 도 그대로
+    assert row["merge_sha"] is None
+
+
+async def test_spec_keeping_ingress_is_merged() -> None:
+    h, git = _guarded(existing=["ingress.yaml", "kustomization.yaml"])
+    await h.request(load_sample(SAMPLE_01))
+    await _finish_ci(h)
+
+    assert h.row()["status"] == "committed"
+    assert h.github.merged and "ingress.yaml" in git.commits[0][1]
+
+
+async def test_new_app_without_overlay_proceeds() -> None:
+    h, git = _guarded(existing=[])
+    await h.request(_without_ingress())
+    await _finish_ci(h)
+
+    assert h.row()["status"] == "committed"
+    assert h.github.merged and set(git.commits[0][1]) == {"kustomization.yaml"}
+
+
+async def test_commit_overlay_checks_again_after_merge() -> None:
+    """병합 전 검사를 지난 뒤 gitops 에 ingress 가 생겼다 — commit_overlay 가 한 번 더 막는다."""
+    from review_worker.commit_overlay import make_commit_overlay
+
+    h = Harness()
+    git = FakeGitClient(h.github, existing=["ingress.yaml"])
+    h.deps.commit_overlay = make_commit_overlay(git)  # 병합 전 검사는 없음(no_overlay_guard) — 그사이 바뀐 상황
+    await h.request(_without_ingress())
+    await _finish_ci(h)
+
+    row = h.row()
+    assert (row["status"], row["deploy_result"]["reason"]) == ("blocked", "OVERLAY_RESOURCE_REMOVED: ingress.yaml")
+    assert git.commits == []

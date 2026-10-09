@@ -8,7 +8,7 @@
                           승인              → await_ci (AI 가 고친 회차가 있으면 commit_fix)
                           거절              → END (rejected)
     pass + 수정 있음  → commit_fix → END (superseded — 수정 커밋을 autofix_commit 새 검토로)
-    pass + 수정 없음  → await_ci → check_ci ─ CI 끝남 → merge_pr → commit_overlay(gitops 커밋) → END
+    pass + 수정 없음  → await_ci → check_ci ─ CI 끝남 → guard_overlay → merge_pr → commit_overlay(gitops 커밋) → END
                                            └ 아직    → wait_ci ⏸ → (재개) 다시 확인, 다른 suite 가 남았으면 await_ci
 
 ⏸ 는 LangGraph interrupt. review.resumed 가 오면 같은 thread_id(review_id) 로 Command(resume=...) 재개한다.
@@ -71,6 +71,15 @@ COMMIT_OVERLAY_MAX_ATTEMPTS = 3  # commit_overlay 의 TransientError(네트워�
 CommitOverlay = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
+# review_worker.commit_overlay.make_overlay_guard(git) — 병합하면 안 되는 사유(지금 배포 중인 ingress 삭제 등) 또는 None
+OverlayGuard = Callable[[dict[str, Any]], Awaitable[str | None]]
+
+
+async def no_overlay_guard(state: dict[str, Any]) -> str | None:
+    """테스트용 — 검사하지 않는다. 실제 워커는 make_overlay_guard(GitHubGitClient) 를 쓴다."""
+    return None
+
+
 class GitHubPort(Protocol):
     async def get_file(self, repository: str, path: str, ref: str) -> str: ...
 
@@ -103,6 +112,7 @@ class Deps:
     llm: LlmClient | None
     retriever: Retriever
     commit_overlay: CommitOverlay = commit_overlay_stub
+    overlay_guard: OverlayGuard = no_overlay_guard
     ci_app_slug: str | None = "github-actions"  # 이 GitHub App 의 check suite 만 CI 로 본다. None 이면 전부
     judge_max_retries: int = JUDGE_MAX_RETRIES
     retry_backoff_seconds: float = 1.0
@@ -291,7 +301,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     async def _after_ci(state: dict[str, Any], conclusion: str) -> Command:
         if conclusion != "success":
             return await _fail(state["review_id"], f"CI {conclusion} ({state['spec_ref']['commit']})")
-        return Command(goto="merge_pr")
+        return Command(goto="guard_overlay")
 
     async def await_ci(state: dict[str, Any]) -> dict[str, Any]:
         await repo.update_review(state["review_id"], status="waiting_ci", final_spec=app_spec(state["deploy_spec"]))
@@ -320,6 +330,25 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         if conclusion is None:
             return Command(goto="await_ci")
         return await _after_ci(state, conclusion)
+
+    async def guard_overlay(state: dict[str, Any]) -> Command:
+        """병합 전 — 지금 배포 중인 보호 리소스(ingress 등)를 지우는 명세면 병합하지 않고 blocked (10/09 sample-app#11 장애)."""
+        rid = state["review_id"]
+        for attempt in range(1, COMMIT_OVERLAY_MAX_ATTEMPTS + 1):
+            try:
+                reason = await deps.overlay_guard(state)
+                break
+            except TransientError as exc:
+                if attempt == COMMIT_OVERLAY_MAX_ATTEMPTS:
+                    raise
+                log.warning("review %s: overlay 검사 일시 오류 %d — %s", rid, attempt, exc)
+                await asyncio.sleep(deps.retry_backoff_seconds * 2**attempt)
+        if reason is None:
+            return Command(goto="merge_pr")
+        log.warning("review %s: 병합 안 함 — %s", rid, reason)
+        result = DeployResult(status="blocked", commit_sha=None, reason=reason)
+        await repo.update_review(rid, status="blocked", error=reason, deploy_result=result)
+        return Command(goto=END, update={"deploy_result": result})
 
     async def merge_pr(state: dict[str, Any]) -> Command:
         rid, ref = state["review_id"], state["spec_ref"]
@@ -360,8 +389,9 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     graph.add_node("apply_human_edits", apply_human_edits, destinations=("static_check", "await_human"))
     graph.add_node("commit_fix", commit_fix, destinations=(END,))
     graph.add_node("await_ci", await_ci)
-    graph.add_node("check_ci", check_ci, destinations=("wait_ci", "merge_pr", END))
-    graph.add_node("wait_ci", wait_ci, destinations=("await_ci", "merge_pr", END))
+    graph.add_node("check_ci", check_ci, destinations=("wait_ci", "guard_overlay", END))
+    graph.add_node("wait_ci", wait_ci, destinations=("await_ci", "guard_overlay", END))
+    graph.add_node("guard_overlay", guard_overlay, destinations=("merge_pr", END))
     graph.add_node("merge_pr", merge_pr, destinations=("commit_overlay", END))
     graph.add_node("commit_overlay", commit_overlay)
 

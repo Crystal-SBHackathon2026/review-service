@@ -24,7 +24,7 @@ from review_common.migrate import migrate
 from review_common.repository import PostgresReviewRepository, make_pool
 from review_common.resumed import TOPIC as RESUMED_TOPIC
 from review_common.settings import db_conninfo, kafka_bootstrap
-from review_worker.commit_overlay import make_commit_overlay
+from review_worker.commit_overlay import make_commit_overlay, make_overlay_guard
 from review_worker.graph import Deps, build_graph
 from review_worker.handler import ReviewHandler
 
@@ -75,8 +75,9 @@ async def run() -> None:
         await producer.start()
         # 규칙 문서(파일) → Qdrant 의미 검색(QDRANT_URL 이 있을 때, 실패하면 건너뜀) → 판단 사례
         retriever = make_retriever(CaseRetriever(repo), qdrant=qdrant_from_url(os.environ.get("QDRANT_URL")))
+        gitops = GitHubGitClient(github)  # gitops 레포: GITOPS_REPO
         deps = Deps(repo=repo, github=github, publisher=KafkaPublisher(), llm=make_llm(), retriever=retriever,
-                    commit_overlay=make_commit_overlay(GitHubGitClient(github)),  # gitops 레포: GITOPS_REPO
+                    commit_overlay=make_commit_overlay(gitops), overlay_guard=make_overlay_guard(gitops),
                     ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None)
         graph = build_graph(deps, checkpointer)
         handler = ReviewHandler(repo, graph, files=github)
