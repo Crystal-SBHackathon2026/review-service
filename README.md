@@ -50,6 +50,7 @@ docker compose --profile app up -d --build
 | `KAFKA_SEND_TIMEOUT` | API·워커 | 발행 한 건을 기다리는 상한(초). 기본 `5` — GitHub 웹훅 10초 안에 503 으로 답한다 |
 | `REVIEW_STALE_AFTER` | API | review sweep 이 멈췄다고 볼 시간(초). 기본 `600` — judge 최악(약 8분)보다 길게 |
 | `WORKER_ALIVE_FILE` | 워커 | livenessProbe 가 보는 파일. 기본 `/tmp/worker-alive` |
+| `METRICS_PORT` | 워커 | Prometheus `/metrics` 포트. 기본 `9100` (API 는 `8080/metrics`) |
 | `GITHUB_TOKEN` | API·워커 | API 는 deploy.yaml 읽기와 명세 생성 커밋(PR 브랜치 Contents 쓰기)·PR 커밋 상태(**Commit statuses 쓰기**, 없으면 표시만 빠진다). 워커는 CI 상태 조회·AI 수정 커밋·PR 병합·gitops overlay 커밋이라 앱 레포·gitops Contents·Pull requests **쓰기** 권한이 필요하다 (`oneaction/gitops-token`) |
 | `GITOPS_REPO` | 워커 | overlay 를 커밋할 gitops 레포. 기본 `Crystal-SBHackathon2026/gitops` |
 | `GITHUB_WEBHOOK_SECRET` | API | `/webhooks/github` HMAC 검증. 없으면 웹훅을 503 으로 거절 |
@@ -129,6 +130,38 @@ docker compose --profile app up -d --build
 - API `GET /healthz` — 프로세스만 본다 (ALB 헬스체크, livenessProbe). `GET /readyz` — DB `SELECT 1`·Kafka 브로커 연결, 실패하면 503 (readinessProbe)
 - 워커 — 메인 루프가 poll 마다(1초) `/tmp/worker-alive` 를 갱신한다. 메시지 처리 중에는 30초마다, `max_poll_interval` 까지.
   livenessProbe: `find /tmp/worker-alive -mmin -2 | grep -q .`
+
+## 지표 (Prometheus)
+
+`prometheus_client` 하나만 쓴다. API 는 `GET /metrics`(토큰 없이), 워커는 `:9100/metrics`. 접두사 `review_`.
+라벨은 값 종류가 적은 것만 — `review_id`·커밋 SHA·레포 경로는 넣지 않는다 (커밋 단위는 Grafana 커밋 타임라인, 업무 DB).
+지표 기록이 실패해도 요청·검토 처리에는 영향이 없다.
+
+| 이름 | 타입 | 라벨 | 뜻 |
+|---|---|---|---|
+| `review_http_requests_total` | counter | route, method, status | API 요청. route 는 경로 템플릿, 없는 경로는 `unmatched`. `/metrics`·`/healthz`·`/readyz` 제외 |
+| `review_http_request_duration_seconds` | histogram | route, method | API 처리 시간 |
+| `review_webhook_events_total` | counter | event, result | pull_request·check_suite·argocd / started·intake·skipped·duplicate·rejected·error |
+| `review_kafka_publish_total` | counter | topic, result | ok·timeout·error (API·워커 각자) |
+| `review_sweep_recovered_total` | counter | from_status | review sweep 이 회수한 검토 |
+| `review_sweep_failed_total` | counter | | 회수 3번을 넘어 failed |
+| `review_intake_sweep_recovered_total` | counter | | intake sweep 이 다시 처리한 intake |
+| `review_reviews` | gauge | app, env, status | 최근 1일 안에 바뀐 검토 수 (scrape 때 업무 DB, 15초 캐시, 실패하면 마지막 값) |
+| `review_needs_human_oldest_seconds` | gauge | app, env | 가장 오래 기다린 needs_human 의 대기 시간 (updated_at 기준) |
+| `review_worker_messages_total` | counter | topic, kind, result | kind: requested·human_decision·ci_completed·retry_overlay / result: processed·skipped·invalid·error |
+| `review_worker_node_duration_seconds` | histogram | node | 그래프 노드 처리 시간 (interrupt 대기는 빼고) |
+| `review_worker_node_errors_total` | counter | node | 노드 예외 |
+| `review_worker_verdicts_total` | counter | app, env, verdict | pass·fix·needs_human (재검사 회차마다) |
+| `review_worker_needs_human_reasons_total` | counter | reason | needs_human 사유 코드 |
+| `review_worker_finished_total` | counter | app, env, status | committed·blocked·rejected·failed·superseded |
+| `review_worker_llm_calls_total` | counter | purpose, result | judge / ok·timeout·error (캐시 적중 제외) |
+| `review_worker_llm_duration_seconds` | histogram | purpose | LLM 호출 시간 |
+| `review_worker_llm_tokens_total` | counter | purpose, type | input·output 토큰 |
+| `review_worker_consumer_lag` | gauge | topic, partition | 30초마다 끝 오프셋 - 커밋 오프셋 |
+| `review_worker_last_heartbeat_timestamp` | gauge | | 생존 파일을 마지막으로 갱신한 시각 |
+
+수집 설정(ServiceMonitor)과 대시보드는 gitops `apps/review-service/monitoring/`. 커밋 타임라인은 `reviews` 의 단계별 시각
+(`judged_at`·`human_decided_at`·`merged_at`·`gitops_committed_at`, 마이그레이션 0009)과 `deploy_events`·`spec_intakes` 로 그린다.
 
 ## 상태 흐름 (`reviews.status`)
 
