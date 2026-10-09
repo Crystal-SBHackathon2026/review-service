@@ -136,8 +136,10 @@ class ReviewRepository(Protocol):
         """
         ...
 
-    async def find_by_merge_sha(self, *, app: str, target_env: str, image_tag: str) -> dict[str, Any] | None:
-        """이미지 태그가 merge_sha 와 같은(짧은 SHA 면 앞부분이 같은) 검토. 가장 최근 것."""
+    async def find_by_merge_sha(self, *, app: str, target_env: str | None, image_tag: str) -> dict[str, Any] | None:
+        """이미지 태그가 merge_sha 와 같은(짧은 SHA 면 앞부분이 같은) 검토. 가장 최근 것.
+
+        target_env=None 이면 대상 환경을 보지 않는다 — 검토 대상이 아닌 환경(aws 검토의 local 배포)의 알림을 잇는다."""
         ...
 
     async def find_by_merge_sha_exact(self, merge_sha: str) -> dict[str, Any] | None:
@@ -152,8 +154,18 @@ class ReviewRepository(Protocol):
     async def add_deploy_event(self, *, review_id: str | None, app: str, target_env: str, kind: str,
                                image_tag: str | None, payload: dict[str, Any]) -> None: ...
 
-    async def has_deploy_event(self, *, review_id: str, kind: str, image_tag: str | None) -> bool:
-        """같은 (검토, healthy|degraded, 이미지 태그) 배포 알림을 이미 기록했는지. Argo CD 가 같은 알림을 다시 보낸다."""
+    async def has_deploy_event(self, *, review_id: str, target_env: str, kind: str, image_tag: str | None) -> bool:
+        """같은 (검토, 환경, healthy|degraded, 이미지 태그) 배포 알림을 이미 기록했는지. Argo CD 가 같은 알림을 다시 보낸다.
+
+        환경이 다르면 다른 알림이다 — 같은 병합을 aws·local 이 각각 배포한다."""
+        ...
+
+    async def deploy_events_for(self, review_id: str) -> list[dict[str, Any]]:
+        """그 검토의 배포 알림, 받은 순서(received_at)대로 — 진행 화면의 환경별 배포 상태."""
+        ...
+
+    async def find_superseding_parent(self, review_id: str) -> dict[str, Any] | None:
+        """superseded_by 가 review_id 인 검토 (넘겨준 쪽). 가장 최근 것 — 진행 화면이 검토 이력을 거꾸로 따라간다."""
         ...
 
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
@@ -178,6 +190,10 @@ class ReviewRepository(Protocol):
 
     async def find_intake_by_result_commit(self, repository: str, sha: str) -> dict[str, Any] | None:
         """intake 가 만든 커밋이 sha 인 행 — 루프 방지·검토 연결용."""
+        ...
+
+    async def find_intake_by_reviews(self, review_ids: Sequence[str]) -> dict[str, Any] | None:
+        """review_id 가 review_ids 중 하나인 intake. 가장 최근 것 — 진행 화면의 명세 생성 단계."""
         ...
 
     async def finish_intake(self, intake_id: str, **fields: Any) -> bool:
@@ -338,13 +354,13 @@ class PostgresReviewRepository:
             " AND status = ANY(%s) AND updated_at < now() - %s RETURNING *",
             (list(statuses), older_than, list(statuses), older_than))
 
-    async def find_by_merge_sha(self, *, app: str, target_env: str, image_tag: str) -> dict[str, Any] | None:
+    async def find_by_merge_sha(self, *, app: str, target_env: str | None, image_tag: str) -> dict[str, Any] | None:
         if len(image_tag) < 7:
             return None
         return await self._fetchone(
-            "SELECT * FROM reviews WHERE app = %s AND target_env = %s AND merge_sha IS NOT NULL"
+            "SELECT * FROM reviews WHERE app = %s AND (%s::text IS NULL OR target_env = %s) AND merge_sha IS NOT NULL"
             " AND starts_with(lower(merge_sha), lower(%s)) ORDER BY created_at DESC LIMIT 1",
-            (app, target_env, image_tag),
+            (app, target_env, target_env, image_tag),
         )
 
     async def find_by_merge_sha_exact(self, merge_sha: str) -> dict[str, Any] | None:
@@ -373,10 +389,19 @@ class PostgresReviewRepository:
             (review_id, app, target_env, kind, image_tag, Jsonb(payload)),
         )
 
-    async def has_deploy_event(self, *, review_id: str, kind: str, image_tag: str | None) -> bool:
+    async def has_deploy_event(self, *, review_id: str, target_env: str, kind: str, image_tag: str | None) -> bool:
         return await self._fetchone(
-            "SELECT 1 AS hit FROM deploy_events WHERE review_id = %s AND kind = %s"
-            " AND image_tag IS NOT DISTINCT FROM %s LIMIT 1", (review_id, kind, image_tag)) is not None
+            "SELECT 1 AS hit FROM deploy_events WHERE review_id = %s AND target_env = %s AND kind = %s"
+            " AND image_tag IS NOT DISTINCT FROM %s LIMIT 1", (review_id, target_env, kind, image_tag)) is not None
+
+    async def deploy_events_for(self, review_id: str) -> list[dict[str, Any]]:
+        return await self._fetchall(
+            "SELECT id, review_id, app, target_env, kind, image_tag, received_at FROM deploy_events"
+            " WHERE review_id = %s ORDER BY received_at, id", (review_id,))
+
+    async def find_superseding_parent(self, review_id: str) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT * FROM reviews WHERE superseded_by = %s ORDER BY created_at DESC LIMIT 1", (review_id,))
 
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
         return await self._fetchone(
@@ -410,6 +435,10 @@ class PostgresReviewRepository:
         return await self._fetchone(
             "SELECT * FROM spec_intakes WHERE repository = %s AND result_commit_sha = %s"
             " ORDER BY created_at DESC LIMIT 1", (repository, sha))
+
+    async def find_intake_by_reviews(self, review_ids: Sequence[str]) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT * FROM spec_intakes WHERE review_id = ANY(%s) ORDER BY created_at DESC LIMIT 1", (list(review_ids),))
 
     async def finish_intake(self, intake_id: str, **fields: Any) -> bool:
         _check_intake(dict.fromkeys(INTAKE_FIELDS), fields)
@@ -573,9 +602,9 @@ class InMemoryReviewRepository:
         row.update(recover_count=row["recover_count"] + 1, updated_at=now)
         return copy.deepcopy(row)
 
-    async def find_by_merge_sha(self, *, app: str, target_env: str, image_tag: str) -> dict[str, Any] | None:
+    async def find_by_merge_sha(self, *, app: str, target_env: str | None, image_tag: str) -> dict[str, Any] | None:
         return self._latest(r for r in self.reviews.values()
-                            if r["app"] == app and r["target_env"] == target_env
+                            if r["app"] == app and target_env in (None, r["target_env"])
                             and tag_matches(r["merge_sha"], image_tag))
 
     async def find_by_merge_sha_exact(self, merge_sha: str) -> dict[str, Any] | None:
@@ -599,9 +628,16 @@ class InMemoryReviewRepository:
             "kind": kind, "image_tag": image_tag, "payload": copy.deepcopy(payload), "received_at": _now(),
         })
 
-    async def has_deploy_event(self, *, review_id: str, kind: str, image_tag: str | None) -> bool:
-        return any(e["review_id"] == review_id and e["kind"] == kind and e["image_tag"] == image_tag
-                   for e in self.deploy_events)
+    async def has_deploy_event(self, *, review_id: str, target_env: str, kind: str, image_tag: str | None) -> bool:
+        return any(e["review_id"] == review_id and e["target_env"] == target_env and e["kind"] == kind
+                   and e["image_tag"] == image_tag for e in self.deploy_events)
+
+    async def deploy_events_for(self, review_id: str) -> list[dict[str, Any]]:
+        rows = [{k: v for k, v in e.items() if k != "payload"} for e in self.deploy_events if e["review_id"] == review_id]
+        return copy.deepcopy(sorted(rows, key=lambda e: (e["received_at"], e["id"])))
+
+    async def find_superseding_parent(self, review_id: str) -> dict[str, Any] | None:
+        return self._latest(r for r in self.reviews.values() if r["superseded_by"] == review_id)
 
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
         rows = [b for b in self.baselines.values() if b["spec_ref"].get("repository") == repository]
@@ -641,6 +677,9 @@ class InMemoryReviewRepository:
     async def find_intake_by_result_commit(self, repository: str, sha: str) -> dict[str, Any] | None:
         return self._latest(r for r in self.intakes.values()
                             if r["repository"] == repository and r["result_commit_sha"] == sha)
+
+    async def find_intake_by_reviews(self, review_ids: Sequence[str]) -> dict[str, Any] | None:
+        return self._latest(r for r in self.intakes.values() if r["review_id"] in review_ids)
 
     async def finish_intake(self, intake_id: str, **fields: Any) -> bool:
         _check_intake(dict.fromkeys(INTAKE_FIELDS), fields)

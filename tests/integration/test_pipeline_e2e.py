@@ -143,9 +143,13 @@ async def test_repository_on_postgres(pool: Any) -> None:
     assert (baseline["spec"], baseline["merge_sha"], baseline["database_has_data"]) == ({"v": 2}, "y", None)
     await repo.add_deploy_event(review_id="rv_1", app="sample-app", target_env="aws", kind="healthy",
                                 image_tag="c0ffee1", payload={"health": "Healthy"})
-    assert await repo.has_deploy_event(review_id="rv_1", kind="healthy", image_tag="c0ffee1")
-    assert not await repo.has_deploy_event(review_id="rv_1", kind="degraded", image_tag="c0ffee1")
-    assert not await repo.has_deploy_event(review_id="rv_1", kind="healthy", image_tag=None)
+    assert await repo.has_deploy_event(review_id="rv_1", target_env="aws", kind="healthy", image_tag="c0ffee1")
+    assert not await repo.has_deploy_event(review_id="rv_1", target_env="local", kind="healthy", image_tag="c0ffee1")
+    assert not await repo.has_deploy_event(review_id="rv_1", target_env="aws", kind="degraded", image_tag="c0ffee1")
+    assert not await repo.has_deploy_event(review_id="rv_1", target_env="aws", kind="healthy", image_tag=None)
+    assert [(e["target_env"], e["kind"]) for e in await repo.deploy_events_for("rv_1")] == [("aws", "healthy")]
+    assert (await repo.find_by_merge_sha(app="sample-app", target_env=None, image_tag="c0ffee1"))["review_id"] == "rv_1"
+    assert await repo.find_by_merge_sha(app="sample-app", target_env="local", image_tag="c0ffee1") is None
     assert (await repo.find_by_merge_sha_exact(MERGE_SHA))["review_id"] == "rv_1"
     assert await repo.find_by_merge_sha_exact(MERGE_SHA[:7]) is None  # 정확히 같을 때만
 
@@ -157,6 +161,8 @@ async def test_repository_on_postgres(pool: Any) -> None:
                              pr_head_sha="b" * 40, requested_by="autofix:rv_1")
     await repo.update_review("rv_1", status="superseded", superseded_by="rv_2")
     assert (await repo.get_review("rv_1"))["superseded_by"] == "rv_2"
+    assert (await repo.find_superseding_parent("rv_2"))["review_id"] == "rv_1"
+    assert await repo.find_superseding_parent("rv_1") is None
     await repo.update_review("rv_1", status="committed", verdict="pass")  # superseded 상태는 덮어쓰지 않는다
     assert ((await repo.get_review("rv_1"))["status"], (await repo.get_review("rv_1"))["verdict"]) == (
         "superseded", "pass")
@@ -225,6 +231,8 @@ async def test_spec_intakes_on_postgres(pool: Any) -> None:
     row = await repo.get_intake("in_1")
     assert (row["status"], row["details"], row["review_id"], row["result_commit_sha"]) == (
         "generated", [{"path": "/runtime"}], "rv_g", "b" * 40)
+    assert (await repo.find_intake_by_reviews(["rv_x", "rv_g"]))["intake_id"] == "in_1"
+    assert await repo.find_intake_by_reviews(["rv_x"]) is None
     await repo.update_review("rv_g", verdict="needs_human", reasons=["GENERATED_SPEC_UNVERIFIED"])  # 0006 CHECK
     await repo.link_intake("in_1", baseline_used=True)  # 다시 처리해도 처음 만든 커밋을 쓴다 — 처음 값이 남는다
     assert (await repo.unverified_generation_for_pr(REPO, 7))["baseline_used"] is False
