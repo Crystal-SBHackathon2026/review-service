@@ -72,6 +72,53 @@ async def test_no_images_no_matching_revision_is_retained_unlinked(setup):
     assert await repo.latest_baseline_for_repository("org/app") is not None
 
 
+async def add_fb27c6bf(repo):
+    """rv_20261010_fb27c6bf 재현 — overlay 커밋 f316634 다음에 CI 이미지 태그 커밋 f817924 로 리비전이 한 번 더 바뀌었다.
+    SHA 는 실제 앞 7자에 뒤를 채운 값."""
+    rid, overlay, merge = "rv_20261010_fb27c6bf", "f316634" + "0"*33, "d"*40
+    await repo.insert_review(review_id=rid, app="sample-app", target_env="aws", repo_id="org/app",
+        spec_ref={"repository": "org/app", "commit": merge, "path": "deploy.yaml"}, pr_head_sha=merge, requested_by="test")
+    await repo.update_review(rid, status="committed", gitops_commit_sha=overlay, merge_sha=merge,
+        final_spec={"metadata": {"name": "sample-app", "repository": "org/app"}, "target": {"env": "aws"}})
+    return rid, merge
+
+
+@pytest.mark.parametrize("kind", ["health_degraded", "sync_failed"])
+async def test_failure_on_image_tag_revision_links_by_image(setup, kind):
+    repo, client, _ = setup
+    rid, merge = await add_fb27c6bf(repo)
+    image_commit = "f817924" + "0"*33
+    body = payload(kind, revision=image_commit)
+    body.update(revision=image_commit, health="Degraded",
+                images=["ghcr.io/org/app:" + "b"*40, "ghcr.io/org/app:" + merge[:7]])  # 롤아웃 중 — 옛 stable 과 새 태그
+    result = (await post(client, body)).json()
+    assert result["review_id"] == rid and result["linked"]
+    assert (await repo.get_deployment(result["event_id"]))["review_id"] == rid
+    assert await repo.is_deployment_failing(rid)
+    progress = (await client.get(f"/reviews/{rid}/progress")).json()
+    assert next(c for c in progress["envs"] if c["is_target"])["deploy"]["kind"] == kind.removeprefix("health_")
+
+
+async def test_failure_with_only_old_stable_image_stays_unlinked(setup):
+    repo, client, _ = setup
+    rid, _ = await add_fb27c6bf(repo)
+    body = payload("health_degraded", revision="f817924" + "0"*33)
+    body.update(health="Degraded", images=["ghcr.io/org/app:" + "b"*40])  # 새 태그가 아직 없다 — "new" 는 옛 stable
+    result = (await post(client, body)).json()
+    assert result["review_id"] is None
+    assert not await repo.is_deployment_failing("new") and not await repo.is_deployment_failing(rid)
+
+
+async def test_cross_env_failure_links_by_image(setup):
+    repo, client, _ = setup
+    rid, merge = await add_fb27c6bf(repo)
+    body = payload("health_degraded", revision="e"*40)
+    body.update(env="gcp", cluster_id="tokyo-gke", health="Degraded", images=["ghcr.io/org/app:" + merge[:7]])
+    result = (await post(client, body)).json()
+    assert result["review_id"] == rid and result["cross_env"] and not result["linked"]
+    assert not await repo.is_deployment_failing(rid)
+
+
 async def test_duplicate_observation_time_does_not_create_new_job(setup):
     repo, client, _ = setup
     body = payload()
@@ -278,7 +325,8 @@ async def test_sync_failure_progress_not_hidden_by_secondary_healthy(setup):
     await post(client, {"app": "sample-app", "env": "local", "health": "Healthy", "images": ["org/app:" + "b"*40]})
     await post(client, payload())
     progress = (await client.get("/reviews/new/progress")).json()
-    assert next(s for s in progress["steps"] if s["key"] == "deploy")["state"] == "failed"
+    # 다른 환경 healthy 로 done 이 되지 않는다 — 대상 실패가 보이는 부분 완료
+    assert next(s for s in progress["steps"] if s["key"] == "deploy")["state"] == "partial"
     assert progress["review"]["deployment"]["status"] == "failed"
     assert "permission denied" not in json.dumps(progress)
 

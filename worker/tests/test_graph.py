@@ -930,6 +930,19 @@ async def test_fork_pr_reaching_merge_is_not_merged(harness: Harness, head_repo:
     assert harness.github.merged == []
 
 
+async def test_draft_pr_is_not_merged(harness: Harness) -> None:
+    """draft PR 은 GitHub 이 405 로 거절한다 — 병합 API 를 부르지 않고 verify success 도 쓰지 않는다."""
+    harness.github.open_pr("Crystal-SBHackathon2026/sample-app", HEAD)
+    harness.github.pulls[HEAD][0]["draft"] = True
+    await harness.request(load_sample(SAMPLE_01))
+    await _finish_ci(harness)
+
+    row = harness.row()
+    assert row["status"] == "failed" and row["error"].startswith("merge_pr: draft PR")
+    assert harness.github.merged == []
+    assert harness.github.states()[-1] == "failure"
+
+
 # --- 커밋 상태 review-service/verify (⑤) ----------------------------------------------------------------
 
 async def test_pass_writes_success_before_merge(harness: Harness) -> None:
