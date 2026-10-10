@@ -452,6 +452,10 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             metrics.webhook("argocd", "error")
             raise
         metrics.webhook("argocd", metrics.argocd_result(result))
+        linked = result.get("linked", bool(result.get("review_id")) and not result.get("cross_env"))
+        log.info("argocd 웹훅 event_id=%s kind=%s app=%s env=%s review_id=%s linked=%s%s",
+                 result.get("event_id"), event.kind(), event.app, event.env, result.get("review_id"), linked,
+                 " duplicate" if result.get("duplicate") else "")
         background.add_task(dispatch_best_effort, deps_.repo, deps_.publisher)
         return result
 

@@ -135,6 +135,13 @@ PR 에서 들어가서 보는 **읽기 전용** 화면이다 (토큰 입력 없�
 - **다른 환경 배포 알림** — 검토 한 건은 대상 환경 하나다. aws 검토의 같은 병합을 로컬 Argo CD 가 배포하면 `/webhooks/argocd` 가 env 로는 검토를 못 찾으므로,
   같은 앱·병합 SHA 검토를 env 와 무관하게 찾아 `deploy_events` 에 그 env 로 남긴다(`{"review_id", "recorded", "cross_env": true}`).
   baseline 갱신·Degraded 판단 사례는 검토 대상 환경일 때만. 같은 알림 중복 판단은 (검토, env, kind, 이미지 태그)
+- **실패 알림 이미지 태그 매칭** — PR 하나에 gitops 리비전이 두 번 바뀌어(overlay 커밋 → CI 이미지 태그 커밋) 두 번째 리비전의
+  health_degraded·sync_failed 는 revision 으로 검토를 못 찾는다. 그때 images 태그 → merge_sha 로 잇되, 그 앱·환경에서 가장 최근에
+  병합한 검토일 때만 (옛 stable 태그만 온 실패를 옛 검토에 잇지 않게)
+- **자동 중단·부분 완료** — 대상 환경 Degraded 알림 payload 의 `resources` 에 Rollout 이 Degraded 이고 message 에 abort
+  (`RolloutAborted: …`)가 있으면 카드 `deploy.rollout_aborted: true`, `serving_tag`(지금 서비스 중인 이전 버전 태그). 화면은
+  "자동 중단 → 이전 버전 유지". 대상 환경만 실패하고 다른 환경이 Healthy 면 배포 단계 `state` 는 `partial`(부분 완료),
+  맨 위 띠는 "서울은 자동 중단되어 이전 버전이 서비스 중 · 도쿄·부산 배포 완료"
 
 ```jsonc
 // GET /reviews/rv_20261009_53c71e3c/progress (줄임)

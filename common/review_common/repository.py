@@ -179,6 +179,10 @@ class ReviewRepository(Protocol):
         """merge_sha 가 정확히 같은 검토. 가장 최근 것 — baseline 이 어느 검토의 배포인지 찾는다."""
         ...
 
+    async def latest_merged_review(self, app: str, target_env: str) -> dict[str, Any] | None:
+        """그 앱·대상 환경에서 가장 최근에 병합한(merge_sha 가 있는) 검토 — 실패 알림을 옛 검토에 잇지 않게."""
+        ...
+
     async def get_baseline(self, app: str, target_env: str) -> dict[str, Any] | None: ...
 
     async def baseline_or_last_committed(self, app: str, target_env: str) -> dict[str, Any] | None:
@@ -208,7 +212,8 @@ class ReviewRepository(Protocol):
         ...
 
     async def deploy_events_for(self, review_id: str) -> list[dict[str, Any]]:
-        """그 검토의 배포 알림, 받은 순서(received_at)대로 — 진행 화면의 환경별 배포 상태."""
+        """그 검토의 배포 알림(payload 포함), 받은 순서(received_at)대로 — 진행 화면의 환경별 배포 상태.
+        payload 는 Rollout 자동 중단 판단에만 쓰고 화면 응답에 내보내지 않는다."""
         ...
 
     async def find_superseding_parent(self, review_id: str) -> dict[str, Any] | None:
@@ -426,6 +431,11 @@ class PostgresReviewRepository(PostgresRequests, PostgresDeployments):
         return await self._fetchone(
             "SELECT * FROM reviews WHERE merge_sha = %s ORDER BY created_at DESC LIMIT 1", (merge_sha,))
 
+    async def latest_merged_review(self, app: str, target_env: str) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT * FROM reviews WHERE app = %s AND target_env = %s AND merge_sha IS NOT NULL"
+            " ORDER BY created_at DESC LIMIT 1", (app, target_env))
+
     async def get_baseline(self, app: str, target_env: str) -> dict[str, Any] | None:
         row = await self._fetchone("SELECT * FROM baselines WHERE app=%s AND target_env=%s", (app, target_env))
         if row and not await self.merge_has_failed(app, target_env, row["merge_sha"]):
@@ -495,7 +505,7 @@ class PostgresReviewRepository(PostgresRequests, PostgresDeployments):
 
     async def deploy_events_for(self, review_id: str) -> list[dict[str, Any]]:
         return await self._fetchall(
-            "SELECT id, review_id, app, target_env, kind, image_tag, received_at FROM deploy_events"
+            "SELECT id, review_id, app, target_env, kind, image_tag, payload, received_at FROM deploy_events"
             " WHERE review_id = %s ORDER BY received_at, id", (review_id,))
 
     async def find_superseding_parent(self, review_id: str) -> dict[str, Any] | None:
@@ -731,6 +741,10 @@ class InMemoryReviewRepository(MemoryRequests, MemoryDeployments):
     async def find_by_merge_sha_exact(self, merge_sha: str) -> dict[str, Any] | None:
         return self._latest(r for r in self.reviews.values() if r["merge_sha"] == merge_sha)
 
+    async def latest_merged_review(self, app: str, target_env: str) -> dict[str, Any] | None:
+        return self._latest(r for r in self.reviews.values()
+                            if r["app"] == app and r["target_env"] == target_env and r["merge_sha"])
+
     async def get_baseline(self, app: str, target_env: str) -> dict[str, Any] | None:
         row = self.baselines.get((app,target_env))
         if row and not await self.merge_has_failed(app,target_env,row["merge_sha"]):
@@ -784,7 +798,7 @@ class InMemoryReviewRepository(MemoryRequests, MemoryDeployments):
         return {k: last[k] for k in ("kind", "image_tag", "received_at")} if last else None
 
     async def deploy_events_for(self, review_id: str) -> list[dict[str, Any]]:
-        rows = [{k: v for k, v in e.items() if k != "payload"} for e in self.deploy_events if e["review_id"] == review_id]
+        rows = [e for e in self.deploy_events if e["review_id"] == review_id]
         return copy.deepcopy(sorted(rows, key=lambda e: (e["received_at"], e["id"])))
 
     async def find_superseding_parent(self, review_id: str) -> dict[str, Any] | None:
