@@ -60,8 +60,8 @@ def review_view(row: dict[str, Any]) -> dict[str, Any]:
 async def deployment_summary(repo, row):
     events = [e for e in await repo.list_deployments(row["review_id"], limit=50)
               if e["target_env"] == row["target_env"]]
-    failed = await repo.has_failed_deployment(row["review_id"])
-    latest = next((e for e in events if e["kind"] != "deployed"), None) if failed else (events[0] if events else None)
+    failed = await repo.is_deployment_failing(row["review_id"])  # 마지막 알림 기준 — 실패 뒤 회복하면 성공 쪽을 본다
+    latest = next((e for e in events if (e["kind"] != "deployed") == failed), events[0] if events else None)
     verified_success = (latest is not None and latest["kind"] == "deployed"
                         and latest["payload"].get("health") == "Healthy"
                         and latest["payload"].get("sync_status") == "Synced"

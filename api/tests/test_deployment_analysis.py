@@ -118,7 +118,7 @@ async def test_json_validation_limits_and_auth(setup):
     assert await repo.list_deployments() == []
 
 
-async def test_degraded_after_healthy_excludes_failed_baseline_and_fallback(setup):
+async def test_degraded_after_healthy_falls_back_until_verified_recovery(setup):
     repo, client, _ = setup
     await post(client, payload("deployed", "a"*40))
     await post(client, payload("deployed"))
@@ -129,8 +129,8 @@ async def test_degraded_after_healthy_excludes_failed_baseline_and_fallback(setu
     assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "a"*40
     assert (await repo.latest_baseline_for_repository("org/app"))["merge_sha"] == "a"*40
     body = payload("deployed"); body["operation"]["started_at"] = "2026-10-09T16:00:00+09:00"
-    await post(client, body)
-    assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "a"*40
+    await post(client, body)  # 같은 병합을 다시 sync 해 검증된 성공 — 마지막 알림이 성공이면 회복이다
+    assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "b"*40
 
 
 async def test_verified_resolution_needs_related_new_success_and_changed_config(setup):
@@ -311,3 +311,67 @@ async def test_error_without_operation_revision_is_unlinked_and_started_at_disti
     assert second["event_id"] != first["event_id"]
     assert len(repo.analysis_jobs) == 2
     assert not await repo.get_failure_case(first["event_id"])
+
+
+def legacy(health, sha="b"*40):
+    return {"app": "sample-app", "env": "aws", "health": health, "images": ["org/app:" + sha]}
+
+
+async def deploy_step(client, review_id):
+    progress = (await client.get(f"/reviews/{review_id}/progress")).json()
+    return next(s for s in progress["steps"] if s["key"] == "deploy")["state"], progress["review"]["deployment"]
+
+
+@pytest.mark.parametrize("sequence", [["Degraded", "Healthy"], ["Healthy", "Degraded", "Healthy"]])
+async def test_legacy_recovery_after_degraded_updates_baseline(setup, sequence):
+    """실패가 있었나가 아니라 마지막 알림이 실패인가 — Degraded 뒤 Healthy 면 회복이다 (#53 리뷰)."""
+    repo, client, _ = setup
+    results = [(await post(client, legacy(health))).json() for health in sequence]
+    assert not results[-1].get("duplicate")  # 같은 Healthy 가 전에 왔어도 상태 전이는 기록한다
+    assert not await repo.is_deployment_failing("new")
+    assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "b"*40
+    state, deployment = await deploy_step(client, "new")
+    assert state == "done" and deployment["status"] != "failed"
+    assert await repo.has_failed_deployment("new")  # 해결 근거 자격은 '한 번이라도'를 유지한다
+
+
+async def test_legacy_failure_after_recovery_is_failing_again(setup):
+    repo, client, _ = setup
+    for health in ["Degraded", "Healthy", "Degraded"]:
+        await post(client, legacy(health))
+    assert await repo.is_deployment_failing("new")
+    assert (await repo.get_baseline("sample-app", "aws") or {}).get("merge_sha") != "b"*40
+    state, deployment = await deploy_step(client, "new")
+    assert state == "failed" and deployment["status"] == "failed"
+
+
+async def test_legacy_same_state_repeat_is_still_duplicate(setup):
+    repo, client, _ = setup
+    await post(client, legacy("Degraded"))
+    assert (await post(client, legacy("Degraded"))).json()["duplicate"]
+    assert [e["kind"] for e in await repo.deploy_events_for("new")] == ["degraded"]
+
+
+async def test_versioned_identical_success_after_degraded_is_recovery(setup):
+    """같은 operation 의 성공 본문이 다시 오면 event_id 가 같다 — 그래도 Degraded 뒤라면 회복으로 남긴다."""
+    repo, client, _ = setup
+    success = payload("deployed")
+    degraded = payload("health_degraded"); degraded["health"] = "Degraded"
+    for body in [success, degraded, success]:
+        await post(client, body)
+    assert [e["kind"] for e in await repo.deploy_events_for("new")] == ["healthy", "degraded", "healthy"]
+    assert not await repo.is_deployment_failing("new")
+    assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "b"*40
+    state, deployment = await deploy_step(client, "new")
+    assert state == "done" and deployment["status"] == "healthy"
+
+
+async def test_versioned_unverified_healthy_does_not_clear_failure(setup):
+    """옛 워크로드만 Healthy 일 수 있다 — operation Succeeded 가 아닌 deployed 는 실패를 덮지 않는다."""
+    repo, client, _ = setup
+    await post(client, payload())  # sync_failed
+    running = payload("deployed"); running["sync_status"] = "OutOfSync"
+    running["operation"]["phase"] = "Running"
+    await post(client, running)
+    assert await repo.is_deployment_failing("new")
+    assert (await deploy_step(client, "new"))[1]["status"] == "failed"

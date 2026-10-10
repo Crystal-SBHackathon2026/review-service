@@ -11,7 +11,7 @@ from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
-from review_common.deployment_repository import MemoryDeployments, PostgresDeployments
+from review_common.deployment_repository import LAST_DEPLOY_FAILED, MemoryDeployments, PostgresDeployments
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -88,7 +88,14 @@ class ReviewRepository(Protocol):
     async def record_deployment(self, event: dict[str, Any]) -> bool: ...
     async def get_deployment(self, event_id: str) -> dict[str, Any] | None: ...
     async def list_deployments(self, review_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]: ...
-    async def has_failed_deployment(self, review_id: str) -> bool: ...
+    async def has_failed_deployment(self, review_id: str) -> bool:
+        """대상 환경에서 실패가 한 번이라도 관측됐는지 — 해결 근거(성공 배포) 자격용. 회복해도 True 다."""
+        ...
+
+    async def is_deployment_failing(self, review_id: str) -> bool:
+        """대상 환경의 마지막 배포 알림이 실패(degraded·sync_failed)인지 — baseline·진행 화면 판단용.
+        실패 뒤 Healthy 가 오면 False 로 돌아온다."""
+        ...
 
     async def mirror_deployment_event(self, *, event_id: str, review_id: str, app: str, target_env: str,
                                       kind: str, image_tag: str | None, payload: dict[str, Any]) -> None: ...
@@ -178,6 +185,10 @@ class ReviewRepository(Protocol):
         """같은 (검토, 환경, healthy|degraded, 이미지 태그) 배포 알림을 이미 기록했는지. Argo CD 가 같은 알림을 다시 보낸다.
 
         환경이 다르면 다른 알림이다 — 같은 병합을 aws·local 이 각각 배포한다."""
+        ...
+
+    async def last_deploy_event(self, *, review_id: str, target_env: str) -> dict[str, Any] | None:
+        """그 검토·환경의 마지막 배포 알림 (kind·image_tag·received_at). 없으면 None."""
         ...
 
     async def deploy_events_for(self, review_id: str) -> list[dict[str, Any]]:
@@ -400,8 +411,7 @@ class PostgresReviewRepository(PostgresDeployments):
             " AND payload->>'health'='Healthy' AND payload->>'sync_status'='Synced'"
             " AND payload->'operation'->>'phase'='Succeeded') d ON d.review_id=r.review_id AND d.target_env=r.target_env"
             " WHERE r.app=%s AND r.target_env=%s AND r.final_spec IS NOT NULL"
-            " AND NOT EXISTS (SELECT 1 FROM deployment_observations f WHERE f.review_id=r.review_id AND f.target_env=r.target_env AND f.kind != 'deployed')"
-            " AND NOT EXISTS (SELECT 1 FROM deploy_events f WHERE f.review_id=r.review_id AND f.target_env=r.target_env AND f.kind IN ('degraded','sync_failed'))"
+            f" AND ({LAST_DEPLOY_FAILED}) IS NOT TRUE"
             " ORDER BY r.created_at DESC LIMIT 1", (app, target_env))
         return {**fallback, "derived": True} if fallback else None
 
@@ -410,16 +420,14 @@ class PostgresReviewRepository(PostgresDeployments):
             return False
         rows = await self._fetchall("SELECT review_id FROM reviews WHERE app=%s AND target_env=%s AND merge_sha=%s",
                                     (app, target_env, merge_sha))
-        return any([await self.has_failed_deployment(r["review_id"]) for r in rows])
+        return any([await self.is_deployment_failing(r["review_id"]) for r in rows])
 
     async def upsert_baseline(self, *, app: str, target_env: str, spec: dict[str, Any], spec_ref: dict[str, Any],
                               merge_sha: str | None, observed_at: datetime) -> None:
         async with self._pool.connection() as conn, conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (app + "/" + target_env,))
-            await cur.execute("SELECT 1 FROM reviews r WHERE r.app=%s AND r.target_env=%s AND r.merge_sha=%s AND ("
-                              " EXISTS(SELECT 1 FROM deployment_observations d WHERE d.review_id=r.review_id AND d.target_env=r.target_env AND d.kind != 'deployed')"
-                              " OR EXISTS(SELECT 1 FROM deploy_events d WHERE d.review_id=r.review_id AND d.target_env=r.target_env AND d.kind IN ('degraded','sync_failed'))) LIMIT 1",
-                              (app,target_env,merge_sha))
+            await cur.execute("SELECT 1 FROM reviews r WHERE r.app=%s AND r.target_env=%s AND r.merge_sha=%s"
+                              f" AND ({LAST_DEPLOY_FAILED}) IS TRUE LIMIT 1", (app,target_env,merge_sha))
             if await cur.fetchone():
                 return
             # Refuse a stale success atomically, including concurrent webhook replicas.
@@ -452,6 +460,11 @@ class PostgresReviewRepository(PostgresDeployments):
             "SELECT 1 AS hit FROM deploy_events WHERE review_id = %s AND target_env = %s AND kind = %s"
             " AND image_tag IS NOT DISTINCT FROM %s LIMIT 1", (review_id, target_env, kind, image_tag)) is not None
 
+    async def last_deploy_event(self, *, review_id: str, target_env: str) -> dict[str, Any] | None:
+        return await self._fetchone(
+            "SELECT kind, image_tag, received_at FROM deploy_events WHERE review_id = %s AND target_env = %s"
+            " ORDER BY received_at DESC, id DESC LIMIT 1", (review_id, target_env))
+
     async def deploy_events_for(self, review_id: str) -> list[dict[str, Any]]:
         return await self._fetchall(
             "SELECT id, review_id, app, target_env, kind, image_tag, received_at FROM deploy_events"
@@ -470,10 +483,9 @@ class PostgresReviewRepository(PostgresDeployments):
             return max(rows, key=lambda b: b["observed_at"] or datetime.min.replace(tzinfo=UTC))
         return await self._fetchone(
             "SELECT app, target_env, final_spec AS spec, spec_ref, merge_sha, NULL::boolean AS database_has_data,"
-            " NULL::timestamptz AS observed_at FROM reviews"
+            " NULL::timestamptz AS observed_at FROM reviews r"
             " WHERE spec_ref->>'repository' = %s AND status = 'committed' AND final_spec IS NOT NULL"
-            " AND NOT EXISTS (SELECT 1 FROM deployment_observations d WHERE d.review_id=reviews.review_id AND d.target_env=reviews.target_env AND d.kind != 'deployed')"
-            " AND NOT EXISTS (SELECT 1 FROM deploy_events d WHERE d.review_id=reviews.review_id AND d.target_env=reviews.target_env AND d.kind IN ('degraded','sync_failed'))"
+            f" AND ({LAST_DEPLOY_FAILED}) IS NOT TRUE"
             " ORDER BY updated_at DESC LIMIT 1", (repository,))
 
     async def insert_intake(self, **intake: Any) -> bool:
@@ -684,13 +696,13 @@ class InMemoryReviewRepository(MemoryDeployments):
                         and e["payload"].get("health") == "Healthy" and e["payload"].get("sync_status") == "Synced"
                         and (e["payload"].get("operation") or {}).get("phase") == "Succeeded"}
         rows = [r for r in self.reviews.values() if r["review_id"] in healthy_ids and r["app"] == app
-                and r["target_env"] == target_env and r["final_spec"] and not await self.has_failed_deployment(r["review_id"])]
+                and r["target_env"] == target_env and r["final_spec"] and not await self.is_deployment_failing(r["review_id"])]
         last = self._latest(rows)
         return dict(app=app,target_env=target_env,spec=last["final_spec"],spec_ref=last["spec_ref"],merge_sha=last["merge_sha"],
                     database_has_data=None,observed_at=None,derived=True) if last else None
 
     async def merge_has_failed(self, app, target_env, merge_sha):
-        return any([await self.has_failed_deployment(r["review_id"]) for r in self.reviews.values()
+        return any([await self.is_deployment_failing(r["review_id"]) for r in self.reviews.values()
                     if r["app"] == app and r["target_env"] == target_env and merge_sha and r["merge_sha"] == merge_sha])
 
     async def upsert_baseline(self, *, app: str, target_env: str, spec: dict[str, Any], spec_ref: dict[str, Any],
@@ -721,6 +733,11 @@ class InMemoryReviewRepository(MemoryDeployments):
         return any(e["review_id"] == review_id and e["target_env"] == target_env and e["kind"] == kind
                    and e["image_tag"] == image_tag for e in self.deploy_events)
 
+    async def last_deploy_event(self, *, review_id: str, target_env: str) -> dict[str, Any] | None:
+        rows = [e for e in self.deploy_events if e["review_id"] == review_id and e["target_env"] == target_env]
+        last = max(rows, key=lambda e: (e["received_at"], e["id"]), default=None)
+        return {k: last[k] for k in ("kind", "image_tag", "received_at")} if last else None
+
     async def deploy_events_for(self, review_id: str) -> list[dict[str, Any]]:
         rows = [{k: v for k, v in e.items() if k != "payload"} for e in self.deploy_events if e["review_id"] == review_id]
         return copy.deepcopy(sorted(rows, key=lambda e: (e["received_at"], e["id"])))
@@ -738,7 +755,7 @@ class InMemoryReviewRepository(MemoryDeployments):
             return copy.deepcopy(rows[-1])
         committed = [r for r in self.reviews.values() if r["spec_ref"].get("repository") == repository
                      and r["status"] == "committed" and r["final_spec"] is not None
-                     and not await self.has_failed_deployment(r["review_id"])]
+                     and not await self.is_deployment_failing(r["review_id"])]
         if not committed:
             return None
         last = max(committed, key=lambda r: r["updated_at"])

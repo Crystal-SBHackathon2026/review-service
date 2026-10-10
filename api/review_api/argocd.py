@@ -15,7 +15,8 @@
 - **images 에는 여러 개가 올 수 있고 순서는 보장되지 않는다.** 롤아웃 중이면 옛 이미지와 새 이미지가 같이 온다.
   그래서 모든 태그로 검토를 찾고 가장 최근 검토(created_at)를 고른다. 첫 매칭을 쓰면 새 배포를 옛 검토에 기록한다
   (10/09 05:45:18 실제 사례).
-- 같은 알림이 여러 번 온다. 같은 (검토, 환경, kind, 이미지 태그)는 한 번만 기록한다.
+- 같은 알림이 여러 번 온다. 그 (검토, 환경)의 마지막 기록과 kind·이미지 태그가 같으면 다시 기록하지 않는다.
+  상태가 바뀐 알림(Healthy → Degraded → Healthy)은 같은 내용이 전에 왔어도 남긴다 — 마지막 알림이 지금 상태다.
 - 검토 한 건은 대상 환경 하나다(deploy.yaml). 같은 병합을 다른 환경(aws 검토의 local 배포)도 배포하는데,
   그 env 로 찾은 검토가 없으면 env 를 보지 않고 같은 앱·병합 SHA 검토를 찾아 deploy_events 에 그 env 로 남긴다
   (cross_env). 진행 화면의 환경별 카드용이다 — baseline·degraded 판단 사례는 검토 대상 환경에서만 남긴다.
@@ -52,7 +53,7 @@ async def latest_matching_review(repo: ReviewRepository, event: ArgoCdEvent, *,
 
 
 async def should_update_baseline(repo: ReviewRepository, row: dict[str, Any]) -> bool:
-    if await repo.has_failed_deployment(row["review_id"]):
+    if await repo.is_deployment_failing(row["review_id"]):  # 실패 뒤 회복했으면 갱신한다
         return False
     current = await repo.get_baseline(row["app"], row["target_env"])
     if current is None:
@@ -74,7 +75,8 @@ async def handle_legacy_event(repo: ReviewRepository, event: ArgoCdEvent) -> dic
     if match is None:
         return {"ignored": "이미지 태그와 맞는 병합 SHA 가 없다"}
     row, tag = match
-    if await repo.has_deploy_event(review_id=row["review_id"], target_env=event.env, kind=kind, image_tag=tag):
+    last = await repo.last_deploy_event(review_id=row["review_id"], target_env=event.env)
+    if last is not None and (last["kind"], last["image_tag"]) == (kind, tag):
         return {"review_id": row["review_id"], "duplicate": True}
     await repo.add_deploy_event(review_id=row["review_id"], app=event.app, target_env=event.env,
                                 kind=kind, image_tag=tag, payload=safe_data(event.model_dump(mode="json")))
@@ -166,9 +168,14 @@ async def handle_deploy_event(repo, event):
     if row and (success or event.kind() != "deployed"):
         kind = {"deployed": "healthy", "health_degraded": "degraded", "sync_failed": "sync_failed"}[event.kind()]
         tag = row.get("merge_sha")
+        payload = safe_data(event.model_dump(mode="json"))
+        last = await repo.last_deploy_event(review_id=row["review_id"], target_env=event.env)
         await repo.mirror_deployment_event(event_id=event_id, review_id=row["review_id"], app=event.app,
-                                           target_env=event.env, kind=kind, image_tag=tag,
-                                           payload=safe_data(event.model_dump(mode="json")))
+                                           target_env=event.env, kind=kind, image_tag=tag, payload=payload)
+        if not inserted and last is not None and last["kind"] != kind:
+            # 전에 받은 것과 같은 본문(같은 event_id)이 상태 전이로 다시 왔다 — 회복·재실패를 남긴다
+            await repo.add_deploy_event(review_id=row["review_id"], app=event.app, target_env=event.env,
+                                        kind=kind, image_tag=tag, payload=payload)
     if success and row and not cross_env and row.get("final_spec"):
         if await should_update_baseline(repo, row):
             await repo.upsert_baseline(app=event.app, target_env=event.env, spec=row["final_spec"],

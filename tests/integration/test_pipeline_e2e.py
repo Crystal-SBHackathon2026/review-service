@@ -556,3 +556,36 @@ async def test_cross_env_baseline_isolation_and_progress_on_postgres(pool):
     progress = await build_progress(repo, "rv_scope", ProgressSettings())
     assert next(s for s in progress["steps"] if s["key"] == "deploy")["state"] == "failed"
     assert progress["review"]["deployment"]["status"] == "failed"
+
+
+async def test_last_deploy_state_decides_baseline_on_postgres(pool):
+    """실패가 있었나가 아니라 마지막 알림이 실패인가 — LAST_DEPLOY_FAILED SQL 을 실제 Postgres 로 고정한다."""
+    from review_api.argocd import ArgoCdEvent, handle_deploy_event
+    from review_api.progress import build_progress, ProgressSettings
+    repo = PostgresReviewRepository(pool)
+    await seed_deployment_review(repo, "rv_flap", "b"*40)
+
+    async def legacy(health):
+        event = dict(app="sample-app", env="aws", health=health, images=["org/app:" + "b"*40], revision="c"*40)
+        return await handle_deploy_event(repo, ArgoCdEvent.model_validate(event))
+
+    async def state():
+        progress = await build_progress(repo, "rv_flap", ProgressSettings())
+        return (next(s for s in progress["steps"] if s["key"] == "deploy")["state"],
+                progress["review"]["deployment"]["status"])
+
+    await legacy("Degraded")
+    assert await repo.is_deployment_failing("rv_flap") and await repo.get_baseline("sample-app", "aws") is None
+    assert (await legacy("Healthy"))["baseline"] == "updated"
+    assert not await repo.is_deployment_failing("rv_flap")
+    assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "b"*40
+    assert (await repo.latest_baseline_for_repository(REPO))["merge_sha"] == "b"*40
+    assert (await state())[0] == "done" and (await state())[1] != "failed"
+    await legacy("Degraded")  # 회복 뒤 다시 실패 — 같은 Degraded 가 전에 왔어도 전이라 기록한다
+    assert await repo.is_deployment_failing("rv_flap")
+    assert await repo.get_baseline("sample-app", "aws") is None
+    assert await state() == ("failed", "failed")
+    assert (await legacy("Degraded"))["duplicate"]
+    assert not (await legacy("Healthy")).get("duplicate")
+    assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "b"*40
+    assert await repo.has_failed_deployment("rv_flap")  # 해결 근거 자격은 '한 번이라도'를 유지

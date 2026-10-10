@@ -11,6 +11,14 @@ from psycopg.types.json import Jsonb
 from review_common.deployment import LEASE_SECONDS, MAX_ATTEMPTS, MAX_EVIDENCE_VERSIONS
 
 
+FAILURE_KINDS = ("degraded", "sync_failed")
+# 검토 대상 환경의 마지막 배포 알림이 실패인가 — "실패가 있었나"가 아니다. 실패 뒤 Healthy 가 오면 회복이다.
+# deploy_events 에는 대상 환경의 실패가 전부 미러되고, v1 Healthy 는 검증된 성공(operation Succeeded)만 들어온다.
+# reviews 별칭 r 에 붙여 쓴다. 알림이 없으면 NULL 이므로 IS TRUE·IS NOT TRUE 로 감싼다.
+LAST_DEPLOY_FAILED = ("(SELECT d.kind FROM deploy_events d WHERE d.review_id=r.review_id AND d.target_env=r.target_env"
+                      " ORDER BY d.received_at DESC,d.id DESC LIMIT 1) IN ('degraded','sync_failed')")
+
+
 def initial_diagnosis():
     return dict(summary="배포 실패가 관측되었습니다. 원인 분석 전입니다.", hypotheses=[], spec_paths=[], evidence=[])
 
@@ -82,6 +90,10 @@ class PostgresDeployments:
             " OR EXISTS(SELECT 1 FROM deploy_events d WHERE d.review_id=r.review_id"
             " AND d.target_env=r.target_env AND d.kind IN ('degraded','sync_failed'))) LIMIT 1",
             (review_id,)) is not None
+
+    async def is_deployment_failing(self, review_id):
+        return await self._fetchone(f"SELECT 1 FROM reviews r WHERE r.review_id=%s AND ({LAST_DEPLOY_FAILED}) IS TRUE",
+                                    (review_id,)) is not None
 
     async def lease_analysis_publications(self):
         # Publish lease avoids a hot loop; successful publication is retried too until consumed.
@@ -203,6 +215,13 @@ class MemoryDeployments:
                    for e in self.observations.values()) or any(
             e["review_id"] == review_id and e["target_env"] == env and e["kind"] in {"degraded", "sync_failed"}
             for e in self.deploy_events)
+
+    async def is_deployment_failing(self, review_id):
+        row = self.reviews.get(review_id)
+        if row is None:
+            return False
+        last = await self.last_deploy_event(review_id=review_id, target_env=row["target_env"])
+        return last is not None and last["kind"] in FAILURE_KINDS
 
     async def lease_analysis_publications(self):
         self._deployment_memory()
