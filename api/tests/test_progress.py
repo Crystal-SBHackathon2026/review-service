@@ -439,6 +439,52 @@ async def test_target_aborted_without_other_healthy_fails(env: Env) -> None:
     assert step(body, "deploy")["state"] == "failed"
 
 
+def argocd_v3_payload(*tags: str) -> dict[str, Any]:
+    """Argo CD v3 실제 알림(sample-app#44) — status.resources 에 헬스가 없고(null), images 는 summary.images."""
+    return {"health": "Degraded", "health_message": None, "images": [f"{IMAGE}:{t}" for t in tags],
+            "resources": [{"kind": "Service", "name": "sample-app", "health": None, "status": "Synced"},
+                          {"kind": "Rollout", "name": "sample-app", "health": None, "status": "Synced"}]}
+
+
+async def test_argocd_v3_abort_from_images() -> None:
+    """헬스 message 가 없으면 images 로 — 이 검토의 태그와 이전 태그가 같이 떠 있으면 새 버전이 막힌 것."""
+    env = Env(deploy_envs=("aws", "gcp", "local"))
+    rid = await scene_14(env, argocd_v3_payload(STABLE, MERGE))
+
+    body = env.progress(rid)
+
+    assert card(body, "aws")["deploy"]["rollout_aborted"] is True
+    assert card(body, "aws")["deploy"]["serving_tag"] == STABLE
+    assert step(body, "deploy")["detail"] == "aws 자동 중단 → 이전 버전 유지 · gcp Healthy · local Healthy"
+
+
+async def test_argocd_v3_only_new_tag_is_plain_degraded(env: Env) -> None:
+    """이 검토의 태그만 떠 있으면 새 버전이 다 올라간 뒤 깨진 것 — 중단이 아니다."""
+    rid = await env.review("rv_n", head="a" * 40, **COMMITTED)
+    await env.repo.add_deploy_event(review_id=rid, app="sample-app", target_env="aws", kind="degraded",
+                                    image_tag=MERGE, payload=argocd_v3_payload(MERGE))
+
+    assert "rollout_aborted" not in card(env.progress(rid), "aws")["deploy"]
+
+
+async def test_argocd_v3_new_tag_missing_is_plain_degraded(env: Env) -> None:
+    """이 검토의 태그가 없으면 새 버전이 떴는지 모른다 — 이전 버전 문제일 수 있어 중단으로 보지 않는다."""
+    rid = await env.review("rv_o", head="a" * 40, **COMMITTED)
+    await env.repo.add_deploy_event(review_id=rid, app="sample-app", target_env="aws", kind="degraded",
+                                    image_tag=MERGE, payload=argocd_v3_payload(STABLE))
+
+    assert "rollout_aborted" not in card(env.progress(rid), "aws")["deploy"]
+
+
+async def test_argocd_v3_uses_merge_sha_when_event_tag_missing(env: Env) -> None:
+    """알림의 image_tag 가 비어도 검토의 merge_sha 로 이 검토의 태그를 안다."""
+    rid = await env.review("rv_m", head="a" * 40, **COMMITTED)
+    await env.repo.add_deploy_event(review_id=rid, app="sample-app", target_env="aws", kind="degraded",
+                                    image_tag=None, payload=argocd_v3_payload(STABLE, MERGE))
+
+    assert card(env.progress(rid), "aws")["deploy"]["rollout_aborted"] is True
+
+
 async def test_done_steps_use_stage_time_columns(env: Env) -> None:
     """7차 0009 열(judged_at·human_decided_at·merged_at·gitops_committed_at)이 있으면 끝난 단계 시각으로 쓴다."""
     rid = await env.review("rv_t", head="a" * 40, **COMMITTED,

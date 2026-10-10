@@ -82,7 +82,7 @@ async def test_publish_failure_does_not_lose_job_and_queued_is_redelivered():
     assert await dispatch_pending(repo, publisher) == 0
 
 
-async def test_invalid_output_is_visible_and_failure_case_is_retained():
+async def test_invalid_output_is_visible_and_failure_case_is_retained(caplog):
     repo = InMemoryReviewRepository()
     spec = {"metadata": {"name": "sample-app"}, "target": {"env": "aws"}}
     await record(repo, spec)
@@ -93,6 +93,8 @@ async def test_invalid_output_is_visible_and_failure_case_is_retained():
     event = await repo.get_deployment(EID)
     assert event["analysis_status"] == "failed" and event["error_code"] == "ANALYSIS_INVALID"
     assert (await repo.get_failure_case(EID))["diagnosis"]["evidence"]
+    invalid = [r.getMessage() for r in caplog.records if "배포 분석 결과 무효" in r.getMessage()]
+    assert len(invalid) == 1 and EID in invalid[0] and "error=" in invalid[0]
 
 
 async def test_static_pass_still_runs_case_advice_and_keeps_original_verdict(harness):

@@ -602,6 +602,10 @@ def make_repair_llm() -> LlmClient | None:
 async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
     import os
 
+    # uvicorn 은 자기 로거만 설정한다 — 루트가 없으면 review_api 의 INFO(웹훅 linked 등)가 안 나온다. 워커와 같은 형식
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
     from aiokafka import AIOKafkaProducer
 
     from review_common.github import GitHubClient
