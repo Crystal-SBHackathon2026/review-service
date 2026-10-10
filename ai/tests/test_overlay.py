@@ -146,13 +146,30 @@ def test_sample_app_has_no_blocking_warning() -> None:
     assert rendered.warnings == ()
 
 
-def test_volume_on_aws_blocks_because_eks_has_no_csi_driver() -> None:
+def test_aws_volume_uses_ebs_storage_class_and_warns_retained() -> None:
+    """2026-10-10: EKS 는 oneaction-monitoring-gp3(EBS, Retain)로 ReadWriteOnce PVC 를 만든다. 배포는 막지 않는다."""
     raw = load_sample_dict("01-pass-sample-app-aws.yaml")
     raw["storage"] = {"volumes": [{"name": "data", "mount_path": "/data", "size": "1Gi"}]}
     rendered = render_overlay(DeploySpec.model_validate(raw))
-    assert [w.code for w in rendered.blocking] == ["VOLUME_UNSUPPORTED"]
-    local = load_sample_dict("02-pass-local-sqlite.yaml")
-    assert "VOLUME_UNSUPPORTED" not in codes(render_overlay(DeploySpec.model_validate(local)))
+    claim = yaml.safe_load(rendered.files["pvc-data.yaml"])["spec"]
+    assert claim == {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}},
+                     "storageClassName": "oneaction-monitoring-gp3"}
+    assert rendered.blocking == ()
+    assert [w.code for w in rendered.warnings] == ["VOLUME_RETAINED"]
+    assert "data 1Gi" in rendered.warnings[0]
+
+
+def test_aws_volume_read_write_many_still_blocks() -> None:
+    raw = load_sample_dict("01-pass-sample-app-aws.yaml")
+    raw["storage"] = {"volumes": [{"name": "data", "mount_path": "/data", "size": "1Gi", "access_mode": "ReadWriteMany"}]}
+    assert [w.code for w in render_overlay(DeploySpec.model_validate(raw)).blocking] == ["VOLUME_UNSUPPORTED"]
+
+
+def test_local_volume_uses_default_class_without_retained_warning() -> None:
+    rendered = render_overlay(DeploySpec.model_validate(load_sample_dict("02-pass-local-sqlite.yaml")))
+    claims = [yaml.safe_load(c)["spec"] for f, c in rendered.files.items() if f.startswith("pvc-")]
+    assert claims and all("storageClassName" not in c for c in claims)
+    assert not codes(rendered) & {"VOLUME_UNSUPPORTED", "VOLUME_RETAINED"}
 
 
 def test_tls_without_host_blocks_tls_secret_does_not() -> None:

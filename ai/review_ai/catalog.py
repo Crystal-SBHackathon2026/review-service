@@ -37,6 +37,8 @@ class TargetCaps:
     arch: frozenset[str]
     database: dict[str, dict[str, tuple[str, ...]]]  # placement → engine → 지원 버전 (빈 튜플 = 무관)
     volume_access_modes: frozenset[str]
+    storage_class: str | None  # PVC 의 storageClassName. None 이면 클러스터 기본 클래스
+    volume_reclaim_policy: str  # 그 클래스의 reclaimPolicy — Retain 이면 PVC 를 지워도 PV·디스크가 남는다
     secret_sources: frozenset[str]
     ingress_class: str
     ingress_annotations: dict[str, str]
@@ -85,6 +87,8 @@ def load_targets() -> dict[str, TargetCaps]:
                 for placement, engines in raw["database"].items()
             },
             volume_access_modes=frozenset(raw["volume_access_modes"]),
+            storage_class=raw.get("storage_class"),
+            volume_reclaim_policy=raw.get("volume_reclaim_policy", "Delete"),
             secret_sources=frozenset(raw["secret_sources"]),
             ingress_class=raw["ingress"]["class"],
             ingress_annotations=dict(raw["ingress"].get("annotations") or {}),

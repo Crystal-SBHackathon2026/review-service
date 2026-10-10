@@ -170,7 +170,8 @@ async def test_generation_reuses_rag_autofix_and_returns_final_yaml(sample_app: 
 
 
 async def test_renderer_blocks_unsupported_generated_volume(sample_app: dict) -> None:
-    sample_app["storage"] = {"volumes": [{"name": "data", "mount_path": "/data", "size": "1Gi"}]}
+    sample_app["storage"] = {"volumes": [{"name": "data", "mount_path": "/data", "size": "1Gi",
+                                          "access_mode": "ReadWriteMany"}]}  # aws(EBS)는 ReadWriteOnce 만
     result = await prepare_and_review(None, context=verified_context(sample_app), review_id="volume",
                                      llm=ScriptedLLM(oracle_review), retriever=FileRetriever())
 

@@ -27,3 +27,16 @@ def internal_open_to_all(ctx: CheckContext) -> list[Hit]:
         for i, cidr in enumerate(ingress.allowed_cidrs)
         if is_full_range(cidr)
     ]
+
+
+def local_internal_not_enforced(ctx: CheckContext) -> list[Hit]:
+    """NET-003 — local 에서 public: false 를 overlay 가 강제하지 못한다 (low 경고).
+
+    local overlay 는 public 값과 무관하게 같은 Traefik Ingress 를 만든다. 내부 전용인지는 클러스터 밖
+    (터널 ingress·라우터 포트포워딩·NodePort·VLAN)이 정한다. allowed_cidrs 가 있으면 INGRESS_CIDRS_NOT_ENFORCED 가
+    커밋을 막으므로 여기서는 보지 않는다.
+    """
+    ingress = ctx.spec.network.ingress
+    if ingress is None or ingress.public or ingress.allowed_cidrs:
+        return []
+    return [Hit("/network/ingress/public", "local: public false 지만 Traefik Ingress 는 공개와 같은 모양 — 내부 전용은 클러스터 밖에서 지켜야 한다")]
