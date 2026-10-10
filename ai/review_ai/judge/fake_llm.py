@@ -102,6 +102,8 @@ def oracle_review(request: JudgeRequest) -> dict[str, Any]:
         items.append({
             "finding_id": f["finding_id"],
             "cited_rule_ids": [f["rule_id"]],
+            "cited_chunk_ids": [d["chunk_id"] for d in request.docs
+                                if d["doc_type"] == "rule" and d["rule_id"] == f["rule_id"]][:1],
             "why": f"{f['title']}. 근거 문서의 권고대로 고친다.",
             "fix_kind": FIX_KIND.get(f["rule_id"], "config"),
         })

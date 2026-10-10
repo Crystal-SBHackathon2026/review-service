@@ -196,6 +196,15 @@ dialog label { display: block; margin: 10px 0 4px; }
     if (s < 86400) return Math.floor(s / 3600) + "시간 " + Math.floor((s % 3600) / 60) + "분 전";
     return Math.floor(s / 86400) + "일 전";
   }
+  function evidenceCards(item) {
+    return ((item || {}).evidence || []).map((d) => el("details", {class: "evidence"}, [
+      el("summary", {text: "인용 근거 · " + (d.rule_id || d.doc_type || "자료") + " · " + d.chunk_id}),
+      el("p", {class: "meta", text: d.source_uri || ""}),
+      el("pre", {text: d.excerpt || ""}),
+      d.truncated ? el("span", {class: "muted", text: "긴 문서의 일부를 표시합니다."}) : null,
+    ]));
+  }
+
   function localTime(iso) {
     const t = Date.parse(iso);
     return Number.isNaN(t) ? String(iso || "") : new Date(t).toLocaleString();
@@ -392,9 +401,10 @@ dialog label { display: block; margin: 10px 0 4px; }
         ]),
         f.evidence ? el("pre", {text: f.evidence}) : null,
         item ? el("div", {class: "why"}, [
-          el("strong", {text: "AI 설명 "}),
+          el("strong", {text: "검토 설명 "}),
           el("span", {class: "meta", text: [(item.cited_rule_ids || []).join(", "), item.fix_kind].filter(Boolean).join(" · ")}),
           el("div", {text: item.why || ""}),
+          ...evidenceCards(item),
         ]) : null,
       ]));
     }
@@ -406,6 +416,8 @@ dialog label { display: block; margin: 10px 0 4px; }
       out.push(el("p", {class: "meta", text: "판정에 쓰이지 않은 AI 의견입니다."}));
       out.push(el("ul", {}, decision.extra_opinions.map((o) => el("li", {text: o}))));
     }
+
+    if (decision.patch_source === "deterministic") out.push(el("p", {class: "meta", text: "수정 후보는 규칙의 확정값과 패치 안전 검사로 계산했습니다."}));
 
     // 권장값
     const recs = decision.recommendations || [];
@@ -436,6 +448,10 @@ dialog label { display: block; margin: 10px 0 4px; }
     if (actual.event_id) out.push(el("button", {type: "button", text: "배포 결과 보기", onclick: () => select("deploy:" + actual.event_id)}));
     out.push(el("h3", {text: "과거 실패 사례 검토"}));
     const advice = r.caseAdvice;
+    const observation = decision.failure_case_observation;
+    if (observation) out.push(el("p", {class: "meta", text: observation.status === "completed"
+      ? "검증된 과거 실패 설정 일치: " + observation.match_count + "건 · 관찰 결과이며 판정에는 반영하지 않습니다."
+      : "과거 실패 설정 일치 여부를 확인하지 못했습니다."}));
     if (!advice) out.push(el("p", {class: "muted", text: "운영자 토큰을 입력하면 사례 안내를 볼 수 있습니다."}));
     else if (advice.status !== "completed") out.push(el("p", {class: "notice info", text: advice.message || "사례 검토 상태: " + (advice.status === "not_checked" ? "검토 전" : "검토 불가")}));
     else if (!advice.items.length) out.push(el("p", {class: "muted", text: "검색된 관련 실패 사례가 없습니다."}));

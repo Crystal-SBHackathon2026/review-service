@@ -173,15 +173,32 @@ def compare_case(case, spec):
 async def case_advice(repo, spec, repository):
     try:
         cases = await asyncio.wait_for(repo.find_failure_cases(app=spec["metadata"]["name"], repository=repository,
-                                             target_env=spec["target"]["env"]), timeout=5)
+                                             target_env=spec["target"]["env"], limit=50), timeout=5)
         grouped = {}
         for c in cases:
             key = c.get("attempt_key") or c["case_id"]
             if key not in grouped or (c.get("resolution") and not grouped[key].get("resolution")):
                 grouped[key] = c
         compared = [compare_case(c, spec) for c in grouped.values()]
+        # 표시 상한(5개)과 별개로 조회한 모든 사례를 관찰한다. 가설·조건 없는 해결 기록은 제외한다.
+        matches = []
+        for c, view in zip(grouped.values(), compared):
+            resolution = c.get("resolution") or {}
+            conditions = resolution.get("conditions") or []
+            verified = (resolution.get("confirmed_by") == "review-api-operator"
+                        and bool(resolution.get("success_event_id")) and bool(conditions))
+            if verified and view["applicability"] == "applicable" and all(
+                condition["failed_value"] != condition["resolved_value"] for condition in conditions
+            ):
+                matches.append(c["case_id"])
+        observation = dict(mode="observe", status="completed", matched_case_ids=matches,
+                           match_count=len(matches), scanned_cases=len(grouped),
+                           search_complete=len(cases) < 50, search_limit=50,
+                           scope="app_repository_environment", enforcement_ready=False)
         # Relevant configuration candidates first; retain an explicit unresolved observation if no path exists.
         compared.sort(key=lambda c: (c["applicability"] == "resolved", not bool(c["related"]), not c["verified"]))
-        return dict(status="completed", items=compared[:5])
+        return dict(status="completed", items=compared[:5], observation=observation)
     except Exception:
-        return dict(status="unavailable", items=[], message="실패 사례 검토를 사용할 수 없습니다.")
+        return dict(status="unavailable", items=[], message="실패 사례 검토를 사용할 수 없습니다.",
+                    observation=dict(mode="observe", status="unavailable", matched_case_ids=[], match_count=None,
+                                     search_complete=False, enforcement_ready=False))

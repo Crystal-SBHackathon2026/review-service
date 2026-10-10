@@ -274,6 +274,11 @@ cases:
     intake: {repo: sample-app, file: missing}
     llm: reviewer
     expect: {intake_kind: missing, intake: generated, verdict: pass, findings: [], llm_calls: 0}
+  - id: e01b-missing-unverified
+    intake: {repo: sample-app-unverified, file: missing}
+    llm: reviewer
+    expect: {intake_kind: missing, intake: generated, verdict: needs_human,
+             reasons_include: [GENERATED_SPEC_UNVERIFIED], llm_calls: 0}
   - id: e02-empty                # 배포된 앱의 명세를 비운 PR — baseline 의 ingress·replicas·env 를 그대로 둔다 (sample-app #11)
     intake: {repo: sample-app, raw: "# 나중에 채운다\n", baseline: 01-pass-sample-app-aws.yaml}
     llm: reviewer

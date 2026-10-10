@@ -178,7 +178,7 @@ def _history_report(report: dict[str, Any]) -> dict[str, Any]:
                 for f in report.get("findings") or []]
     for finding in findings:
         finding["location"] = {"spec_path": (finding.get("location") or {}).get("spec_path")}
-    items = [{k: item[k] for k in ("finding_id", "why", "cited_rule_ids") if k in item}
+    items = [{k: item[k] for k in ("finding_id", "why", "cited_rule_ids", "cited_chunk_ids", "evidence", "citation_status") if k in item}
              for item in report.get("items") or []]
     return mask_spec({"findings": findings, "items": items, "doc_ids": report.get("doc_ids") or []})
 
@@ -200,6 +200,7 @@ def review_history(chain: list[dict[str, Any]], row: dict[str, Any]) -> list[dic
         for snapshot in r.get("rounds") or []:
             human = snapshot.get("human")
             rounds.append({"round": snapshot.get("round"), "verdict": snapshot.get("verdict"),
+                           "patch_source": snapshot.get("patch_source"),
                            **_history_report(snapshot), "ops": _history_ops(snapshot.get("patch") or {}),
                            "actor": "human" if human else "ai",
                            "approver": human.get("approver") if human else None})

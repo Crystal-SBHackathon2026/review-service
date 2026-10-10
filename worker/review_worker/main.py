@@ -52,6 +52,18 @@ ALIVE_FILE = "/tmp/worker-alive"
 ALIVE_TOUCH_SECONDS = 30.0  # 처리 중 갱신 주기 — probe 기준(2분)보다 넉넉히 짧게
 
 
+def review_feature_flags() -> dict[str, bool]:
+    """검증 뒤 명시적으로 활성화한다. 설정 오타로 정책이 바뀌면 시작을 거부한다."""
+    flags = {}
+    for name, field in (("REVIEW_STRICT_CITATIONS", "strict_citations"),
+                        ("REVIEW_DETERMINISTIC_FIXES", "deterministic_fixes")):
+        value = os.environ.get(name, "false").strip().lower()
+        if value not in {"true", "false", "1", "0"}:
+            raise ValueError(f"{name} must be true/false or 1/0")
+        flags[field] = value in {"true", "1"}
+    return flags
+
+
 def make_llm() -> CachedLLM | None:
     try:
         return CachedLLM(MeteredLLM(ClaudeLLM(client_options=JUDGE_CLIENT_OPTIONS), purpose="judge"))
@@ -124,6 +136,7 @@ def make_analysis_llm():
 
 
 async def run() -> None:
+    features = review_feature_flags()
     start_http_server(int(os.environ.get("METRICS_PORT") or DEFAULT_METRICS_PORT))
     conninfo = db_conninfo()
     await migrate(conninfo)
@@ -159,7 +172,7 @@ async def run() -> None:
                     retriever=retriever, commit_overlay=make_commit_overlay(gitops),
                     overlay_guard=make_overlay_guard(gitops),
                     ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None,
-                    public_url=os.environ.get("REVIEW_API_PUBLIC_URL") or None)
+                    public_url=os.environ.get("REVIEW_API_PUBLIC_URL") or None, **features)
         graph = build_graph(deps, checkpointer)
         handler = ReviewHandler(repo, graph, files=github)
         analysis_handler = DeploymentAnalysisHandler(repo, make_analysis_llm(), retriever)

@@ -132,6 +132,8 @@ class Deps:
     public_url: str | None = None  # REVIEW_API_PUBLIC_URL — 커밋 상태 링크 /ui/reviews/{id}(진행 화면)의 앞부분
     judge_max_retries: int = JUDGE_MAX_RETRIES
     retry_backoff_seconds: float = 1.0
+    strict_citations: bool = False
+    deterministic_fixes: bool = False
 
 
 def is_fork_pull(pull: dict[str, Any], repository: str) -> bool:
@@ -156,7 +158,8 @@ def ci_conclusion(suites: list[dict[str, Any]], app_slug: str | None) -> str | N
 
 def build_graph(deps: Deps, checkpointer: Any) -> Any:
     repo, github = deps.repo, deps.github
-    judge_once = make_judge(deps.llm)
+    judge_once = make_judge(deps.llm, strict_citations=deps.strict_citations,
+                            deterministic_fixes=deps.deterministic_fixes)
 
     async def _retry(what: str, call: Callable[[], Awaitable[Any]]) -> Any:
         for attempt in range(GITHUB_MAX_ATTEMPTS):
@@ -234,7 +237,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     async def inspect_failure_cases(state):
         advice = await case_advice(repo, state["deploy_spec"], state["spec_ref"].get("repository", ""))
         await repo.update_review(state["review_id"], case_advice=advice)
-        return {}
+        # 관찰만 한다. verdict·patch·사유 코드·승인 경로에는 영향이 없다.
+        return {"decision": {**state["decision"], "failure_case_observation": advice["observation"]}}
 
     async def record_result(state: dict[str, Any]) -> dict[str, Any]:
         decision = state["decision"]

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -25,6 +26,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from review_ai.catalog import load_targets
+from review_ai.failure_evidence import safe_text
 from review_ai.judge.prompt import RULE_PATCH_PATHS
 from review_ai.judge.schema import LlmPatch, LlmReview
 from review_ai.overlay import overlay_diff
@@ -55,13 +57,41 @@ def parse_review(text: str, findings: Sequence[Finding]) -> LlmReview | None:
     return _sanitized(review)
 
 
-def citations_ok(review: LlmReview, findings: Sequence[Finding], docs: Sequence[Doc]) -> bool:
-    available = {d["rule_id"] for d in docs if d["rule_id"]}
+def citations_ok(review: LlmReview, findings: Sequence[Finding], docs: Sequence[Doc], *, strict: bool = True) -> bool:
+    available = {d["chunk_id"]: d for d in docs}
+    available_rules = {d["rule_id"] for d in docs if d["rule_id"]}
     rule_of = {f["finding_id"]: f["rule_id"] for f in findings}
-    return all(
-        set(item.cited_rule_ids) <= available and rule_of[item.finding_id] in item.cited_rule_ids
-        for item in review.items
-    )
+    for item in review.items:
+        own_rule = rule_of[item.finding_id]
+        if not set(item.cited_rule_ids) <= available_rules or own_rule not in item.cited_rule_ids:
+            return False
+        ids = item.cited_chunk_ids
+        if len(ids) != len(set(ids)) or not set(ids) <= available.keys():
+            return False
+        cited = [available[cid] for cid in ids]
+        if strict and not any(
+            d["doc_type"] == "rule" and d["rule_id"] == own_rule for d in cited
+        ):
+            return False
+    return True
+
+
+def citation_evidence(review: LlmReview, docs: Sequence[Doc]) -> dict[str, list[dict[str, Any]]]:
+    """유효한 인용의 당시 내용을 저장한다. 비밀 제거·크기 제한 뒤의 본문 해시로 변경 여부를 비교할 수 있다."""
+    by_id = {d["chunk_id"]: d for d in docs}
+    result = {}
+    for item in review.items:
+        evidence = []
+        for cid in item.cited_chunk_ids:
+            if cid not in by_id:
+                continue
+            d = by_id[cid]
+            text = safe_text(d["text"])
+            evidence.append(dict(chunk_id=cid, rule_id=d["rule_id"], doc_type=d["doc_type"],
+                                 source_uri=safe_text(d["source_uri"])[:512], excerpt=text[:800],
+                                 content_hash=hashlib.sha256(text.encode()).hexdigest(), truncated=len(text) > 800))
+        result[item.finding_id] = evidence
+    return result
 
 
 def _overlaps(path: str, pattern: str) -> bool:
@@ -228,7 +258,7 @@ def overlay_files(before: DeploySpec, after: DeploySpec) -> list[dict[str, str]]
 
 
 def validate_output(
-    text: str, findings: Sequence[Finding], docs: Sequence[Doc], spec: dict[str, Any]
+    text: str, findings: Sequence[Finding], docs: Sequence[Doc], spec: dict[str, Any], *, strict_citations: bool = True
 ) -> tuple[LlmReview | None, Validation, Patch | None]:
     review = parse_review(text, findings)
     if review is None:
@@ -237,7 +267,8 @@ def validate_output(
     validation = Validation(
         llm_available=True,
         schema_ok=True,
-        citations_ok=citations_ok(review, findings, docs),
+        citations_ok=citations_ok(review, findings, docs, strict=strict_citations),
+        chunk_citations_ok=citations_ok(review, findings, docs, strict=True),
         patch_scope_ok=review.patch is None or patch is not None,
     )
     return review, validation, patch

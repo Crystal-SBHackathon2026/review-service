@@ -108,6 +108,21 @@ def test_past_case_does_not_count_as_rule_evidence() -> None:
     assert "LOW_SCORE" not in decide(findings, docs=exact_docs(findings) + cases)["reasons"]
 
 
+@pytest.mark.parametrize("kind", ["case", "incident", "guide"])
+def test_high_score_context_cannot_replace_missing_rule(kind: str) -> None:
+    findings = findings_for("07-fix-public-bucket.yaml")
+    context = [{**d, "doc_type": kind} for d in exact_docs(findings)]
+    unrelated = Doc(chunk_id="other", rule_id="DB-002", doc_type="rule", provider="any",
+                    match="semantic", score=0.99, source_uri="other.md", text="")
+    assert "LOW_SCORE" in decide(findings, docs=[*context, unrelated])["reasons"]
+
+
+def test_rule_evidence_is_required_for_each_finding() -> None:
+    findings = findings_for("10-human-mixed-aws.yaml")
+    docs = exact_docs(findings)[:1]
+    assert "LOW_SCORE" in decide(findings, docs=docs)["reasons"]
+
+
 def test_loop_exhausted_after_max_rounds() -> None:
     findings = findings_for("07-fix-public-bucket.yaml")
     rounds = [{"finding_ids": ["other"]}] * MAX_PATCH_ROUNDS
@@ -132,7 +147,7 @@ def test_round_snapshot_shape() -> None:
     decision = decide(findings)
     snap = round_snapshot({"findings": findings, "decision": decision, "patch": None, "retry_count": 0})
     assert snap == {"round": 0, "finding_ids": [findings[0]["finding_id"]], "findings": findings, "verdict": "fix",
-                    "reasons": [], "items": decision["items"], "doc_ids": [], "patch": None}
+                    "reasons": [], "items": decision["items"], "doc_ids": [], "patch": None, "validation": dict(OK)}
     assert snap["findings"] is not findings  # 이후 State 변경이 기록에 번지지 않게 복사
 
 

@@ -189,6 +189,15 @@ tbody tr:hover { background: var(--hover); }
     const t = Date.parse(iso);
     return Number.isNaN(t) ? "" : new Date(t).toLocaleTimeString();
   }
+  function evidenceCards(item) {
+    return ((item || {}).evidence || []).map((d) => el("details", {class: "evidence"}, [
+      el("summary", {text: "인용 근거 · " + (d.rule_id || d.doc_type || "자료") + " · " + d.chunk_id}),
+      el("p", {class: "meta", text: d.source_uri || ""}),
+      el("pre", {text: d.excerpt || ""}),
+      d.truncated ? el("span", {class: "muted", text: "긴 문서의 일부를 표시합니다."}) : null,
+    ]));
+  }
+
   function localTime(iso) {
     const t = Date.parse(iso);
     return Number.isNaN(t) ? String(iso || "") : new Date(t).toLocaleString();
@@ -423,7 +432,8 @@ tbody tr:hover { background: var(--hover); }
           f.irreversible ? " · 되돌릴 수 없음" : "", f.autofix === "forbidden" ? " · 자동 수정 금지" : "",
         ]),
         f.evidence ? el("pre", {text: f.evidence}) : null,
-        item && item.why ? el("div", {class: "why"}, [el("strong", {text: "AI 설명 "}), el("div", {text: item.why})]) : null,
+        item && item.why ? el("div", {class: "why"}, [el("strong", {text: "검토 설명 "}), el("div", {text: item.why})]) : null,
+        ...evidenceCards(item),
         item && (item.cited_rule_ids || []).length
           ? el("div", {class: "meta"}, ["근거 문서 ", ...item.cited_rule_ids.map((c) => el("span", {class: "chip rule", text: c}))])
           : null,
@@ -444,7 +454,8 @@ tbody tr:hover { background: var(--hover); }
       const contents = [el("p", {class: "meta"}, [localTime(h.created_at), " · ",
         link(h.commit_url, "검토 커밋 " + short(h.commit)) || "검토 " + h.review_id])];
       for (const r of rounds) {
-        const actor = r.actor === "human" ? "사람 수정" + (r.approver ? " · " + r.approver : "") : "AI 수정";
+        const actor = r.actor === "human" ? "사람 수정" + (r.approver ? " · " + r.approver : "")
+          : r.patch_source === "deterministic" ? "규칙 기반 수정" : "AI 수정";
         const docs = r.doc_ids || [];
         contents.push(el("div", {class: "round"}, [
           el("h4", {text: "회차 " + (Number.isInteger(r.round) ? r.round + 1 : "-") + " · " + actor
