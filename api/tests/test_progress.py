@@ -12,6 +12,7 @@ from review_api.app import ApiDeps, create_app
 from review_api.argocd import ArgoCdEvent, handle_deploy_event
 from review_api.progress import ProgressSettings, parse_app_urls
 from review_common.repository import InMemoryReviewRepository
+from review_ai.secrets_pattern import MASK
 
 REPO = "Crystal-SBHackathon2026/sample-app"
 IMAGE = "ghcr.io/crystal-sbhackathon2026/sample-app"
@@ -134,6 +135,124 @@ async def test_two_autofix_commits_chain(env: Env) -> None:
     assert step(latest, "review")["at"] is None  # 0009 judged_at 이 없는 행 — 시각 없이
     assert states(latest) == {"review": "done", "ci": "running", "merge": "waiting", "gitops": "waiting",
                               "deploy": "waiting"}
+
+
+def fix_snapshot(*, why: str = "SQLite 는 단일 replica 로 실행해야 합니다", value: int = 1) -> dict[str, Any]:
+    return {
+        "round": 0, "verdict": "fix", "reasons": [],
+        "findings": [{"finding_id": "db_replicas", "rule_id": "DB-003", "severity": "high",
+                      "title": "SQLite 다중 replica", "location": {"spec_path": "/runtime/replicas"},
+                      "evidence": "replicas=2", "autofix": "allowed", "irreversible": False}],
+        "items": [{"finding_id": "db_replicas", "why": why, "cited_rule_ids": ["DB-003"]}],
+        "doc_ids": ["rules/db-003#0"],
+        "patch": {"kind": "config", "target_finding_ids": ["db_replicas"],
+                  "ops": [{"op": "replace", "path": "/runtime/replicas", "value": value}], "files": []},
+    }
+
+
+async def test_history_survives_autofix_pass_and_old_url(env: Env) -> None:
+    snapshot = fix_snapshot()
+    first = await env.review("rv_before", head="a" * 40, verdict="pass", findings=[], rounds=[snapshot])
+    latest = await env.review("rv_after", head="b" * 40, requested_by="autofix:rv_before", **COMMITTED)
+    await env.repo.update_review(first, status="superseded", superseded_by=latest)
+
+    old, body = env.progress(first), env.progress(latest)
+
+    assert old["latest_review_id"] == latest
+    assert body["findings"] == [] and body["rounds"] == [] and body["review"]["verdict"] == "pass"
+    history = body["history"]
+    assert [h["review_id"] for h in history] == [first, latest]
+    assert [h["is_current"] for h in history] == [False, True]
+    before = history[0]
+    assert before["rounds"][0]["items"] == snapshot["items"]
+    assert before["rounds"][0]["findings"] == snapshot["findings"]
+    assert before["rounds"][0]["doc_ids"] == snapshot["doc_ids"]
+    assert before["rounds"][0]["ops"] == snapshot["patch"]["ops"]
+    assert before["rounds"][0]["actor"] == "ai"
+    assert before["patch_commit"] == "committed"
+    assert before["next"] == {"review_id": latest, "kind": "autofix", "commit": "b" * 40,
+                              "commit_url": f"https://github.com/{REPO}/commit/{'b' * 40}",
+                              "status": "committed", "verdict": "pass"}
+    assert old["history"][0]["rounds"] == before["rounds"]
+    assert len(old["history"]) == 1  # 요청한 검토 뒤의 회차는 그 검토로 이동해 확인
+
+
+async def test_history_preserves_repeated_finding_by_review_and_round(env: Env) -> None:
+    one, two, three = fix_snapshot(why="첫 설명"), fix_snapshot(why="두 번째 설명"), fix_snapshot(why="다른 검토의 설명")
+    two["round"] = 1
+    first = await env.review("rv_1", head="a" * 40, rounds=[one, two])
+    second = await env.review("rv_2", head="b" * 40, requested_by="autofix:rv_1", rounds=[three])
+    await env.repo.update_review(first, status="superseded", superseded_by=second)
+
+    history = env.progress(second)["history"]
+
+    assert [[r["items"][0]["why"] for r in h["rounds"]] for h in history] == [
+        ["첫 설명", "두 번째 설명"], ["다른 검토의 설명"]]
+    assert [r["round"] for r in history[0]["rounds"]] == [0, 1]
+
+
+@pytest.mark.parametrize("requested_by", ["hyeyeon", "autofix:rv_other"])
+async def test_history_manual_or_wrong_autofix_parent_is_not_applied(env: Env, requested_by: str) -> None:
+    first = await env.review("rv_before", head="a" * 40, rounds=[fix_snapshot()])
+    latest = await env.review("rv_after", head="b" * 40, requested_by=requested_by, **COMMITTED)
+    await env.repo.update_review(first, status="superseded", superseded_by=latest)
+
+    before = env.progress(latest)["history"][0]
+
+    assert before["patch_commit"] == "unconfirmed"
+    assert before["next"]["kind"] == "new_commit"
+
+
+async def test_history_failed_branch_update_is_not_committed(env: Env) -> None:
+    first = await env.review("rv_before", head="a" * 40, status="failed", verdict="pass",
+                             error="commit_fix: branch changed", rounds=[fix_snapshot()])
+    # commit_fix 는 새 검토를 먼저 만든다. 브랜치 갱신 실패 시 superseded_by 는 연결되지 않는다.
+    await env.review("rv_orphan", head="b" * 40, requested_by="autofix:rv_before", status="failed")
+
+    history = env.progress(first)["history"]
+
+    assert len(history) == 1
+    assert history[0]["patch_commit"] == "failed" and history[0]["next"] is None
+
+
+async def test_history_internal_patch_is_not_yet_a_commit(env: Env) -> None:
+    rid = await env.review("rv_h", head="a" * 40, status="needs_human", verdict="needs_human",
+                           rounds=[fix_snapshot()])
+    assert env.progress(rid)["history"][0]["patch_commit"] == "unconfirmed"
+
+
+async def test_history_human_round_and_public_fields(env: Env) -> None:
+    snapshot = fix_snapshot()
+    snapshot["human"] = {"decision": "approved", "approver": "혜연", "internal": "not-public"}
+    snapshot["deploy_spec"] = {"private": "not-public"}
+    snapshot["patch"]["files"] = [{"path": "private.yaml", "diff": "not-public"}]
+    snapshot["patch"]["ops"].extend([
+        {"op": "replace", "path": "/runtime/env/PASSWORD", "value": "ordinary-private-value"},
+        {"op": "add", "path": "/runtime/env/NORMAL", "value": "another-private-value"},
+        {"op": "replace", "path": "/runtime", "value": {"env": {"PASSWORD": "nested-private-value"}}},
+    ])
+    snapshot["items"][0]["llm"] = {"prompt": "not-public"}
+    rid = await env.review("rv_h", head="a" * 40, verdict="pass", rounds=[snapshot],
+                           decision={"items": [], "llm": {"input": "not-public"}},
+                           final_spec={"runtime": {"env": {"PASSWORD": "not-public"}}})
+
+    history = env.progress(rid)["history"]
+    report = history[0]["rounds"][0]
+
+    assert report["actor"] == "human" and report["approver"] == "혜연"
+    assert report["ops"][0]["value"] == 1
+    assert report["ops"][1]["value"] == MASK and report["ops"][2]["value"] == MASK
+    assert report["ops"][3]["value"]["env"]["PASSWORD"] == MASK
+    assert "not-public" not in str(history) and "private-value" not in str(history)
+    assert "files" not in report and "llm" not in report["items"][0]
+    assert "deploy_spec" not in report and "final_spec" not in history[0]
+
+
+async def test_history_empty_legacy_records(env: Env) -> None:
+    rid = await env.review("rv_legacy", head="a" * 40)
+    report = env.progress(rid)["history"][0]
+    assert report["rounds"] == [] and report["findings"] == [] and report["items"] == []
+    assert report["patch_commit"] == "unconfirmed"
 
 
 async def test_needs_human_waiting_then_approved(env: Env) -> None:
