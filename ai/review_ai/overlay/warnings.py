@@ -13,6 +13,7 @@ WarningCode = Literal[
     "DB_PROVISIONING_REQUIRED",
     "BUCKET_PROVISIONING_REQUIRED",
     "VOLUME_UNSUPPORTED",
+    "VOLUME_RETAINED",
     "INGRESS_CIDRS_NOT_ENFORCED",
     "TLS_HOST_MISSING",
     "TLS_SECRET_REQUIRED",
@@ -24,6 +25,7 @@ BLOCKING: dict[str, bool] = {
     "DB_PROVISIONING_REQUIRED": True,  # 없는 DB 를 바라보면 앱이 뜨지 않는다
     "BUCKET_PROVISIONING_REQUIRED": True,
     "VOLUME_UNSUPPORTED": True,  # PVC 가 Pending 에 머문다
+    "VOLUME_RETAINED": False,  # 배포는 된다 — PVC 를 지운 뒤 남는 PV·디스크(과금) 정리를 사람에게 알린다
     # 명세가 막으라고 한 대역이 강제되지 않아 공개로 열린다(local·gcp 만. aws 는 ALB inbound-cidrs 로 강제된다).
     # TLS_HOST_MISSING 과 같은 보호 누락이라 fail-closed (D11, 10/08).
     "INGRESS_CIDRS_NOT_ENFORCED": True,

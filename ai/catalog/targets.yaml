@@ -2,21 +2,28 @@
 # verified: false 는 아직 실측 전. 팀이 클러스터를 만들면 값을 확인해 true 로 바꾼다.
 # database: placement → engine → 지원 메이저 버전. 버전 목록이 []면 버전 무관.
 # volume_access_modes: [] 면 그 환경은 PVC 를 만들 수 없다 (STO-001 이 막고, 렌더러는 blocking 경고).
+# storage_class: PVC 에 적을 storageClassName (없으면 클러스터 기본 클래스).
+# volume_reclaim_policy: 그 클래스의 reclaimPolicy (기본 Delete). Retain 이면 렌더러가 VOLUME_RETAINED 경고를 붙인다.
 # ingress: overlay 렌더러(review_ai/overlay)가 쓰는 Ingress 클래스와 환경 고정 annotation.
 
 targets:
   aws:
     # 2026-10-08 실측 (EKS 인계서 · Notion "배포 에이전트 설계" 6절): oneaction EKS 1.36,
     # t3.medium 2대(AL2023 x86_64), 애드온은 VPC CNI·kube-proxy·CoreDNS·Pod Identity Agent 4개뿐(Terraform 고정).
+    # 2026-10-10 갱신 (Slack, 이성진): EBS CSI 사용 가능 — StorageClass oneaction-monitoring-gp3(Retain)에
+    # Prometheus 10Gi·Grafana 2Gi PVC 가 Bound. 같은 클래스를 일반 앱 PVC 에도 쓴다.
     verified: true
     arch: [amd64]
     database:
       # RDS postgres 16.15 는 있지만 앱마다 DB 를 만드는 수단(Crossplane)이 아직 없다 →
       # 검토는 통과시키고 렌더러가 DB_PROVISIONING_REQUIRED(blocking)로 배포를 멈춘다.
       managed: {postgres: ["16"], mysql: ["8.0"]}
-      # in-cluster·volume 은 PVC 가 필요한데 EBS CSI 드라이버가 없어 만들 수 없다.
+      # in-cluster·volume(SQLite)은 PVC 로 만들 수 있지만 일부러 열지 않는다(10/10 결정) — EBS 는 단일 AZ·Retain 이라
+      # DB 를 올리려면 백업·AZ 장애·정리 절차를 먼저 정해야 한다. SQLite 앱은 managed postgres 변환(DB_SQLITE_TO_POSTGRES)으로 간다.
       external: {postgres: [], mysql: []}
-    volume_access_modes: []                        # EBS CSI 미설치 — 볼륨을 쓰는 명세는 배포 불가
+    volume_access_modes: [ReadWriteOnce]           # EBS gp3. 단일 AZ — 공유·여러 AZ 동시 마운트(ReadWriteMany)는 EFS 가 필요
+    storage_class: oneaction-monitoring-gp3
+    volume_reclaim_policy: Retain                  # PVC 를 지워도 PV·EBS 와 과금이 남는다 → VOLUME_RETAINED
     # ESO 동기화는 아직 platform namespace 에만 설정돼 있다. 앱 namespace 의 aws-secrets-manager 는
     # 렌더러 SECRET_KEYS_REQUIRED 경고대로 Secret 이 미리 있어야 한다.
     secret_sources: [aws-secrets-manager, k8s-secret, generated]

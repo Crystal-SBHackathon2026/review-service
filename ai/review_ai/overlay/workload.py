@@ -72,13 +72,17 @@ def pod_volumes(spec: AppSpec) -> list[dict[str, Any]]:
     ]
 
 
-def pvc(spec: AppSpec, volume_name: str) -> dict[str, Any]:
+def pvc(spec: AppSpec, volume_name: str, storage_class: str | None = None) -> dict[str, Any]:
+    """storage_class 가 None 이면 storageClassName 을 쓰지 않는다 — 클러스터 기본 클래스를 쓴다."""
     v = next(v for v in spec.storage.volumes if v.name == volume_name)
+    claim: dict[str, Any] = {"accessModes": [v.access_mode], "resources": {"requests": {"storage": v.size}}}
+    if storage_class:
+        claim["storageClassName"] = storage_class
     return {
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
         "metadata": {"name": pvc_name(spec, v.name)},
-        "spec": {"accessModes": [v.access_mode], "resources": {"requests": {"storage": v.size}}},
+        "spec": claim,
     }
 
 

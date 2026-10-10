@@ -130,7 +130,7 @@ evidence 에도 값을 남기지 않는다. `source: generated` 는 배포 시 �
 4. **decide_verdict 보완.** low finding 은 `forbidden` 이어도 사람 조건에서 빼야 한다.
    안 그러면 HTTP 전용인 지금의 sample-app(NET-001)이 매번 needs_human 이 된다.
 5. ~~**명세 → kustomize overlay 변환은 누가 하나.**~~ → 검토 서비스 코드(`review_ai/overlay`)가 만든다. 지금 sample-app overlay 3개를 그대로 재현한다 — [review-ai.md](review-ai.md#overlay-렌더러-결정-7-검토-서비스-코드가-만든다)
-6. **능력표 실측.** ~~EKS~~ → aws 실측 반영(10/08): amd64, EBS CSI 없음 → 볼륨·in-cluster DB·SQLite 볼륨 불가, 앱별 DB 생성 수단 없음. 남은 것: GKE·Cloud SQL 유무, busan-local 노드 아키텍처.
+6. **능력표 실측.** ~~EKS~~ → aws 실측 반영(10/08): amd64, 앱별 DB 생성 수단 없음. 10/10: EBS CSI 사용 가능 → ReadWriteOnce 볼륨(oneaction-monitoring-gp3, Retain) 가능, in-cluster DB·SQLite 볼륨은 일부러 막아 둠(DB-002). 남은 것: GKE·Cloud SQL 유무, busan-local 노드 아키텍처.
 7. **`source: generated` 시크릿은 누가 만드나.**
 
 ## 범위 밖
