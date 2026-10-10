@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+
 from pydantic import ValidationError
 
 from review_ai.deployment_analysis import diagnose, evidence_from
@@ -11,6 +13,8 @@ from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.static_check import run_static_check
 from review_ai.retrieval import Scope
 from review_common.deployment import AnalysisRequested, MAX_ATTEMPTS
+
+log = logging.getLogger(__name__)
 
 
 class DeploymentAnalysisHandler:
@@ -28,6 +32,9 @@ class DeploymentAnalysisHandler:
         event = await self.repo.get_deployment(msg.event_id)
         if event is None:
             raise RuntimeError("claimed deployment event missing")
+        log.info("배포 분석 시작 event_id=%s kind=%s app=%s env=%s review_id=%s linked=%s attempt=%s",
+                 msg.event_id, event["kind"], event["app"], event["target_env"], event["review_id"],
+                 event["review_id"] is not None, job["attempts"])
         cases, docs = [], []
         if event["repository"] and event["spec_snapshot"]:
             cases = await self.repo.find_failure_cases(app=event["app"], repository=event["repository"],
@@ -58,5 +65,8 @@ class DeploymentAnalysisHandler:
         if event["repository"] and event["spec_snapshot"]:
             case = dict(case_id=msg.event_id, app=event["app"], repository=event["repository"],
                         target_env=event["target_env"], failed_spec=event["spec_snapshot"], diagnosis=result)
-        await self.repo.finish_analysis(msg.event_id, job["lease_token"], status=status, result=result,
-                                        error_code=code, case=case)
+        saved = await self.repo.finish_analysis(msg.event_id, job["lease_token"], status=status, result=result,
+                                                error_code=code, case=case)
+        log.info("배포 분석 끝 event_id=%s app=%s env=%s review_id=%s status=%s error_code=%s case=%s",
+                 msg.event_id, event["app"], event["target_env"], event["review_id"], status, code,
+                 ("saved" if case else "none") if saved else "lease_lost")
