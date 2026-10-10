@@ -60,7 +60,7 @@ pre { background: var(--code-bg); padding: 8px; border-radius: 6px; margin: 4px 
 .badge.reviewing, .badge.waiting_ci, .badge.merging, .badge.received, .badge.medium { background: var(--info-bg);
   color: var(--info-text); }
 .badge.committed, .badge.healthy { background: var(--ok-bg); color: var(--ok); }
-.badge.rejected, .badge.failed, .badge.blocked, .badge.degraded { background: var(--danger-bg); color: var(--danger); }
+.badge.rejected, .badge.failed, .badge.blocked, .badge.degraded, .badge.sync_failed { background: var(--danger-bg); color: var(--danger); }
 .badge.high { font-weight: 600; }
 .chip { display: inline-block; padding: 0 6px; border: 1px solid var(--border); border-radius: 4px; font-size: 12px;
   color: var(--muted); white-space: nowrap; }
@@ -141,7 +141,7 @@ tbody tr:hover { background: var(--hover); }
     superseded: "새 검토로 대체됨",
   };
   const ENV_LABEL = {aws: "AWS", local: "로컬", gcp: "GCP"};
-  const HEALTH_LABEL = {healthy: "Healthy", degraded: "Degraded"};
+  const HEALTH_LABEL = {healthy: "Healthy", degraded: "Degraded", sync_failed: "SyncFailed"};
   const ICON = {done: "✓", failed: "!", running: "", waiting: "", skipped: "–"};
   const STATE_LABEL = {done: "완료", failed: "실패", running: "진행 중", waiting: "대기", skipped: "건너뜀"};
   const LIST_STATUSES = Object.keys(STATUS_LABEL).filter((s) => s !== "superseded");
@@ -308,6 +308,13 @@ tbody tr:hover { background: var(--hover); }
 
   function resultBand(p) {
     const r = p.review;
+    const deployment = r.deployment || {};
+    const targetFailure = p.envs.find((c) => c.is_target && c.deploy && ["degraded", "sync_failed"].includes(c.deploy.kind));
+    if (deployment.status === "failed" || targetFailure) {
+      const destination = deployment.event_id ? "deploy:" + deployment.event_id : r.review_id;
+      return el("div", {class: "notice err band"}, [el("strong", {text: "대상 환경의 배포가 실패했습니다. 이전 버전은 정상 응답할 수 있습니다."}),
+        el("a", {class: "button", href: "/ui#" + encodeURIComponent(destination), text: "오류 증거·원인 분석 확인 (운영자 토큰 필요)"})]);
+    }
     const live = p.envs.filter((c) => !c.planned && c.deploy && c.deploy.kind === "healthy");
     if (live.length) {
       const links = live.map((c) => el("span", {}, [envName(c.env) + " ", link(c.app_url) || el("span", {class: "muted", text: "주소 미설정"})]));
@@ -321,7 +328,7 @@ tbody tr:hover { background: var(--hover); }
       return el("div", {class: "notice warn band"}, [el("strong", {text: "사람 확인을 기다립니다"}),
         el("a", {class: "button", href: "/ui#" + encodeURIComponent(r.review_id), text: "승인 화면에서 결정하기"})]);
     }
-    const degraded = p.envs.find((c) => !c.planned && c.deploy && c.deploy.kind === "degraded");
+    const degraded = p.envs.find((c) => !c.planned && c.deploy && ["degraded", "sync_failed"].includes(c.deploy.kind));
     if (degraded) return el("div", {class: "notice err", text: envName(degraded.env) + " 배포가 Degraded 입니다."});
     return null;
   }

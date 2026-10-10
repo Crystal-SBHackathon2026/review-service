@@ -112,6 +112,8 @@ dialog label { display: block; margin: 10px 0 4px; }
   <section class="panel" aria-labelledby="list-title">
     <h2 id="list-title">진행 중인 검토</h2>
     <ul id="list" class="list"></ul>
+    <h2>배포 실패 분석</h2>
+    <ul id="deployment-list" class="list"></ul>
   </section>
   <section class="panel" aria-live="polite">
     <div id="detail"><p class="empty">왼쪽에서 검토를 고르세요.</p></div>
@@ -122,7 +124,7 @@ dialog label { display: block; margin: 10px 0 4px; }
 <dialog id="settings">
   <form id="settings-form" method="dialog">
     <h2>승인자·토큰</h2>
-    <p class="muted">조회는 토큰 없이 됩니다. 승인·거절에만 토큰이 필요합니다. 이 탭을 닫으면 지워집니다.</p>
+    <p class="muted">기본 검토 조회는 토큰 없이 됩니다. 오류 상세·사례 안내·승인·거절에는 운영자 토큰이 필요합니다. 이 탭을 닫으면 지워집니다.</p>
     <label for="f-approver">승인자 이름</label>
     <input id="f-approver" name="approver" autocomplete="name" required>
     <label for="f-token">REVIEW_API_TOKEN</label>
@@ -138,7 +140,11 @@ dialog label { display: block; margin: 10px 0 4px; }
 <script>
 "use strict";
 (function () {
+  let deploymentRows = [], resolutionFormKey = "";
   const ACTIVE = ["needs_human", "reviewing", "waiting_ci", "merging"];
+  const ANALYSIS_LABEL = {pending: "분석 대기", queued: "분석 대기", processing: "분석 중", completed: "분석 완료",
+    insufficient: "정보 부족", failed: "분석 오류", skipped: "분석 횟수 제한"};
+  const DEPLOYMENT_LABEL = {deployed: "정상 배포 알림", health_degraded: "상태 악화", sync_failed: "동기화 실패"};
   const LIST_MS = 5000, DETAIL_MS = 3000;
   const STATUS_LABEL = {
     received: "접수", reviewing: "검토 중", needs_human: "사람 확인 필요", waiting_ci: "CI 대기",
@@ -227,13 +233,17 @@ dialog label { display: block; margin: 10px 0 4px; }
     $("f-token").value = "";
     save(KEY_APPROVER, approver);
     save(KEY_TOKEN, token);
+    lastDetailJson = "";
+    pollDeploymentList();
     renderWho();
   });
   $("settings-cancel").addEventListener("click", () => { $("f-token").value = ""; $("settings").close(); });
   $("open-settings").addEventListener("click", () => openSettings());
 
-  async function getJson(url) {
-    const res = await fetch(url, {headers: {Accept: "application/json"}, cache: "no-store"});
+  async function getJson(url, authenticated = false) {
+    const headers = {Accept: "application/json"};
+    if (authenticated && token) headers.Authorization = "Bearer " + token;
+    const res = await fetch(url, {headers, cache: "no-store"});
     if (!res.ok) { const err = new Error("HTTP " + res.status); err.status = res.status; throw err; }
     return res.json();
   }
@@ -290,7 +300,7 @@ dialog label { display: block; margin: 10px 0 4px; }
     if (!id || id === selectedId) return;
     selectedId = id;
     if (location.hash.slice(1) !== encodeURIComponent(id)) history.replaceState(null, "", "#" + encodeURIComponent(id));
-    lastDetailJson = ""; respondKey = ""; current = null;
+    lastDetailJson = ""; respondKey = ""; resolutionFormKey = ""; current = null;
     $("detail").replaceChildren(el("p", {class: "muted", text: "불러오는 중…"}));
     $("respond").replaceChildren();
     markSelected();
@@ -300,9 +310,14 @@ dialog label { display: block; margin: 10px 0 4px; }
 
   async function pollDetail() {
     if (!selectedId) return;
+    if (selectedId.startsWith("deploy:")) { await pollDeploymentDetail(); return; }
     const id = selectedId;
     try {
       const review = await getJson("/reviews/" + encodeURIComponent(id));
+      if (token) {
+        try { review.caseAdvice = await getJson("/reviews/" + encodeURIComponent(id) + "/case-advice", true); }
+        catch (e) { review.caseAdvice = {status: "unavailable", message: "사례 안내를 불러오지 못했습니다 (HTTP " + e.status + ")"}; }
+      }
       if (id !== selectedId) return;
       setConn(true);
       const text = JSON.stringify(review);
@@ -413,6 +428,28 @@ dialog label { display: block; margin: 10px 0 4px; }
       ])]));
     }
 
+    out.push(el("h3", {text: "실제 배포 상태"}));
+    const actual = r.deployment || {};
+    out.push(el("p", {class: actual.status === "failed" ? "notice err" : "muted",
+      text: actual.status === "failed" ? "배포 실패가 관측되었습니다. 오류 상세에서 원인 후보와 확인 항목을 확인하세요." :
+        actual.status === "healthy" ? "정상 배포가 관측되었습니다." : "실제 배포 결과 확인 전입니다."}));
+    if (actual.event_id) out.push(el("button", {type: "button", text: "배포 결과 보기", onclick: () => select("deploy:" + actual.event_id)}));
+    out.push(el("h3", {text: "과거 실패 사례 검토"}));
+    const advice = r.caseAdvice;
+    if (!advice) out.push(el("p", {class: "muted", text: "운영자 토큰을 입력하면 사례 안내를 볼 수 있습니다."}));
+    else if (advice.status !== "completed") out.push(el("p", {class: "notice info", text: advice.message || "사례 검토 상태: " + (advice.status === "not_checked" ? "검토 전" : "검토 불가")}));
+    else if (!advice.items.length) out.push(el("p", {class: "muted", text: "검색된 관련 실패 사례가 없습니다."}));
+    else for (const item of advice.items) {
+      if (item.applicability === "resolved") {
+        out.push(el("p", {class: "notice ok", text: "관련 조건 해소 · " + item.reason}));
+        continue;
+      }
+      out.push(el("p", {class: "notice info", text: (item.verified ? "검증된 사례" : "원인 후보 사례") + " · " + item.reason + " · " + item.summary}));
+      out.push(el("button", {type: "button", text: "과거 실패 증거 보기", onclick: () => select("deploy:" + item.case_id)}));
+      out.push(el("pre", {text: json(item.related)}));
+      out.push(el("ul", {}, (item.actions || []).map(a => el("li", {text: a}))));
+    }
+
     // 처리 이력
     out.push(el("h3", {text: "처리 이력"}));
     const human = r.human_decision;
@@ -426,6 +463,98 @@ dialog label { display: block; margin: 10px 0 4px; }
       ["오류", r.error ? el("pre", {text: r.error}) : null],
     ]));
     $("detail").replaceChildren(...out);
+  }
+
+  async function pollDeploymentList() {
+    if (!token) { $("deployment-list").replaceChildren(el("li", {class: "empty", text: "오류 상세 조회에는 운영자 토큰이 필요합니다."})); return; }
+    try {
+      deploymentRows = await getJson("/deployments?limit=50", true);
+      const rows = deploymentRows.filter(r => r.kind !== "deployed");
+      $("deployment-list").replaceChildren(...(rows.length ? rows.map(r => el("li", {
+        tabindex: "0", onclick: () => select("deploy:" + r.event_id),
+        onkeydown: e => { if (e.key === "Enter") select("deploy:" + r.event_id); }
+      }, [el("div", {text: r.app + " · " + r.target_env}),
+          el("div", {class: "meta", text: (DEPLOYMENT_LABEL[r.kind] || r.kind) + " · " + (ANALYSIS_LABEL[r.analysis_status] || "분석 상태 확인 전") + (r.review_id ? "" : " · 명세 미연결")})])) :
+      [el("li", {class: "empty", text: "수신한 배포 실패가 없습니다."})]));
+    } catch (e) {
+      $("deployment-list").replaceChildren(el("li", {class: "notice err", text: "배포 결과를 불러오지 못했습니다 (HTTP " + e.status + ")"}));
+    }
+  }
+
+  async function pollDeploymentDetail() {
+    const selected = selectedId;
+    if (!token) {
+      $("detail").replaceChildren(el("p", {class: "notice info", text: "오류 상세 조회에는 운영자 토큰이 필요합니다."}));
+      $("respond").replaceChildren(); return;
+    }
+    try {
+      const row = await getJson("/deployments/" + encodeURIComponent(selected.slice(7)), true);
+      if (selected !== selectedId) return;
+      const result = row.result || {};
+      const out = [el("h2", {text: row.app + " · 배포 결과"}),
+        el("p", {class: row.kind === "deployed" ? "notice ok" : "notice err", text: row.kind === "deployed" ? "정상 배포 알림" : "배포 실패 알림"}),
+        el("p", {class: "muted", text: ANALYSIS_LABEL[row.analysis_status] || "분석 대상이 아닙니다."}),
+        el("p", {text: "자동 재배포는 실행하지 않습니다. 아래 확인·수정 항목을 검토한 뒤 새 배포를 요청하세요."})];
+      if (!row.review_id) out.push(el("p", {class: "notice info", text: "실패한 명세를 정확히 연결하지 못했습니다. 오류 증거만 분석합니다."}));
+      if (result.summary) out.push(el("p", {text: result.summary}));
+      for (const h of result.hypotheses || []) {
+        out.push(el("h3", {text: "원인 후보"}), el("p", {text: h.reason}),
+          el("p", {class: "muted", text: "근거: " + h.evidence_ids.join(", ")}),
+          el("ul", {}, h.actions.map(a => el("li", {text: a}))));
+      }
+      out.push(el("h3", {text: "추가 확인 사항"}), el("ul", {}, (result.additional_information || []).map(a => el("li", {text: a}))));
+      out.push(el("h3", {text: "관측 오류"}), el("pre", {text: json(result.evidence || row.payload)}));
+      if (row.review_id) out.push(el("button", {type: "button", text: "배포 전 검토 보기", onclick: () => select(row.review_id)}));
+      $("detail").replaceChildren(...out); renderResolutionForm(row);
+    } catch (e) {
+      if (selected === selectedId) { $("detail").replaceChildren(el("p", {class: "notice err", text: "오류 상세를 불러오지 못했습니다 (HTTP " + e.status + ")"})); $("respond").replaceChildren(); resolutionFormKey = ""; }
+    }
+  }
+
+  function renderResolutionForm(row) {
+    if (row.kind === "deployed" || !row.review_id) { $("respond").replaceChildren(); resolutionFormKey = ""; return; }
+    if (row.resolution) {
+      resolutionFormKey = row.event_id + ":confirmed";
+      $("respond").replaceChildren(el("p", {class: "notice ok", text: "해결 확인이 기록되었습니다. 다음 요청에서 관련 수정 조건을 비교합니다."})); return;
+    }
+    const successes = deploymentRows.filter(r => r.kind === "deployed" && r.review_id && r.review_id !== row.review_id
+      && r.app === row.app && r.target_env === row.target_env && r.repository === row.repository
+      && Date.parse(r.occurred_at) > Date.parse(row.occurred_at) && r.payload.health === "Healthy"
+      && r.payload.sync_status === "Synced" && (r.payload.operation || {}).phase === "Succeeded");
+    const key = row.event_id + ":" + successes.map(r => r.event_id).join(",");
+    if (key === resolutionFormKey) return;
+    resolutionFormKey = key;
+    if (!successes.length) {
+      $("respond").replaceChildren(el("p", {class: "muted", text: "관련 수정 후 새 배포가 성공하면 운영자가 해결 사례로 확인할 수 있습니다."})); return;
+    }
+    const successSelect = el("select", {"aria-label": "해결을 확인한 성공 배포"}, successes.map(r => el("option", {
+      value: r.event_id, text: r.app + " · " + new Date(r.occurred_at).toLocaleString() + " · " + r.review_id})));
+    const cause = el("textarea", {required: true, maxLength: 2000, "aria-label": "확인한 원인"});
+    const actions = el("textarea", {required: true, maxLength: 5000, "aria-label": "실제로 확인한 해결 조치"});
+    const paths = el("input", {type: "text", "aria-label": "해결과 관련된 설정 경로", placeholder: "/runtime/health/readiness (없으면 비움)",
+      value: ((row.result || {}).spec_paths || []).join(", ")});
+    const msg = el("p", {class: "muted"});
+    const button = el("button", {type: "submit", text: "해결 사례 확인"});
+    const form = el("form", {}, [el("h3", {text: "해결 사례 확인"}),
+      el("p", {text: "단순한 후속 성공이 아니라, 이 실패의 원인과 아래 수정이 실제로 연결됐음을 운영자가 확인하는 단계입니다."}),
+      el("label", {text: "해결을 확인한 성공 배포"}, [successSelect]),
+      el("label", {text: "확인한 원인"}, [cause]), el("label", {text: "실제로 확인한 해결 조치 (줄마다 한 항목)"}, [actions]),
+      el("label", {text: "해결과 관련된 설정 경로 (쉼표로 구분, 외부 권한 등은 비움)"}, [paths]), button, msg]);
+    form.addEventListener("submit", async e => {
+      e.preventDefault();
+      if (!confirm("해당 실패와 선택한 새 배포의 수정·해결 결과가 연결됐음을 확인하셨습니까?")) return;
+      button.disabled = true;
+      try {
+        const res = await fetch("/failure-cases/" + encodeURIComponent(row.event_id) + "/resolution", {
+          method: "POST", headers: {"Content-Type": "application/json", Authorization: "Bearer " + token},
+          body: JSON.stringify({success_event_id: successSelect.value, cause: cause.value,
+            actions: actions.value.split("\n").map(s => s.trim()).filter(Boolean),
+            config_paths: paths.value.split(",").map(s => s.trim()).filter(Boolean)})});
+        if (!res.ok) throw new Error((await errorDetail(res)) || "HTTP " + res.status);
+        msg.className = "notice ok"; msg.textContent = "해결 확인을 기록했습니다. 다음 요청에서 관련 수정 조건을 비교합니다.";
+      } catch (err) { msg.className = "notice err"; msg.textContent = err.message; button.disabled = false; }
+    });
+    $("respond").replaceChildren(form);
   }
 
   // --- 응답 ---
@@ -605,6 +734,7 @@ dialog label { display: block; margin: 10px 0 4px; }
   renderWho();
   if (!approver || !token) openSettings();
   loop(pollList, LIST_MS);
+  loop(pollDeploymentList, LIST_MS);
   loop(pollDetail, DETAIL_MS);
   setInterval(refreshAges, 1000 * 30);
 })();

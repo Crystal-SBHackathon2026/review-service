@@ -39,7 +39,7 @@ from typing import Any, Protocol, get_args
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from review_ai.graph import check_edited_ops
 from review_ai.intake.repair import RepairOutput
@@ -51,11 +51,15 @@ from review_ai.spec.deploy_spec import REPOSITORY
 from review_ai.transform import TRANSFORM_MAX_TOKENS
 from review_ai.transform.prompt import TransformOutput
 from review_api.argocd import ArgoCdEvent, handle_deploy_event
+from review_api.deployment_contract import MAX_BODY
+from review_api.deployments import ResolutionIn, resolve_case
+from review_ai.failure_evidence import safe_data
+from review_common.deployment import dispatch_best_effort, sweep_analysis
 from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spec, open_intake, process_intake,
                                sweep_stale_intakes)
 from review_api import metrics
 from review_api.lockfile import regenerate_lockfile
-from review_api.progress import ProgressSettings, build_progress, review_view
+from review_api.progress import ProgressSettings, build_progress, deployment_summary, review_view
 from review_api.recovery import sweep_stale_reviews
 from review_common.github import GitHubError, SpecNotFound
 from review_common.ids import new_review_id
@@ -233,7 +237,9 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         row = await d(request).repo.get_review(review_id)
         if row is None:
             raise HTTPException(404, "검토가 없다")
-        return review_view(row)
+        deployment = await deployment_summary(d(request).repo, row)
+        return {**review_view(row), "deployment": deployment,
+                "case_advice_status": (row.get("case_advice") or {}).get("status", "not_checked")}
 
     @app.get("/reviews/{review_id}/progress")
     async def get_progress(review_id: str, request: Request) -> dict[str, Any]:
@@ -344,7 +350,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         return {"resumed": resumed}
 
     @app.post("/webhooks/argocd", status_code=202)
-    async def argocd_webhook(event: ArgoCdEvent, request: Request,
+    async def argocd_webhook(request: Request, background: BackgroundTasks,
                              authorization: str = Header(default="")) -> dict[str, Any]:
         deps_ = d(request)
         try:
@@ -352,13 +358,52 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         except HTTPException:
             metrics.webhook("argocd", "rejected")
             raise
+        data = bytearray()
+        async for chunk in request.stream():
+            data.extend(chunk)
+            if len(data) > MAX_BODY:
+                raise HTTPException(413, "웹훅 본문이 너무 큽니다")
+        try:
+            event = ArgoCdEvent.model_validate_json(bytes(data))
+        except ValidationError:
+            # Pydantic error input may contain credentials; never echo it to the sender.
+            raise HTTPException(422, "배포 결과 JSON 명세가 맞지 않습니다")
         try:
             result = await handle_deploy_event(deps_.repo, event)
         except Exception:
             metrics.webhook("argocd", "error")
             raise
         metrics.webhook("argocd", metrics.argocd_result(result))
+        background.add_task(dispatch_best_effort, deps_.repo, deps_.publisher)
         return result
+
+    @app.get("/deployments")
+    async def deployments(request: Request, authorization: str = Header(default=""),
+                          review_id: str | None = None, limit: int = Query(default=50, ge=1, le=100)):
+        require_bearer(authorization, d(request).api_token, "REVIEW_API_TOKEN")
+        return safe_data(await d(request).repo.list_deployments(review_id, limit))
+
+    @app.get("/deployments/{event_id}")
+    async def deployment(event_id: str, request: Request, authorization: str = Header(default="")):
+        require_bearer(authorization, d(request).api_token, "REVIEW_API_TOKEN")
+        row = await d(request).repo.get_deployment(event_id)
+        if row is None:
+            raise HTTPException(404, "배포 결과가 없습니다")
+        return safe_data(row)
+
+    @app.get("/reviews/{review_id}/case-advice")
+    async def advice(review_id: str, request: Request, authorization: str = Header(default="")):
+        require_bearer(authorization, d(request).api_token, "REVIEW_API_TOKEN")
+        row = await d(request).repo.get_review(review_id)
+        if row is None:
+            raise HTTPException(404, "검토가 없습니다")
+        return safe_data(row.get("case_advice") or {"status": "not_checked", "items": []})
+
+    @app.post("/failure-cases/{case_id}/resolution")
+    async def resolution(case_id: str, body: ResolutionIn, request: Request,
+                         authorization: str = Header(default="")):
+        require_bearer(authorization, d(request).api_token, "REVIEW_API_TOKEN")
+        return await resolve_case(d(request).repo, case_id, body)
 
     return app
 
@@ -585,12 +630,14 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
         progress=ProgressSettings.from_env(os.environ),
     )
     sweeps = [asyncio.create_task(sweep_stale_intakes(app.state.deps)),
-              asyncio.create_task(sweep_stale_reviews(app.state.deps))]  # 멈춘 intake·검토 회수
+              asyncio.create_task(sweep_stale_reviews(app.state.deps)),
+              asyncio.create_task(sweep_analysis(app.state.deps.repo, app.state.deps.publisher))]  # 멈춘 intake·검토 회수
     try:
         yield
     finally:
         for sweep in sweeps:
             sweep.cancel()
+        await asyncio.gather(*sweeps, return_exceptions=True)
         await producer.stop()
         await github.aclose()
         await pool.close()

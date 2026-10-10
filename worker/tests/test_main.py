@@ -112,3 +112,18 @@ async def test_handler_exception_still_stops_the_loop(tmp_path: Path) -> None:
     with pytest.raises(ConnectionError):
         await consume(consumer, Broken(), stop, AliveFile(tmp_path / "a"), handle_limit_seconds=900)
     assert consumer.commits == 0
+
+
+async def test_analysis_routing_preserves_review_consumption_and_alive(tmp_path):
+    from review_common.deployment import TOPIC
+    from review_worker.main import RoutedHandler
+    class Analysis:
+        def __init__(self): self.values = []
+        async def handle(self, value): self.values.append(value)
+    stop = asyncio.Event()
+    consumer = FakeConsumer(stop, [("review.requested", b"review"), (TOPIC, b"evidence")])
+    review, analysis = SlowHandler(), Analysis()
+    alive = CountingAlive(tmp_path / "alive")
+    await consume(consumer, RoutedHandler(review, analysis), stop, alive, handle_limit_seconds=900)
+    assert review.handled == [b"review"] and analysis.values == [b"evidence"]
+    assert consumer.commits == 2 and alive.touches == consumer.polls

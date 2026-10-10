@@ -113,7 +113,7 @@ async def test_migrate_is_idempotent(conninfo: str) -> None:
                                        "0004_spec_intakes.sql", "0005_review_cases.sql",
                                        "0006_generated_spec_unverified.sql", "0007_review_recovery.sql",
                                        "0008_review_head_unique.sql", "0009_review_stage_times.sql",
-                                       "0010_intake_attempts.sql"]
+                                       "0010_intake_attempts.sql", "0011_deployment_analysis.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -406,3 +406,188 @@ async def test_api_to_kafka_to_worker(pool: Any) -> None:
     finally:
         await consumer.stop()
         await producer.stop()
+
+
+async def seed_deployment_review(repo, rid, revision, *, readiness="/wrong"):
+    import copy
+    spec = yaml.safe_load((SAMPLES / "01-pass-sample-app-aws.yaml").read_text())
+    spec["runtime"]["health"]["readiness"] = readiness
+    await repo.insert_review(review_id=rid, app=spec["metadata"]["name"], target_env="aws", repo_id=REPO,
+        spec_ref={"repository": REPO, "commit": revision, "path": "deploy.yaml"}, pr_head_sha=revision, requested_by="it")
+    await repo.update_review(rid, status="committed", merge_sha=revision, gitops_commit_sha=revision, final_spec=spec)
+    return spec
+
+
+def deployment_payload(kind="sync_failed", revision="b"*40):
+    return dict(schema_version="deployment.result/v1", event_type=kind, app="sample-app", env="aws",
+        health="Healthy", sync_status="Synced", images=[], revision="a"*40, namespace="sample-app",
+        cluster_id="it-cluster", operation=dict(phase="Succeeded" if kind == "deployed" else "Failed",
+            revision=revision, message="probe failed to become ready", started_at="2026-10-09T14:00:00+09:00",
+            finished_at="2026-10-09T14:01:00+09:00"))
+
+
+async def test_deployment_outbox_atomic_deduplication_and_lease_recovery(pool):
+    from review_api.argocd import ArgoCdEvent, handle_deploy_event
+    from review_common.deployment import AnalysisRequested, dispatch_pending
+    from review_worker.deployment_analysis import DeploymentAnalysisHandler
+    from review_ai.judge.llm import LlmResponse
+    repo = PostgresReviewRepository(pool)
+    spec = await seed_deployment_review(repo, "rv_failure", "b"*40)
+    results = await asyncio.gather(*(handle_deploy_event(repo, ArgoCdEvent.model_validate(deployment_payload())) for _ in range(20)))
+    eid = results[0]["event_id"]
+    assert sum(not r["duplicate"] for r in results) == 1
+    assert len(await repo.list_deployments()) == 1
+    assert len(await repo.deploy_events_for("rv_failure")) == 1
+    assert await repo.get_failure_case(eid)
+    assert (await repo.latest_baseline_for_repository(REPO)) is None
+    class DownPublisher:
+        async def send(self, *args):
+            raise RuntimeError("broker down")
+    assert await dispatch_pending(repo, DownPublisher()) == 0
+    assert (await repo.get_deployment(eid))["analysis_status"] == "queued"
+    abandoned = await repo.claim_analysis(eid)
+    await repo._execute("UPDATE deployment_analysis_jobs SET lease_until=now()-interval '1 second' WHERE event_id=%s", (eid,))
+    class Llm:
+        async def complete(self, request):
+            return LlmResponse(json.dumps(dict(summary="probe 경로 원인 후보", hypotheses=[dict(reason="probe 경로 확인 필요",
+                evidence_ids=["e2"], spec_paths=["/runtime/health/readiness"], actions=["probe 경로 확인"])],
+                additional_information=[], cited_case_ids=[])), "fake")
+    await DeploymentAnalysisHandler(PostgresReviewRepository(pool), Llm()).handle(AnalysisRequested(event_id=eid).model_dump_json().encode())
+    assert (await repo.get_deployment(eid))["analysis_status"] == "completed"
+    assert not await repo.finish_analysis(eid, abandoned["lease_token"], status="failed", result={})
+    assert (await repo.get_failure_case(eid))["diagnosis"]["spec_paths"] == ["/runtime/health/readiness"]
+    from review_ai.deployment_analysis import case_advice
+    advice = await case_advice(PostgresReviewRepository(pool), spec, REPO)
+    assert advice["items"][0]["case_id"] == eid
+    assert advice["items"][0]["applicability"] == "applicable"
+    # Same attempt's additional evidence is retained, but only three analysis jobs are admitted.
+    for i in range(3):
+        body = deployment_payload(); body["operation"]["message"] = f"new evidence {i}"
+        await handle_deploy_event(repo, ArgoCdEvent.model_validate(body))
+    rows = await repo.list_deployments()
+    assert len(rows) == 4 and sum(r["analysis_status"] == "skipped" for r in rows) == 1
+
+
+async def test_deployment_api_kafka_analysis_and_verified_next_request(pool):
+    from review_common.deployment import TOPIC as ANALYSIS_TOPIC
+    from review_worker.deployment_analysis import DeploymentAnalysisHandler
+    from review_ai.judge.llm import LlmResponse
+    from review_ai.deployment_analysis import case_advice
+    await _ensure_topics(ANALYSIS_TOPIC)
+    repo = PostgresReviewRepository(pool)
+    failed_spec = await seed_deployment_review(repo, "rv_failed", "b"*40)
+    await seed_deployment_review(repo, "rv_old", "a"*40, readiness="/ready")
+    producer = AIOKafkaProducer(bootstrap_servers=BOOTSTRAP)
+    consumer = AIOKafkaConsumer(ANALYSIS_TOPIC, bootstrap_servers=BOOTSTRAP, group_id="failure-it-"+uuid.uuid4().hex[:8],
+        enable_auto_commit=False, auto_offset_reset="latest")
+    await producer.start(); await consumer.start()
+    while not consumer.assignment():
+        await consumer.getmany(timeout_ms=200)
+    await consumer.seek_to_end()
+    class Publisher:
+        async def send(self, topic, key, value):
+            await producer.send_and_wait(topic, value=value, key=key.encode())
+    class Llm:
+        async def complete(self, req):
+            return LlmResponse(json.dumps(dict(summary="probe 오류", hypotheses=[dict(reason="경로 불일치 후보",
+                evidence_ids=["e2"], spec_paths=["/runtime/health/readiness"], actions=["readiness 경로 확인"])],
+                additional_information=[], cited_case_ids=[])), "fake")
+    app = create_app(ApiDeps(repo=repo, specs=None, publisher=Publisher(), api_token="operator", argocd_webhook_token="argo"))
+    handler = DeploymentAnalysisHandler(repo, Llm())
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://it") as c:
+            auth = {"Authorization": "Bearer argo"}
+            assert (await c.post("/webhooks/argocd", json=deployment_payload("deployed", "a"*40), headers=auth)).status_code == 202
+            r = await c.post("/webhooks/argocd", json=deployment_payload(), headers=auth)
+            assert r.status_code == 202
+            eid = r.json()["event_id"]
+            for _ in range(50):
+                for records in (await consumer.getmany(timeout_ms=200)).values():
+                    for record in records:
+                        assert set(json.loads(record.value)) == {"schema_version", "event_id"}
+                        await handler.handle(record.value); await consumer.commit()
+                if (await repo.get_deployment(eid))["analysis_status"] == "completed":
+                    break
+            assert (await repo.get_deployment(eid))["analysis_status"] == "completed"
+            assert (await c.get(f"/deployments/{eid}")).status_code == 401
+            assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "a"*40
+            fixed_spec = await seed_deployment_review(repo, "rv_fixed", "c"*40, readiness="/ready")
+            body = deployment_payload("deployed", "c"*40)
+            body["operation"]["started_at"] = "2026-10-09T15:00:00+09:00"
+            body["operation"]["finished_at"] = "2026-10-09T15:01:00+09:00"
+            success = (await c.post("/webhooks/argocd", json=body, headers=auth)).json()["event_id"]
+            resolution = await c.post(f"/failure-cases/{eid}/resolution", headers={"Authorization": "Bearer operator"},
+                json=dict(success_event_id=success, cause="경로 불일치 확인", actions=["경로 수정 확인"], config_paths=["/runtime/health/readiness"]))
+            assert resolution.status_code == 200, resolution.text
+            # Re-created repository proves persistence; static findings are not needed for this path.
+            advice = await case_advice(PostgresReviewRepository(pool), fixed_spec, REPO)
+            resolved = next(a for a in advice["items"] if a["case_id"] == eid)
+            assert resolved["applicability"] == "resolved" and resolved["actions"] == []
+            assert (await repo.get_review("rv_failed"))["status"] == "committed"
+    finally:
+        await consumer.stop(); await producer.stop()
+
+
+async def test_cross_env_baseline_isolation_and_progress_on_postgres(pool):
+    from review_api.argocd import ArgoCdEvent, handle_deploy_event
+    from review_api.progress import build_progress, ProgressSettings
+    repo = PostgresReviewRepository(pool)
+    await seed_deployment_review(repo, "rv_scope", "b"*40)
+    healthy = ArgoCdEvent.model_validate(deployment_payload("deployed"))
+    await handle_deploy_event(repo, healthy)
+    await repo._execute("UPDATE baselines SET database_has_data=true WHERE app='sample-app' AND target_env='aws'", ())
+    local = deployment_payload(); local["env"] = "local"
+    local["cluster_id"] = "crystal-busan"
+    results = await asyncio.gather(*(handle_deploy_event(repo, ArgoCdEvent.model_validate(local)) for _ in range(10)))
+    assert all(r["cross_env"] and not r["linked"] for r in results)
+    assert len([e for e in await repo.deploy_events_for("rv_scope") if e["target_env"] == "local"]) == 1
+    assert not await repo.has_failed_deployment("rv_scope")
+    assert (await repo.get_baseline("sample-app", "aws"))["database_has_data"] is True
+    assert (await repo.latest_baseline_for_repository(REPO))["merge_sha"] == "b"*40
+    assert await repo.get_baseline("sample-app", "local") is None
+    assert await repo.find_failure_cases(app="sample-app", repository=REPO, target_env="aws") == []
+    # Existing historical cross-env healthy rows cannot qualify as a target baseline.
+    await repo._execute("DELETE FROM baselines", ())
+    await repo._execute("DELETE FROM deploy_events WHERE target_env='aws'", ())
+    await repo._execute("DELETE FROM deployment_observations WHERE kind='deployed'", ())
+    assert await repo.get_baseline("sample-app", "aws") is None
+    # Target failure is visible even alongside healthy secondary environment notifications.
+    await handle_deploy_event(repo, ArgoCdEvent.model_validate(deployment_payload()))
+    local["event_type"] = "deployed"; local["operation"]["phase"] = "Succeeded"
+    await handle_deploy_event(repo, ArgoCdEvent.model_validate(local))
+    progress = await build_progress(repo, "rv_scope", ProgressSettings())
+    assert next(s for s in progress["steps"] if s["key"] == "deploy")["state"] == "failed"
+    assert progress["review"]["deployment"]["status"] == "failed"
+
+
+async def test_last_deploy_state_decides_baseline_on_postgres(pool):
+    """실패가 있었나가 아니라 마지막 알림이 실패인가 — LAST_DEPLOY_FAILED SQL 을 실제 Postgres 로 고정한다."""
+    from review_api.argocd import ArgoCdEvent, handle_deploy_event
+    from review_api.progress import build_progress, ProgressSettings
+    repo = PostgresReviewRepository(pool)
+    await seed_deployment_review(repo, "rv_flap", "b"*40)
+
+    async def legacy(health):
+        event = dict(app="sample-app", env="aws", health=health, images=["org/app:" + "b"*40], revision="c"*40)
+        return await handle_deploy_event(repo, ArgoCdEvent.model_validate(event))
+
+    async def state():
+        progress = await build_progress(repo, "rv_flap", ProgressSettings())
+        return (next(s for s in progress["steps"] if s["key"] == "deploy")["state"],
+                progress["review"]["deployment"]["status"])
+
+    await legacy("Degraded")
+    assert await repo.is_deployment_failing("rv_flap") and await repo.get_baseline("sample-app", "aws") is None
+    assert (await legacy("Healthy"))["baseline"] == "updated"
+    assert not await repo.is_deployment_failing("rv_flap")
+    assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "b"*40
+    assert (await repo.latest_baseline_for_repository(REPO))["merge_sha"] == "b"*40
+    assert (await state())[0] == "done" and (await state())[1] != "failed"
+    await legacy("Degraded")  # 회복 뒤 다시 실패 — 같은 Degraded 가 전에 왔어도 전이라 기록한다
+    assert await repo.is_deployment_failing("rv_flap")
+    assert await repo.get_baseline("sample-app", "aws") is None
+    assert await state() == ("failed", "failed")
+    assert (await legacy("Degraded"))["duplicate"]
+    assert not (await legacy("Healthy")).get("duplicate")
+    assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "b"*40
+    assert await repo.has_failed_deployment("rv_flap")  # 해결 근거 자격은 '한 번이라도'를 유지
