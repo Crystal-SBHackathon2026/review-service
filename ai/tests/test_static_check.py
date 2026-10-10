@@ -318,7 +318,7 @@ def test_sto002_rwo_volume_shared_by_replicas(sample_app: dict[str, Any], volume
 def test_sto002_leaves_sqlite_volume_to_db003() -> None:
     spec = load_sample_dict("02-pass-local-sqlite.yaml")
     spec["runtime"]["replicas"] = 2
-    assert rule_ids(spec) == ["DB-003"]
+    assert "STO-002" not in rule_ids(spec) and "DB-003" in rule_ids(spec)
 
 
 def test_sto006_removed_persistent_volume_points_into_baseline(sample_app: dict[str, Any]) -> None:
@@ -454,3 +454,56 @@ def test_sto004_unencrypted_bucket(sample_app: dict[str, Any]) -> None:
     assert (f["severity"], f["autofix"], f["location"]["spec_path"]) == ("medium", "allowed", "/storage/buckets/1/encryption")
     sample_app["target"] = {"env": "local", "region": "r"}
     assert "STO-004" not in rule_ids(sample_app)
+
+
+# ── 온프레미스(local): DB-010 백업 없음 · NET-003 내부 전용 미강제 ───────────────
+
+
+@pytest.mark.parametrize(
+    ("env", "db", "persistence", "baseline_data", "hit"),
+    [
+        ("local", {"engine": "sqlite", "placement": "volume", "volume": "data"}, True, None, True),
+        ("local", {**PG, "placement": "in-cluster"}, True, None, True),
+        ("local", {**PG, "placement": "in-cluster", "backup_retention_days": 7}, True, None, True),  # 효과 없는 값
+        ("local", {**PG, "placement": "in-cluster"}, False, None, False),  # 데이터를 남길 필요가 없다
+        ("local", {**PG, "placement": "in-cluster"}, False, True, True),  # 선언이 없어도 이전 데이터가 있다
+        ("local", {**PG, "placement": "external"}, True, None, False),  # 외부 DB 백업은 그쪽 운영 몫
+        ("gcp", {**PG, "placement": "in-cluster"}, True, None, False),  # local 규칙
+    ],
+    ids=["sqlite-volume", "in-cluster-pg", "retention-ignored", "no-persistence", "baseline-data", "external", "gcp"],
+)
+def test_db010_self_hosted_db_without_backup(sample_app: dict[str, Any], env: str, db: dict[str, Any],
+                                              persistence: bool, baseline_data: bool | None, hit: bool) -> None:
+    spec = {**sample_app, "database": db, "secrets": DB_SECRET, "target": {"env": env, "region": "r"},
+            "requirements": {"persistence": persistence},
+            "storage": {"volumes": [{"name": "data", "mount_path": "/data", "size": "1Gi"}]}}
+    if baseline_data is not None:
+        spec["baseline"] = {"spec_ref": "prev", "facts": {"database_has_data": baseline_data}, "spec": copy.deepcopy(spec)}
+    found = findings_of(spec, "DB-010")
+    assert bool(found) is hit
+    if hit:
+        assert (found[0]["severity"], found[0]["autofix"], found[0]["location"]["spec_path"]) == (
+            "low", "forbidden", "/database/placement")
+        assert "자동 백업 없음" in found[0]["evidence"]
+
+
+@pytest.mark.parametrize(
+    ("env", "ingress", "hit"),
+    [
+        ("local", {"public": False}, True),
+        ("local", {"public": False, "allowed_cidrs": ["192.168.0.0/16"]}, False),  # INGRESS_CIDRS_NOT_ENFORCED 가 막는다
+        ("local", {"public": True, "tls": True, "host": "a.example.com"}, False),
+        ("local", None, False),  # 밖으로 노출하지 않는다
+        ("aws", {"public": False}, False),  # internal ALB 로 강제된다
+        ("gcp", {"public": False}, False),  # gce-internal
+    ],
+    ids=["local-internal", "local-with-cidrs", "local-public", "local-no-ingress", "aws", "gcp"],
+)
+def test_net003_local_internal_not_enforced(sample_app: dict[str, Any], env: str, ingress: dict[str, Any] | None,
+                                            hit: bool) -> None:
+    spec = {**sample_app, "target": {"env": env, "region": "r"}, "network": {"ingress": ingress}}
+    found = findings_of(spec, "NET-003")
+    assert bool(found) is hit
+    if hit:
+        assert (found[0]["severity"], found[0]["autofix"], found[0]["location"]["spec_path"]) == (
+            "low", "forbidden", "/network/ingress/public")

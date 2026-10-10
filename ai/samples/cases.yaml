@@ -9,7 +9,7 @@ cases:
     verdict: pass
     reasons: []
   - file: 02-pass-local-sqlite.yaml
-    findings: []
+    findings: [DB-010, NET-003]   # local 환경 한계 low 경고만 — LLM 없이 pass
     verdict: pass
     reasons: []
     llm_called: false
@@ -23,10 +23,10 @@ cases:
     verdict: needs_human
     reasons: [IRREVERSIBLE]
   - file: 05-fix-engine-unsupported-local.yaml
-    findings: [DB-002]
+    findings: [DB-002, DB-010]
     verdict: fix
     reasons: []
-    after_patch: {findings: [], verdict: pass}
+    after_patch: {findings: [DB-010], verdict: pass}
   - file: 06-human-plaintext-secret.yaml
     findings: [SEC-001]
     verdict: needs_human

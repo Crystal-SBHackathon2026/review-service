@@ -40,6 +40,11 @@ targets:
       annotations: {}
 
   local:
+    # 온프레미스 k3s. 명세로 판정할 수 없는 운영 조건 — 배포 전에 사람이 확인한다 (knowledge/guides/onprem-*.md)
+    # - 노드 주소: DHCP 로 바뀌면 프록시 upstream·방화벽·터널 대상이 동시에 깨진다 → DHCP 예약(고정 할당) 확인
+    # - 노출 경로: overlay 는 public 값과 무관하게 같은 Traefik Ingress 를 만든다(NET-003). 내부 전용은 터널 ingress·
+    #   라우터 포트포워딩·NodePort 가 지킨다
+    # - 백업: 관리형 DB·볼륨 스냅샷이 없다. 클러스터 안 DB 는 직접 밖으로 백업한다(DB-010)
     verified: false
     arch: [amd64]                  # busan-local 노드 아키텍처 확인 필요
     database:

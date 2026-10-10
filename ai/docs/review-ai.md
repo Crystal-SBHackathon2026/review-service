@@ -52,7 +52,7 @@ LLM 이 낸 패치는 아래를 모두 통과해야 `fix` 가 된다. 하나라�
 5. persistent 볼륨을 없애거나 비영속으로 바꾸거나 줄이지 않는다
 6. **지워서 고치지 않는다** — DB 를 없애거나(engine none) 외부 DB(external)로 돌리거나, 버킷을 지우거나, 보호 설정(DB 공개·백업 보존일·버킷 공개·버전 관리·암호화)을 약하게 바꾸지 않는다. 대상 finding 은 사라지고 재검사도 통과하는 패치라 8번(재검사)만으로는 못 막는다
 7. 비밀처럼 보이는 env 를 새로 넣지 않는다
-8. 적용한 명세를 다시 static_check 하면 대상 finding 이 사라지고 새 finding 이 생기지 않는다
+8. 적용한 명세를 다시 static_check 하면 대상 finding 이 사라지고 새 finding 이 생기지 않는다 — low 경고는 예외다. 판정에 들지 않는 환경 한계 안내라, local 에서 managed → in-cluster 로 고치면 붙는 DB-010 때문에 패치를 버리지 않는다
 
 8번 때문에 루프 안 재검사는 대부분 첫 회차에 끝난다. LOOP_EXHAUSTED 는 안전장치로 남아 있다.
 LOOP_EXHAUSTED 는 "AI 가 또 고치려 한다" 는 뜻으로 두 경우에도 쓴다 — 봇 커밋을 다시 검토했는데 fix(`autofix_commit`),
@@ -110,7 +110,7 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
 ## 근거 문서 (knowledge/)
 
 S3 `review-docs` 버킷과 같은 구조다: `rules/{any,aws,gcp,local}/<ruleId>.md`, `incidents/K-*.md`(oneaction 리허설 카드 13장), `guides/*.md`, `warnings/<code>.md`(렌더러 경고 7개).
-문서의 `## ` 섹션 하나가 청크다. 구현한 규칙 29개(P0 12 + P1 17) 전부 문서가 있고, 환경별 청크 수는 테스트로 30개 이상을 유지한다.
+문서의 `## ` 섹션 하나가 청크다. 구현한 규칙 31개(P0 12 + P1 19) 전부 문서가 있고, 환경별 청크 수는 테스트로 30개 이상을 유지한다.
 
 - 규칙 문서는 ruleId 정확 매칭(점수 1.0)으로 찾고, 사례·가이드는 의미 검색(dense cosine, 0.5 미만 버림)으로 보탠다.
 - 정확 매칭은 ruleId 당 최대 8청크이고 **규칙 문서를 먼저** 채운 뒤 related_rules 사례·가이드를 붙인다(`retrieval.exact_first`). 경로 순으로 자르면 사례가 많은 DB-003 은 규칙 문서가 통째로 빠졌다.
@@ -178,6 +178,7 @@ S3·Qdrant 가 아니라 업무 DB 인 이유: 근거 문서(FileRetriever)는 �
 | p1-db007·sec003·net002·sto004 | 관리형 DB 백업 0일·시크릿 이름 중복·내부 전용에 0.0.0.0/0·버킷 암호화 꺼짐 | 자동 수정 게이트 통과 → pass (SEC-003·NET-002 는 해당 항목 삭제만) |
 | p1-db008 | 데이터 있는 DB 의 메이저 버전을 낮춤 | needs_human(IRREVERSIBLE), 값 없이 승인하면 baseline 버전 복원 → pass |
 | p1-sec002 | aws 에 gcp-secret-manager 참조 | needs_human(AUTOFIX_FORBIDDEN) |
+| local-* | local 클러스터 안 DB·내부 전용 진입점 · 관리형 DB 요청을 in-cluster 로 고침 | DB-010·NET-003 low 경고만 → LLM 없이 pass · 고친 뒤 붙는 DB-010 은 패치를 막지 않음 → pass |
 
 복구 자리(`intake.repair`)는 `--llm fake` 면 정답(고치기 전 샘플)을 내는 가짜(`intake/fake_repair.py`), `--llm claude` 면 실제 Claude 다. 거절된 intake 의 verdict 는 `intake_rejected`(`/verify` 의 `intake_{status}` 와 같은 뜻).
 
@@ -194,7 +195,7 @@ ANTHROPIC_API_KEY=... .venv/bin/python scripts/run_eval.py --llm claude --repeat
 
 ## 검색 평가셋 (eval/retrieval_cases.yaml)
 
-"질문 → 나와야 할 문서" 25개 — 증상 질문 16 · 워커가 만드는 finding 검색어("제목 — 근거") 5 · 관련 문서가 없는 질문 4.
+"질문 → 나와야 할 문서" 33개 — 증상 질문 22 · 워커가 만드는 finding 검색어("제목 — 근거") 7 · 관련 문서가 없는 질문 4.
 의미 검색(사례·가이드)만 잰다. 규칙 문서는 ruleId 정확 매칭이라 잴 필요가 없다.
 
 ```bash
