@@ -10,7 +10,7 @@
         - 포크 PR 은 브랜치에 쓸 수 없다 (FORK_PR)
         - 앱·대상: 그 레포의 가장 최근 baseline, 없으면 DEFAULT_TARGET(예 aws/ap-northeast-2). 둘 다 없으면 NO_TARGET
         - baseline 이 없는 새 앱은 PR head 의 Dockerfile·의존성·CI·소스를 읽어 확인된 값만 채운다
-          (review_ai.intake.analyze). 하나라도 애매하면 UNVERIFIED 로 커밋하지 않는다
+          (review_ai.intake.analyze). 확인하지 못한 값은 후보값으로 커밋하고 그 경로(unverified_paths)를 행에 남긴다
         - missing·empty: review_ai.intake.prepare_intake 가 생성. yaml_error·schema_error: PR head 의 원문을 읽어
           review_ai.intake.repair.repair_intake 가 LLM 으로 형식만 고친다(값은 코드 게이트가 원문과 대조).
           LLM 이 없으면(repair_llm None) REPAIR_UNAVAILABLE
@@ -18,8 +18,9 @@
           (LLM + 코드 게이트). 통과하면 package-lock.json 을 npm 으로 다시 만들어 코드·명세를 한 커밋에 올린다
         - 생성·복구하면 PR 브랜치에 커밋 → synchronize 웹훅이 그 SHA 를 일반 검토로
           시작한다 (autofix_commit 아님). 커밋 SHA 는 브랜치를 옮기기 전에 행에 남긴다 — 웹훅이 먼저 와도 연결된다
-        - baseline 으로 만들었는지(baseline_used)도 같이 남긴다. baseline 없이 만든 명세(missing·empty)가 든 PR 의
-          검토는 pass 여도 needs_human(GENERATED_SPEC_UNVERIFIED) — app.on_pull_request
+        - baseline 으로 만들었는지(baseline_used)·확인하지 못한 경로(unverified_paths)도 같이 남긴다. 확인하지 못한 값이
+          있는 생성 명세(missing·empty)가 든 PR 의 검토는 pass 여도 needs_human(GENERATED_SPEC_UNVERIFIED) —
+          app.on_pull_request. 전부 확인된 생성 명세는 일반 검토처럼 자동 병합·배포된다
     PR 표시: 커밋 상태 review-service/intake. 토큰에 권한이 없으면 로그만 남기고 기록은 그대로 둔다.
     파드가 처리 중에 죽으면 processing 행이 남는다 → resume_stale_intakes 가 STALE_AFTER 뒤에 다시 처리한다.
         처리 중에는 HEARTBEAT_EVERY 마다 updated_at 을 찍는다 — 레포 분석·LLM 이 STALE_AFTER 를 넘겨도 살아 있는
@@ -64,7 +65,7 @@ SWEEP_EVERY_SECONDS = 60.0
 HEARTBEAT_EVERY = STALE_AFTER / 4  # DB 가 한두 번 실패해도 STALE_AFTER 안에 다시 찍는다
 REPAIRABLE = ("yaml_error", "schema_error")
 READ_CONCURRENCY = 8  # 레포 분석 파일 읽기 — GitHub 은 동시 요청이 많으면 secondary rate limit 을 건다
-# 코드 패치가 풀 수 있는 미해결 항목 — 다른 항목이 남으면 어차피 생성하지 못하니 LLM 을 부르지 않는다
+# 코드 패치가 풀 수 있는 미해결 항목 — 다른 항목이 남으면 어차피 사람 확인으로 가니 코드 패치(LLM)는 하지 않는다
 TRANSFORM_RESOLVES = frozenset({"/database", "/requirements"})
 OTHER_LOCKFILES = ("yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json")
 MAX_READ_BYTES = 256 * 1024  # 레포 분석 파일 하나 — 넘으면 읽지 않은 파일로 둔다('없음' 결론을 막는다)
@@ -122,6 +123,11 @@ def load_spec(raw: str, path: str) -> dict[str, Any]:
     except ValidationError as exc:
         raise SpecProblem("schema_error", "deploy_spec 형식 오류", validation_errors(exc)) from exc
     return loaded
+
+
+def unverified_of(intake: dict[str, Any] | None) -> list[str]:
+    """spec_intakes 행의 확인하지 못한 경로. 0012 전 행(NULL)은 빈 목록 — 무엇을 확인할지 모른다는 뜻."""
+    return list((intake or {}).get("unverified_paths") or [])
 
 
 async def expects_spec(deps: ApiDeps, repository: str) -> bool:
@@ -268,9 +274,10 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any] | None:
             if transform is not None:
                 context, findings = apply_to_context(context, findings, transform)
         outcome = prepare_intake(row["kind"], context=context, baseline=baseline, findings=findings)
+    # 코드 패치가 막혀 그 항목(DB 등)이 확인되지 않은 채 남았다 — 패치가 풀려던 문제를 후보값으로 덮지 않는다
+    if transform is not None and transform.action == "rejected" and (outcome.action == "rejected" or outcome.unverified):
+        return _done("rejected", transform.reason, transform.message, transform.details)
     if outcome.action == "rejected":
-        if transform is not None and transform.action == "rejected":  # 코드 패치가 막힌 이유가 더 정확하다
-            return _done("rejected", transform.reason, transform.message, transform.details)
         return _done("rejected", outcome.reason, outcome.message, outcome.details)
     # 분석·LLM 이 길었다 — 그사이 sweep 이 가져가 끝냈으면 두 번째 커밋을 만들지 않는다
     current = await deps.repo.get_intake(row["intake_id"])
@@ -281,19 +288,21 @@ async def _decide(deps: ApiDeps, row: dict[str, Any]) -> dict[str, Any] | None:
         repository, parent=head_sha, files=_commit_files(outcome, row["path"], transform),
         message=_message(outcome, transform))
     # 동시에 만든 커밋이 먼저 이어졌으면 그 커밋으로 옮긴다 — 행의 SHA 와 브랜치가 어긋나면 생성 커밋 웹훅이 끊긴다
-    commit = await deps.repo.link_intake(row["intake_id"], result_commit_sha=commit,
-                                         baseline_used=baseline is not None) or commit
+    commit = await deps.repo.link_intake(row["intake_id"], result_commit_sha=commit, baseline_used=baseline is not None,
+                                         unverified_paths=list(outcome.unverified_paths)) or commit
     try:
         await deps.github.update_branch(repository, row["head_ref"], commit)
     except RefConflict:
         # GitHub 은 브랜치 보호로 막혀도 422 를 준다 — 둘 다 이 커밋에서는 더 할 게 없다
         return _done("rejected", "BRANCH_MOVED",
                      "PR 브랜치를 옮기지 못했다(그사이 새 커밋 또는 브랜치 보호) — 새 커밋이 오면 다시 판단한다")
+    # 확인하지 못한 항목을 앞에 둔다 — /intakes/{id} 를 연 사람이 먼저 볼 것
     if transform is not None and transform.action == "patched":
         return _done(outcome.action, "TRANSFORMED", f"{transform.message} — 코드 패치·deploy.yaml 커밋",
-                     transform.details + outcome.details, result_commit_sha=commit)
+                     outcome.unverified + transform.details + outcome.details, result_commit_sha=commit)
     skipped = ({"path": "(코드 패치)", "source": transform.reason, "reason": transform.message},) if transform else ()
-    return _done(outcome.action, outcome.reason, outcome.message, outcome.details + skipped, result_commit_sha=commit)
+    return _done(outcome.action, outcome.reason, outcome.message, outcome.unverified + outcome.details + skipped,
+                 result_commit_sha=commit)
 
 
 async def process_intake(deps: ApiDeps, intake_id: str) -> None:

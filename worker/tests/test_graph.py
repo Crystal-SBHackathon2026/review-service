@@ -257,13 +257,13 @@ async def test_autofix_commit_review_that_needs_fix_again_goes_to_human(harness:
     assert harness.github.commits == []
 
 
-async def _request_generated(h: Harness, spec: dict[str, Any]) -> None:
+async def _request_generated(h: Harness, spec: dict[str, Any], unverified_paths: tuple[str, ...] = ()) -> None:
     """Review API 가 intake 의 baseline 없는 생성 명세 PR 이라고 표시한 검토 요청."""
     from review_ai.messages import build_review_requested
 
     ref = {"repository": spec["metadata"]["repository"], "commit": HEAD, "path": "deploy.yaml"}
     msg = build_review_requested(spec, review_id=RID, spec_ref=ref, requested_by="octo-dev",
-                                 requested_at=datetime.now(UTC), generated_spec=True)
+                                 requested_at=datetime.now(UTC), generated_spec=True, unverified_paths=unverified_paths)
     await h.repo.insert_review(review_id=RID, app=msg.app, target_env=msg.target_env, repo_id=msg.repo_id,
                                spec_ref=ref, pr_head_sha=HEAD, requested_by="octo-dev", pr_number=7)
     h.github.files[HEAD] = yaml.safe_dump(spec, sort_keys=False)
@@ -295,6 +295,28 @@ async def test_generated_spec_edited_by_human_is_not_asked_again_after_autofix_c
     assert (msg.autofix_commit, msg.generated_spec) == (True, False)
     await harness.deliver_published()
     assert harness.row(msg.review_id)["status"] == "waiting_ci"
+
+
+async def test_unverified_candidates_accepted_as_is_merge_without_bot_commit(harness: Harness) -> None:
+    """'권장값으로 진행' = 후보값 그대로 승인. 명세가 안 바뀌니 봇 수정 커밋 없이 그 커밋을 병합한다."""
+    harness.github.suites[HEAD] = [suite(conclusion="success")]
+    await _request_generated(harness, load_sample(SAMPLE_01), ("/image", "/runtime"))
+
+    recs = harness.row()["decision"]["recommendations"]
+    assert [op["path"] for r in recs if r["source"] == "generated" for op in r["ops"]] == [
+        "/image/repository", "/image/platforms", "/runtime/port", "/runtime/health"]
+    await harness.human(RID, "approved")
+    assert harness.github.commits == [] and harness.github.merged == [("Crystal-SBHackathon2026/sample-app", 7, HEAD)]
+
+
+async def test_changed_candidate_is_committed_and_not_asked_again(harness: Harness) -> None:
+    await _request_generated(harness, load_sample(SAMPLE_01), ("/runtime",))
+    await harness.human(RID, "approved", [{"op": "add", "path": "/runtime/port", "value": 3000}])
+
+    [(_, _, value)] = harness.publisher.sent
+    msg = ReviewRequested.model_validate_json(value)
+    assert (msg.autofix_commit, msg.generated_spec, msg.unverified_paths) == (True, False, ())
+    assert yaml.safe_load(harness.github.commits[-1]["content"])["runtime"]["port"] == 3000
 
 
 async def test_fork_pr_cannot_be_autofixed(harness: Harness) -> None:

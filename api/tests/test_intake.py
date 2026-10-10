@@ -178,6 +178,7 @@ async def test_new_app_is_generated_from_repo_analysis(ienv: IntakeEnv) -> None:
     assert spec.image.repository == "ghcr.io/crystal-sbhackathon2026/sample-app"
     assert "레포 분석" in ienv.github.last_message
     assert "- /runtime: Dockerfile — EXPOSE 8080, HEALTHCHECK /healthz" in ienv.github.last_message.splitlines()
+    assert row["unverified_paths"] == [] and "사람 확인 필요" not in ienv.github.last_message  # 전부 확인 → 자동 진행
 
 
 async def test_deleted_spec_before_deploy_report_keeps_committed_spec(ienv: IntakeEnv) -> None:
@@ -207,9 +208,10 @@ async def test_large_source_file_is_left_out_and_blocks_absence_claims(ienv: Int
     send_pr(ienv, pr_event("opened"))
 
     row = ienv.only_intake()
-    assert (row["status"], row["reason"], row["result_commit_sha"]) == ("rejected", "UNVERIFIED", None)
-    database = next(d for d in row["details"] if d["path"] == "/database")
-    assert "큰 파일은 읽지 않는다" in database["message"]  # 못 읽은 파일로 'DB 없음'을 결론내지 않는다
+    assert (row["status"], row["reason"]) == ("generated", "GENERATED")
+    assert "/database" in row["unverified_paths"]  # 못 읽은 파일로 'DB 없음'을 결론내지 않는다 → 사람 확인
+    database = next(d for d in row["details"] if d["path"] == "/database" and "code" in d)
+    assert "큰 파일은 읽지 않는다" in database["message"]
     assert set(ienv.github.read_limits.values()) == {MAX_READ_BYTES}
 
 
@@ -243,18 +245,21 @@ def test_broken_spec_in_unknown_repo_still_opens_intake() -> None:
 
 # --- 거절 -----------------------------------------------------------------------------------------
 
-async def test_new_app_without_baseline_is_rejected_unverified(ienv: IntakeEnv) -> None:
+async def test_new_app_with_unknown_values_commits_candidates_and_records_paths(ienv: IntakeEnv) -> None:
+    """레포로 못 채운 값은 후보값으로 커밋하고 경로를 남긴다 — 그 PR 검토는 needs_human (test_generated_spec)."""
     send_pr(ienv, pr_event("opened"))
 
     row = ienv.only_intake()
-    assert (row["status"], row["reason"], row["result_commit_sha"]) == ("rejected", "UNVERIFIED", None)
-    assert "RUNTIME_UNVERIFIED" in row["message"]
-    runtime = next(d for d in row["details"] if d["path"] == "/runtime")
+    commit = row["result_commit_sha"]
+    assert (row["status"], row["reason"], ienv.github.branch) == ("generated", "GENERATED", commit)
+    assert {"/image", "/runtime", "/database"} <= set(row["unverified_paths"])
+    assert f"확인 필요 {len(row['unverified_paths'])}개" in row["message"]
+    runtime = row["details"][1]  # 확인 필요 항목이 앞에 온다
+    assert (runtime["code"], runtime["path"]) == ("RUNTIME_UNVERIFIED", "/runtime")
     assert "Dockerfile 이 없어" in runtime["message"]  # 레포 분석이 못 채운 이유
-    assert ienv.github.parents == {} and ienv.states() == [(HEAD, "pending"), (HEAD, "failure")]
-    verify = ienv.client.get("/verify", params={"sha": HEAD}).json()
-    assert (verify["passed"], verify["status"], verify["reasons"], verify["intake_id"]) == (
-        False, "intake_failed", ["UNVERIFIED"], row["intake_id"])
+    assert "사람 확인 필요" in ienv.github.last_message and "- /runtime: 루트 Dockerfile 이 없어" in ienv.github.last_message
+    assert ienv.states() == [(HEAD, "pending"), (HEAD, "success")]
+    assert AppSpec.model_validate(yaml.safe_load(ienv.github.contents[commit])).runtime.port == 8080  # 후보값
 
 
 def test_no_target_without_baseline_or_default() -> None:

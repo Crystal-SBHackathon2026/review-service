@@ -20,6 +20,16 @@ DROP_ENTRY_RULES = {
     "NET-002": "내부 전용 진입점에서 전체 대역(0.0.0.0/0·::/0) 허용을 지움",
 }
 BASE_LIMITS = {"cpu_limit": BASE_RESOURCES.cpu_limit, "memory_limit": BASE_RESOURCES.memory_limit}
+# intake 가 확인하지 못한 최상위 경로 → 승인 화면에서 고치기 쉬운 경로들과 무엇을 확인할지.
+# 값은 intake 가 커밋한 후보값 그대로다 — "권장값으로 진행"은 후보값을 그대로 승인한다는 뜻이고 명세는 바뀌지 않는다
+UNVERIFIED_FIELDS: dict[str, tuple[tuple[str, ...], str]] = {
+    "/image": (("/image/repository", "/image/platforms"), "이미지 경로·빌드 플랫폼"),
+    "/runtime": (("/runtime/port", "/runtime/health"), "실행 포트·헬스 확인 경로"),
+    "/requirements": (("/requirements/persistence",), "재배포 뒤에도 데이터를 남겨야 하는지"),
+    "/database": (("/database",), "DB 사용 여부·엔진·배치"),
+    "/secrets": (("/secrets",), "앱이 읽는 시크릿 참조"),
+    "/storage": (("/storage",), "볼륨·버킷이 필요한지"),
+}
 
 
 def _overlaps(a: str, b: str) -> bool:
@@ -161,6 +171,58 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
     return accepted
 
 
+def _value_at(doc: Any, path: str) -> tuple[bool, Any]:
+    node = doc
+    for token in parse_pointer(path):
+        if not isinstance(node, dict) or token not in node:
+            return False, None
+        node = node[token]
+    return True, node
+
+
+def unverified_recommendations(spec: dict[str, Any], paths: Sequence[str]) -> list[dict[str, Any]]:
+    """intake 가 후보값으로 채운 항목을 승인 화면의 확인 항목으로 만든다 — 값은 지금 명세의 후보값.
+
+    finding 이 아니라 finding_ids 는 비어 있다. 명세에 생략된 필드는 스키마 기본값이 후보값이다.
+    부모가 생략돼 하위 경로에 add 할 수 없으면 최상위 경로 하나로 낸다. 가린 값은 만들지 않는다.
+    """
+    full = DeploySpec.model_validate(spec).model_dump(mode="json", exclude_none=True)
+    out: list[dict[str, Any]] = []
+    for path in paths:
+        leaves, what = UNVERIFIED_FIELDS.get(path, ((path,), path))
+        if not all(_value_at(spec, leaf.rsplit("/", 1)[0] or "/")[0] for leaf in leaves if leaf.count("/") > 1):
+            leaves = (path,)
+        ops = []
+        for leaf in leaves:
+            found, value = _value_at(full, leaf)
+            if found:
+                ops.append({"op": "add", "path": leaf, "value": value})
+        if ops and MASK not in json.dumps(ops, ensure_ascii=False):
+            out.append({"finding_ids": [], "source": "generated", "ops": ops,
+                        "why": f"확인 필요 — 레포로 확인하지 못해 후보값으로 채웠다: {what}. 맞으면 그대로, 아니면 새 값을 넣는다"})
+    return out
+
+
+def _meaning(doc: dict[str, Any]) -> Any:
+    """스키마 기본값까지 채운 명세 — 생략과 기본값을 같은 것으로 본다. 중간 상태가 형식에 안 맞으면 원문 그대로."""
+    try:
+        return DeploySpec.model_validate(doc).model_dump(mode="json")
+    except ValueError:
+        return doc
+
+
+def _effective(spec: dict[str, Any], ops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """명세를 바꾸는 op 만 — 후보값 그대로인 권장값은 수정이 아니다(AI 수정 커밋·재검사를 만들지 않는다)."""
+    kept: list[dict[str, Any]] = []
+    current = spec
+    for op in ops:
+        changed = apply_ops(current, [op])
+        if _meaning(changed) != _meaning(current):
+            kept.append(op)
+            current = changed
+    return kept
+
+
 def resolve_human_decision(state: dict[str, Any], human: dict[str, Any]) -> dict[str, Any]:
     """미입력을 저장된 권장값으로 보충한다. false/0/null은 명시 입력으로 취급한다.
 
@@ -196,6 +258,7 @@ def resolve_human_decision(state: dict[str, Any], human: dict[str, Any]) -> dict
         _check_recommended_path(recommended_spec, path)
     # 객체 전체를 명시한 경우도 사용자 선택으로 취급하며, 권장값으로 다시 덮지 않는다.
     defaults = [op for op in defaults if not any(path_under(op["path"], given["path"]) for given in supplied)]
+    defaults = _effective(state["deploy_spec"], defaults)
     ops = defaults + supplied
     for op in ops:
         if parse_pointer(op["path"])[0] in PIPELINE_FIELDS:

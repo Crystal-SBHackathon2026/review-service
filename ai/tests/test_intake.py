@@ -34,12 +34,29 @@ def test_baseline_regenerates_committable_spec(kind: str, sample_app: dict) -> N
     assert {d["source"] for d in outcome.details} == {"baseline", "rule"}
 
 
-def test_new_app_without_verified_values_is_not_committed(sample_app: dict) -> None:
+def test_new_app_without_verified_values_commits_candidates_for_human_check(sample_app: dict) -> None:
+    """확인 못 한 값은 후보값으로 커밋하고 경로를 돌려준다 — Review API 가 그 PR 검토를 needs_human 으로 보낸다."""
     outcome = prepare_intake("missing", context=bare_context(sample_app))
 
-    assert (outcome.action, outcome.reason, outcome.content) == ("rejected", "UNVERIFIED", None)
-    assert "RUNTIME_UNVERIFIED" in outcome.message
-    assert {d["code"] for d in outcome.details} >= {"RUNTIME_UNVERIFIED", "DATABASE_UNVERIFIED"}
+    assert (outcome.action, outcome.reason) == ("generated", "GENERATED")
+    assert outcome.unverified_paths == ("/image", "/runtime", "/requirements", "/database", "/secrets", "/storage")
+    assert {i["code"] for i in outcome.unverified} >= {"RUNTIME_UNVERIFIED", "DATABASE_UNVERIFIED"}
+    assert "확인 필요 6개" in outcome.message and "사람 확인 뒤 배포" in outcome.message
+    assert "사람이 확인하기 전에는 배포하지 않는다" in outcome.content.splitlines()[1]
+    spec = AppSpec.model_validate(yaml.safe_load(outcome.content))
+    assert (spec.runtime.port, spec.database.engine, spec.network.ingress) == (8080, "none", None)  # 후보값
+    # 후보값의 출처(preset)는 details 에 넣지 않는다 — 확인 필요 항목이 그 값을 설명한다
+    assert {d["path"] for d in outcome.details} == {"/network", "/rollout"}
+    message = commit_message(outcome)
+    assert "사람 확인 필요" in message and "- /runtime: 실행 포트" in message
+
+
+def test_verified_generation_has_no_unverified_items(sample_app: dict) -> None:
+    outcome = prepare_intake("missing", context=bare_context(sample_app), baseline=Baseline(spec_ref="m1", spec=sample_app))
+
+    assert outcome.unverified == () and "확인 필요" not in outcome.message
+    assert "사람 확인 필요" not in commit_message(outcome)
+    assert len(outcome.content.splitlines()[0]) > 0 and "후보값" not in outcome.content.splitlines()[1]
 
 
 def test_verified_context_generates_without_baseline(sample_app: dict) -> None:

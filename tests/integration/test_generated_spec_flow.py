@@ -3,6 +3,8 @@
 10/09 sample-app #11: deploy.yaml 을 지운 PR 에 intake 가 baseline 없이(레포 분석만으로) 명세를 만들었고,
 그 명세가 network: {} 라 검토가 pass → 자동 병합 → gitops 의 ingress 가 지워져 ALB 가 삭제됐다.
 baseline 없이 생성한 명세는 공개 범위·env·replicas 를 모르므로 pass 여도 사람 확인(GENERATED_SPEC_UNVERIFIED)으로 보낸다.
+10/10 부터는 레포로 확인하지 못한 값(unverified_paths)이 있을 때만 사람 확인이고, 전부 확인된 생성 명세는 자동 진행한다.
+unverified_paths 를 남기지 않은 행(0012 전)은 예전처럼 사람 확인이다.
 
 baseline 없는 생성 커밋은 intake 가 남기는 그대로(spec_intakes 행 + PR 브랜치 커밋) 넣어 둔다 — intake 가 어떤 명세를
 커밋할지(#39 는 network 를 모르면 커밋하지 않는다)와 상관없이, 커밋된 뒤의 검토 층만 확인한다.
@@ -55,7 +57,7 @@ class FakeGitHub:
         self.merged: list[str] = []
 
     # --- 읽기 (API specs·intake, 워커) ---
-    async def get_file(self, repository: str, path: str, ref: str) -> str:
+    async def get_file(self, repository: str, path: str, ref: str, *, max_bytes: int | None = None) -> str:
         try:
             return self.trees[ref][path]
         except KeyError:
@@ -143,11 +145,11 @@ class Flow:
                 await self.handler.handle(topic, value)
         return delivered
 
-    async def human(self, review_id: str, decision: str = "approved") -> None:
+    async def human(self, review_id: str, decision: str = "approved", *, use_recommendations: bool = False) -> None:
         body = {"schema_version": "review.resumed/v1", "resumed_at": datetime.now(UTC).isoformat(),
                 "review_id": review_id, "kind": "human_decision",
                 "human_decision": {"decision": decision, "approver": "hyeyeon", "edited_ops": [],
-                                   "use_recommendations": False}}
+                                   "use_recommendations": use_recommendations}}
         await self.handler.handle("review.resumed", json.dumps(body).encode())
 
     async def generated_review(self) -> dict[str, Any]:
@@ -195,7 +197,7 @@ async def test_spec_generated_without_baseline_waits_for_human_even_when_it_pass
     assert (row["status"], row["verdict"]) == ("needs_human", "needs_human")
     assert row["reasons"] == ["GENERATED_SPEC_UNVERIFIED"]
     detail = flow.client.get(f"/reviews/{row['review_id']}").json()
-    assert "baseline 없이 생성된 명세" in detail["reason_messages"]["GENERATED_SPEC_UNVERIFIED"]
+    assert "확인 필요" in detail["reason_messages"]["GENERATED_SPEC_UNVERIFIED"]
 
     await flow.human(row["review_id"])  # 사람이 공개 범위·env·replicas 를 확인하고 승인하면 병합된다
     assert flow.github.merged == [row["pr_head_sha"]]
@@ -226,3 +228,42 @@ async def test_later_commit_on_the_generated_pr_still_waits_for_human() -> None:
     assert (row["status"], row["reasons"]) == ("needs_human", ["GENERATED_SPEC_UNVERIFIED"])
     assert flow.repo.reviews[first["review_id"]]["status"] == "superseded"
     assert flow.github.merged == []
+
+
+async def _intake_review(flow: Flow) -> dict[str, Any]:
+    """실제 intake(레포 분석)가 만든 생성 커밋 → synchronize → 워커 검토. 그 검토 행."""
+    assert "kind" in flow.pr("opened", HEAD)
+    [intake] = flow.repo.intakes.values()
+    assert intake["status"] == "generated", intake
+    body = flow.pr("synchronize", intake["result_commit_sha"])
+    await flow.deliver()
+    return flow.repo.reviews[body["review_id"]]
+
+
+async def test_new_app_fully_verified_by_repo_analysis_proceeds_without_human() -> None:
+    """레포 분석으로 이미지·포트·DB·시크릿·저장소를 다 확인했다 — 기본값(내부 전용 등)은 알리고 자동 진행한다."""
+    flow = Flow()
+    row = await _intake_review(flow)
+
+    [intake] = flow.repo.intakes.values()
+    assert intake["unverified_paths"] == []
+    assert (row["verdict"], row["reasons"]) == ("pass", [])
+    assert flow.github.merged == [row["pr_head_sha"]]
+
+
+async def test_new_app_with_unknown_port_waits_with_check_items_and_merges_as_is() -> None:
+    """Dockerfile 이 없어 포트를 모른다 → 후보값(8080)으로 커밋, 사람 확인. 후보값 그대로 승인하면 봇 커밋 없이 병합."""
+    flow = Flow()
+    del flow.github.trees[HEAD]["Dockerfile"]
+    row = await _intake_review(flow)
+
+    [intake] = flow.repo.intakes.values()
+    assert "/runtime" in intake["unverified_paths"]
+    assert row["status"] == "needs_human" and "GENERATED_SPEC_UNVERIFIED" in row["reasons"]
+    paths = [op["path"] for rec in row["decision"]["recommendations"] if rec["source"] == "generated"
+             for op in rec["ops"]]
+    assert "/runtime/port" in paths
+    commits_before = len(flow.github.parents)
+
+    await flow.human(row["review_id"], use_recommendations=True)  # 승인 화면의 "권장값으로 진행"
+    assert flow.github.merged == [row["pr_head_sha"]] and len(flow.github.parents) == commits_before

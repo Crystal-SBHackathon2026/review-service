@@ -10,6 +10,8 @@
 - status 에 running 추가 — initial_state 값. judge 가 verdict 로 바꾼다
 - autofix_commit 추가 — 워커가 applied_ops 를 커밋한 SHA 를 다시 검토할 때 True. 또 fix 면 needs_human(LOOP_EXHAUSTED)
 - generated_spec 추가 — intake 가 baseline 없이 만든 명세의 검토면 True. pass 여도 needs_human(GENERATED_SPEC_UNVERIFIED)
+- unverified_paths 추가 — 그중 레포로 확인하지 못해 후보값으로 채운 경로. judge 가 승인 화면의 확인 항목(권장값)으로 만든다.
+  전부 확인된 생성 명세는 generated_spec 자체가 False 로 온다 (Review API 가 spec_intakes.unverified_paths 로 정한다)
 """
 
 from __future__ import annotations
@@ -36,7 +38,8 @@ REASON_CODES = (
 )
 # 사유 코드만으로는 사람이 무엇을 확인할지 모르는 경우의 설명 — Review API 가 reason_messages 로 같이 보여 준다
 REASON_MESSAGES: dict[str, str] = {
-    "GENERATED_SPEC_UNVERIFIED": "baseline 없이 생성된 명세 — 공개 범위(network·ingress)·env·replicas 확인 필요",
+    "GENERATED_SPEC_UNVERIFIED": "레포로 확인하지 못한 값을 후보값으로 채운 생성 명세 — 권장값 표의 '확인 필요' 항목"
+                                 "(이미지·포트·DB·시크릿·저장소 등)이 맞는지 보고 승인·수정",
 }
 
 
@@ -121,4 +124,5 @@ class ReviewState(TypedDict, total=False):
     human_decision: HumanDecision | None  # needs_human 뒤 재개할 때만 있다. 있으면 AI 가 다시 자동 수정하지 않는다
     autofix_commit: bool  # 검토 대상 커밋이 워커가 applied_ops 를 커밋한 것(봇 커밋)이면 True — 재수정 루프 방지
     generated_spec: bool  # intake 가 baseline 없이 만든 명세면 True — 사람이 확인하기 전에는 병합하지 않는다
+    unverified_paths: list[str]  # 그중 후보값으로 채운 경로 (/image 등). 승인 화면의 확인 항목
     deploy_result: DeployResult | None  # commit_overlay 만 쓴다 (pass 가 아니면 없음)

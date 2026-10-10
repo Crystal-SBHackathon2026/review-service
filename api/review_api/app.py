@@ -30,7 +30,7 @@ import hmac
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -52,7 +52,7 @@ from review_ai.transform import TRANSFORM_MAX_TOKENS
 from review_ai.transform.prompt import TransformOutput
 from review_api.argocd import ArgoCdEvent, handle_deploy_event
 from review_api.intake import (IntakeGitHub, SpecProblem, expects_spec, load_spec, open_intake, process_intake,
-                               sweep_stale_intakes)
+                               sweep_stale_intakes, unverified_of)
 from review_api import metrics
 from review_api.lockfile import regenerate_lockfile
 from review_api.progress import ProgressSettings, build_progress, review_view
@@ -396,14 +396,16 @@ async def start_review(deps: ApiDeps, spec_ref: dict[str, str], requested_by: st
 
 
 async def submit_review(deps: ApiDeps, loaded: dict[str, Any], spec_ref: dict[str, str], requested_by: str, *,
-                        pr_number: int | None = None, generated_spec: bool = False) -> str:
+                        pr_number: int | None = None, generated_spec: bool = False,
+                        unverified_paths: Sequence[str] = ()) -> str:
     """review_id 발급 → DB received → review.requested 발행. review_id 반환.
 
     같은 레포·head SHA 검토가 이미 있으면(동시에 온 같은 웹훅) 새로 발행하지 않고 그 review_id 를 돌려준다."""
     commit = spec_ref["commit"]
     review_id = new_review_id()
     message = build_review_requested(loaded, review_id=review_id, spec_ref=spec_ref, requested_by=requested_by,
-                                     requested_at=datetime.now(UTC), generated_spec=generated_spec)
+                                     requested_at=datetime.now(UTC), generated_spec=generated_spec,
+                                     unverified_paths=unverified_paths)
     stored = await deps.repo.insert_review(review_id=review_id, app=message.app, target_env=message.target_env,
                                            repo_id=message.repo_id, spec_ref=spec_ref, pr_head_sha=commit,
                                            requested_by=requested_by, pr_number=pr_number)
@@ -455,7 +457,8 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
     - 새 검토를 만들면 그 PR 의 끝나지 않은 이전 검토는 superseded 로 넘긴다
     - deploy.yaml 이 없거나 비었거나 깨졌으면 검토 대신 intake 를 연다 (review_api.intake). 처리는 응답 뒤
     - intake 가 만든 생성 커밋에 온 웹훅이면 새 검토를 그 intake 에 잇는다
-    - 그 PR 에 intake 가 baseline 없이 만든 명세 커밋이 있으면 generated_spec 으로 보낸다 → pass 여도 needs_human.
+    - 그 PR 에 intake 가 baseline 없이, 확인하지 못한 값을 후보값으로 채워 만든 명세 커밋이 있으면 generated_spec 으로
+      보낸다(그 경로는 unverified_paths) → pass 여도 needs_human. 전부 확인된 생성 명세는 일반 검토와 같다.
       생성 커밋 위에 커밋이 더 올라와도 같다(명세는 여전히 레포 분석으로 만든 것). 판단 근거는 spec_intakes 기록뿐이다 —
       명세 파일 내용·커밋 메시지·PR 작성자처럼 PR 을 올린 사람이 바꿀 수 있는 표시는 보지 않는다
     - 포크 PR 은 {"skipped": "fork"} — 검토·intake 모두 하지 않는다
@@ -491,7 +494,7 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
         return await open_intake(deps, payload, problem, spec_ref["path"])
     generated = await deps.repo.unverified_generation_for_pr(repository, number)
     review_id = await submit_review(deps, loaded, spec_ref, payload["sender"]["login"], pr_number=number,
-                                    generated_spec=generated is not None)
+                                    generated_spec=generated is not None, unverified_paths=unverified_of(generated))
     superseded = await deps.repo.supersede_open(repository=repository, pr_number=number, superseded_by=review_id)
     result: dict[str, Any] = {"review_id": review_id, "superseded": superseded}
     if generated is not None:

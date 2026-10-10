@@ -26,7 +26,7 @@
 
 sample-app(14411fd)은 전 항목이 채워져 aws·gcp 모두 정적 검사 pass·`ready_to_commit` 이다.
 
-`POST /reviews`는 파일 없음 404, 빈 파일 422를 유지한다. PR 웹훅은 `review_ai.intake.prepare_intake`(이 모듈의 `prepare_spec` 사용)로 연결됐다 — 확인 항목이 없을 때만 생성 커밋을 올리고, 남으면 `UNVERIFIED`로 거절한다. 흐름·상태는 README 의 "명세 없음·빈 명세·형식 오류" 절.
+`POST /reviews`는 파일 없음 404, 빈 파일 422를 유지한다. PR 웹훅은 `review_ai.intake.prepare_intake`(이 모듈의 `prepare_spec` 사용)로 연결됐다 — 확인 항목이 없으면 생성 커밋 → 일반 검토, 남으면 후보값으로 커밋하고 그 경로(`unverified_paths`)를 남겨 그 PR 검토를 사람 확인으로 보낸다. 흐름·상태는 README 의 "명세 없음·빈 명세·형식 오류" 절.
 
 ## 입력
 

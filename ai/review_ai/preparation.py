@@ -154,7 +154,7 @@ def prepare_spec(
         "requirements": "영속성 미선언의 후보값이다. 데이터 보존 불필요를 확인한 사실은 아니다",
         "database": "DB 미선언의 후보값이다. 앱이 DB 를 쓰지 않는다는 관측은 아니다",
         "secrets": "시크릿 값은 생성하거나 추측하지 않는다. 앱이 요구하는 참조를 확인해야 한다",
-        "network": "기본 후보는 클러스터 내부만 접근. 외부 공개는 확인된 설정을 사용한다",
+        "network": "기본값은 클러스터 내부만 접근(외부 노출 없음). 외부에 공개하려면 deploy.yaml 에 network.ingress 를 넣는다",
         "storage": "기본 후보에는 볼륨·버킷을 추가하지 않는다. 파일 저장 요구를 확인해야 한다",
     }
     for field, default in defaults.items():

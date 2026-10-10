@@ -17,6 +17,7 @@ apply_patch 는 patch 를 rounds 로 옮기고 비운다. 그래서 고쳐서 �
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
@@ -94,13 +95,15 @@ def check_edited_ops(deploy_spec: dict[str, Any], ops: list[Any]) -> dict[str, A
 
 
 def route_start(state: dict[str, Any]) -> str:
+    """승인 + 적용할 수정값(입력값·명세를 바꾸는 권장값)이 있으면 apply_human_edits, 아니면 바로 재검사."""
     human = state.get("human_decision")
     if not human or human["decision"] != "approved":
         return "static_check"
-    has_recommendations = bool((state.get("decision") or {}).get("recommendations"))
-    if human["edited_ops"] or (human.get("use_recommendations", True) and has_recommendations):
+    try:
+        resolved = resolve_human_decision(state, human)
+    except ValueError:  # apply_human_edits 가 같은 오류로 멈춘다 — 승인 API 가 재개 전에 422 로 막는다
         return "apply_human_edits"
-    return "static_check"
+    return "apply_human_edits" if resolved["edited_ops"] else "static_check"
 
 
 def route_after_judge(state: dict[str, Any]) -> str:
@@ -127,7 +130,8 @@ def build_graph(llm: LlmClient | None, retriever: Retriever) -> Any:
 
 
 def initial_state(deploy_spec: dict[str, Any], *, review_id: str, spec_ref: dict[str, str] | None = None,
-                  autofix_commit: bool = False, generated_spec: bool = False) -> ReviewState:
+                  autofix_commit: bool = False, generated_spec: bool = False,
+                  unverified_paths: Sequence[str] = ()) -> ReviewState:
     return ReviewState(
         review_id=review_id,
         target_env=deploy_spec["target"]["env"],
@@ -141,6 +145,7 @@ def initial_state(deploy_spec: dict[str, Any], *, review_id: str, spec_ref: dict
         status="running",
         autofix_commit=autofix_commit,
         generated_spec=generated_spec,
+        unverified_paths=list(unverified_paths),
     )
 
 

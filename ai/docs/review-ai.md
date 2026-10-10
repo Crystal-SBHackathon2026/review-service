@@ -76,7 +76,7 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
 | `Finding` | — | `title`·`irreversible` 추가 | decide_verdict 가 규칙 목록을 다시 읽지 않게 |
 | `Patch` | `files: [{path, diff}]` | **`ops`(deploy_spec JSON Patch)가 정본**, `files` 는 ops 를 overlay 로 렌더링한 diff. `kind` 는 지금 항상 `config` | 명세를 고쳐야 재검사·형식 검사가 가능. overlay 는 명세에서 결정적으로 나온다 |
 | `spec_ref` | str | `{repository, commit, path}` | Kafka 메시지와 같은 모양 |
-| 사유 코드 | 7개 | `PATCH_MISSING`·`GENERATED_SPEC_UNVERIFIED` 추가 | 고칠 수 있는 finding 인데 LLM 이 패치를 안 낸 경우 · intake 가 baseline 없이 만든 명세(`generated_spec`)라 findings 가 없어도 사람이 공개 범위·env·replicas 를 확인해야 하는 경우 (10/09 ingress 삭제 장애) |
+| 사유 코드 | 7개 | `PATCH_MISSING`·`GENERATED_SPEC_UNVERIFIED` 추가 | 고칠 수 있는 finding 인데 LLM 이 패치를 안 낸 경우 · intake 가 레포로 확인하지 못한 값을 후보값으로 채운 생성 명세(`generated_spec`·`unverified_paths`)라 findings 가 없어도 사람이 그 값을 확인해야 하는 경우 — 확인 항목은 권장값 표에 `source: generated` 로 붙는다 |
 | low finding | — | 사람 확인 조건에서 제외 (`verdict.EXCLUDE_LOW_FROM_HUMAN`) | 결정 #6. 단 LLM 출력이 틀리면(CITATION_INVALID) low 만 있어도 needs_human |
 | low 만 있을 때 | LLM 호출 | **LLM 호출 안 함** | 매 배포 경고 설명에 비용을 쓰지 않는다. 설명은 규칙 제목 |
 | 데이터 있는 SQLite + replicas 2 | needs_human (IRREVERSIBLE) | **fix (replicas → 1)** | replicas 를 줄이는 건 되돌릴 수 있다. 엔진 전환 패치는 데이터가 있으면 범위 밖으로 막힌다(`sqlite-with-data-llm-converts-engine` 케이스) |
