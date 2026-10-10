@@ -69,6 +69,24 @@ def managed_db_without_backup(ctx: CheckContext) -> list[Hit]:
     return [Hit("/database/backup_retention_days", f"managed {db.engine}: backup_retention_days 0")]
 
 
+
+# 백업을 플랫폼이 만들어 주지 않는 배치 — PVC 위 파일·Pod 가 데이터의 유일한 사본이다
+SELF_HOSTED_PLACEMENTS = ("in-cluster", "volume")
+
+
+def self_hosted_db_without_backup(ctx: CheckContext) -> list[Hit]:
+    """DB-010 — 클러스터 안 DB(in-cluster postgres·볼륨 SQLite)에 백업 수단이 없다 (low 경고).
+
+    DB-007 은 관리형만 본다. 여기는 backup_retention_days 가 무엇이든 효과가 없다 — overlay 가 백업을 만들지 않는다.
+    """
+    db = ctx.spec.database
+    if db.engine == "none" or db.placement not in SELF_HOSTED_PLACEMENTS:
+        return []
+    if not (ctx.spec.requirements.persistence or ctx.has_existing_data):
+        return []
+    return [Hit("/database/placement",
+                f"{ctx.caps.env}: {db.placement} {db.engine} — 자동 백업 없음 (backup_retention_days 는 managed 에만 적용)")]
+
 def _version_key(version: str | None) -> tuple[int, ...] | None:
     try:
         return tuple(int(part) for part in version.split(".")) if version else None

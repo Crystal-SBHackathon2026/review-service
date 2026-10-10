@@ -140,6 +140,35 @@ async def test_patch_cannot_fix_by_removing_or_weakening(sample: str, ops: list[
     assert patch is None and validation["patch_scope_ok"] is False
 
 
+
+async def _local_managed_db_state() -> dict[str, Any]:
+    state = await prepared("02-pass-local-sqlite.yaml")
+    state["deploy_spec"]["database"] = {"engine": "postgres", "version": "16", "placement": "managed"}
+    state["deploy_spec"]["secrets"] = [{"name": "DATABASE_URL", "source": "generated"}]
+    state["findings"] = run_static_check(DeploySpec.model_validate(state["deploy_spec"]))
+    state["retrieved_docs"] = await FileRetriever().search(state["findings"], "local")
+    return state
+
+
+@pytest.mark.parametrize(
+    ("ops", "ok"),
+    [
+        ([{"op": "replace", "path": "/database/placement", "value_json": '"in-cluster"'}], True),  # DB-010(low) 이 새로 붙는다
+        ([{"op": "replace", "path": "/database/engine", "value_json": '"sqlite"'},
+          {"op": "replace", "path": "/database/placement", "value_json": '"volume"'},
+          {"op": "remove", "path": "/database/version"}], False),  # DB-005(high) 가 새로 붙는다
+    ],
+    ids=["new-low-warning-ok", "new-high-finding-rejected"],
+)
+async def test_patch_may_add_low_warnings_but_not_new_findings(ops: list[dict[str, Any]], ok: bool) -> None:
+    """low 경고는 판정에 들지 않는다 — local 에서 managed → in-cluster 로 고치면 붙는 DB-010 때문에 패치를 버리지 않는다."""
+    state = await _local_managed_db_state()
+    assert {f["rule_id"] for f in state["findings"]} == {"DB-002", "NET-003"}
+    _, validation, patch = validate_output(_with_patch(state, ops), state["findings"], state["retrieved_docs"],
+                                           state["deploy_spec"])
+    assert (patch is not None, validation["patch_scope_ok"]) == (ok, ok)
+
+
 async def _shadowed_env_state() -> dict[str, Any]:
     state = await prepared("01-pass-sample-app-aws.yaml")
     state["deploy_spec"]["runtime"]["env"]["UPSTREAM_URL"] = "https://old.example.com"

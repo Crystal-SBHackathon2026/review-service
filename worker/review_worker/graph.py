@@ -46,6 +46,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from review_ai.cases import case_from_state
+from review_ai.deployment_analysis import case_advice
 from review_ai.errors import TransientError
 from review_ai.graph import apply_human_edits as ai_apply_human_edits
 from review_ai.graph import apply_patch
@@ -229,6 +230,11 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
                 if attempt < deps.judge_max_retries:
                     await asyncio.sleep(deps.retry_backoff_seconds * 2**attempt)
         return judge_unavailable(state, error=f"transient: {last}")
+
+    async def inspect_failure_cases(state):
+        advice = await case_advice(repo, state["deploy_spec"], state["spec_ref"].get("repository", ""))
+        await repo.update_review(state["review_id"], case_advice=advice)
+        return {}
 
     async def record_result(state: dict[str, Any]) -> dict[str, Any]:
         decision = state["decision"]
@@ -474,6 +480,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     node("static_check", make_static_check())
     node("retrieve_evidence", make_retrieve_evidence(deps.retriever))
     node("judge", judge)
+    node("inspect_failure_cases", inspect_failure_cases)
     node("record_result", record_result)
     node("apply_patch", apply_patch)
     node("await_human", await_human)
@@ -491,7 +498,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     graph.add_edge(START, "static_check")
     graph.add_edge("static_check", "retrieve_evidence")
     graph.add_edge("retrieve_evidence", "judge")
-    graph.add_edge("judge", "record_result")
+    graph.add_edge("judge", "inspect_failure_cases")
+    graph.add_edge("inspect_failure_cases", "record_result")
     graph.add_conditional_edges("record_result", route_after_result,
                                 ["apply_patch", "await_human", "await_ci", "commit_fix"])
     graph.add_edge("apply_patch", "static_check")

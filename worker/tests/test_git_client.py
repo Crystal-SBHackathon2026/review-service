@@ -9,7 +9,8 @@ import httpx
 import pytest
 
 from review_ai.errors import TransientError
-from review_common.github import GitHubClient, GitHubError, GitHubGitClient, ProtectedFileRemoval, git_blob_sha
+from review_common.github import (GitHubClient, GitHubError, GitHubGitClient, ProtectedFileRemoval, git_blob_sha,
+                                  is_protected)
 
 GITOPS = "Crystal-SBHackathon2026/gitops"
 DIR = "apps/sample-app/overlays/aws"
@@ -164,6 +165,36 @@ async def test_protected_file_kept_by_rendered_files_commits_normally() -> None:
 
     assert sha == api.head and api.ref_updates == 2
     assert files_at_head(api) == {f"{DIR}/kustomization.yaml": "new", f"{DIR}/ingress.yaml": "new"}
+
+
+async def test_protected_pattern_blocks_pvc_removal() -> None:
+    """보호 목록은 패턴이다 — pvc-*.yaml 은 어떤 볼륨 이름의 PVC 든 지우지 않는다."""
+    api = FakeGitHubApi({f"{DIR}/kustomization.yaml": "old", f"{DIR}/pvc-data.yaml": "pvc",
+                         f"{DIR}/pvc-cache.yaml": "pvc"})
+
+    with pytest.raises(ProtectedFileRemoval) as exc:
+        await client(api).commit_files(DIR, {"kustomization.yaml": "new", "pvc-cache.yaml": "pvc"}, "msg",
+                                       protected=("ingress.yaml", "pvc-*.yaml"))
+
+    assert exc.value.paths == ["pvc-data.yaml"]
+    assert (api.created_trees, api.created_commits, api.ref_updates) == ([], 0, 0)
+
+
+async def test_unprotected_file_removal_still_commits() -> None:
+    api = FakeGitHubApi({f"{DIR}/kustomization.yaml": "old", f"{DIR}/hpa.yaml": "hpa"})
+
+    await client(api).commit_files(DIR, {"kustomization.yaml": "new"}, "msg", protected=("ingress.yaml", "pvc-*.yaml"))
+
+    assert files_at_head(api) == {f"{DIR}/kustomization.yaml": "new"}
+
+
+@pytest.mark.parametrize(("name", "expected"), [
+    ("ingress.yaml", True), ("pvc-data.yaml", True), ("pvc-a-b.yaml", True),
+    ("pvc.yaml", False), ("pvc-data.yml", False), ("PVC-data.yaml", False), ("sub/pvc-data.yaml", False),
+    ("kustomization.yaml", False),
+])
+def test_is_protected(name: str, expected: bool) -> None:
+    assert is_protected(name, ("ingress.yaml", "pvc-*.yaml")) is expected
 
 
 async def test_read_file_missing_is_file_not_found() -> None:

@@ -23,14 +23,16 @@ from review_ai.patching import apply_ops
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.state import DeployResult, ReviewState
 from review_ai.verdict import applied_ops
-from review_common.github import ProtectedFileRemoval
+from review_common.github import ProtectedFileRemoval, is_protected
 
 __all__ = ["GitClient", "make_commit_overlay", "make_overlay_guard", "commit_message", "removed_protected",
            "PROTECTED_OVERLAY_FILES", "OVERLAY_RESOURCE_REMOVED"]
 
-# 지금 배포에 있는데 렌더 결과에서 사라지면 안 되는 overlay 파일. 사라지면 Argo CD prune 이 실제 리소스를 지운다.
-# 10/09 sample-app#11: network: {} 명세 → ingress.yaml 삭제 → ALB 삭제(10분 장애, 주소 변경). 볼륨(pvc-*) 등은 여기에 더한다.
-PROTECTED_OVERLAY_FILES: tuple[str, ...] = ("ingress.yaml",)
+# 지금 배포에 있는데 렌더 결과에서 사라지면 안 되는 overlay 파일(fnmatch 패턴). 사라지면 Argo CD prune 이 실제 리소스를 지운다.
+# 10/09 sample-app#11: network: {} 명세 → ingress.yaml 삭제 → ALB 삭제(10분 장애, 주소 변경).
+# pvc-*.yaml: 명세에서 persistent 볼륨을 빼거나 이름을 바꾸면 PVC 가 지워진다. local-path(local)·GKE 기본
+# StorageClass 는 reclaim Delete 라 데이터(SQLite 파일)도 같이 사라진다. 일부러 지우려면 사람이 gitops 에서 지운다.
+PROTECTED_OVERLAY_FILES: tuple[str, ...] = ("ingress.yaml", "pvc-*.yaml")
 OVERLAY_RESOURCE_REMOVED = "OVERLAY_RESOURCE_REMOVED"
 
 
@@ -58,7 +60,7 @@ class GitClient(Protocol):
         2. push 가 충돌하면 rebase 해서 다시 시도한다. gitops 에 커밋하는 곳이
            셋이다 — sample-app CI(이미지 태그), review-service CI(이미지 태그),
            그리고 이 노드. 같은 시점에 겹칠 수 있다.
-        3. protected(directory 기준 파일 이름) 중 지우게 되는 파일이 있으면 커밋하지 않고
+        3. protected(directory 기준 파일 이름 패턴, is_protected) 에 맞는 파일 중 지우게 되는 파일이 있으면 커밋하지 않고
            ProtectedFileRemoval 을 던진다. 충돌로 다시 만들 때마다 새로 읽은 main 기준으로 본다.
 
         네트워크 오류는 TransientError 로 올린다. 재시도해도 안 되는 충돌도 마찬가지다.
@@ -83,8 +85,8 @@ def _committed(sha: str) -> dict[str, Any]:
 
 def removed_protected(existing: Iterable[str], rendered_files: Mapping[str, str]) -> list[str]:
     """지금 overlay 에 있는데 렌더 결과에는 없는 보호 파일."""
-    present = set(existing)
-    return [name for name in PROTECTED_OVERLAY_FILES if name in present and name not in rendered_files]
+    return sorted(name for name in set(existing)
+                  if name not in rendered_files and is_protected(name, PROTECTED_OVERLAY_FILES))
 
 
 def removed_reason(removed: list[str]) -> str:

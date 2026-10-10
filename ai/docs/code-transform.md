@@ -16,7 +16,7 @@
 
 | 항목 | 조건 | 패치 |
 |---|---|---|
-| `DB_SQLITE_TO_POSTGRES` | Node 앱이 SQLite 드라이버를 쓰는데 대상 환경이 SQLite 볼륨을 못 만든다 (지금 aws — EBS CSI 없음) | `pg`·`DATABASE_URL`, `migrations/0001_init.sql`, `src/migrate.js`(schema_migrations 기록), 세션은 `connect-pg-simple`, 시작 코드의 CREATE TABLE 제거 |
+| `DB_SQLITE_TO_POSTGRES` | Node 앱이 SQLite 드라이버를 쓰는데 대상 환경이 SQLite 볼륨을 못 만든다 (지금 aws — PVC 는 되지만 SQLite 볼륨 배치는 열지 않음, DB-002) | `pg`·`DATABASE_URL`, `migrations/0001_init.sql`, `src/migrate.js`(schema_migrations 기록), 세션은 `connect-pg-simple`, 시작 코드의 CREATE TABLE 제거 |
 | `METRICS_ENDPOINT` | Express 앱에 `/metrics` 가 없다 | `prom-client` 기본 지표 + 요청 수·처리 시간 |
 
 DB 항목이 있으면 생성 명세가 이렇게 된다: `database: {engine: postgres, placement: managed, version: "16",

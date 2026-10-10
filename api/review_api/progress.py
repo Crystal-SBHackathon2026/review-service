@@ -23,6 +23,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from review_ai.masking import mask_spec
+from review_ai.secrets_pattern import MASK, looks_secret
 from review_ai.state import REASON_MESSAGES
 from review_common.github import DEFAULT_GITOPS_REPO
 from review_common.repository import ReviewRepository
@@ -45,7 +47,7 @@ INTAKE_KINDS = {"missing": "deploy.yaml 없음", "empty": "빈 deploy.yaml", "ya
                 "schema_error": "명세 형식 오류"}
 INTAKE_STATUSES = {"processing": "처리 중", "generated": "명세 생성", "repaired": "형식 복구", "rejected": "거절",
                    "failed": "실패"}
-HEALTH = {"healthy": "Healthy", "degraded": "Degraded"}
+HEALTH = {"healthy": "Healthy", "degraded": "Degraded", "sync_failed": "SyncFailed"}
 STAGE_AT = {"review": "judged_at", "human": "human_decided_at", "merge": "merged_at",
             "gitops": "gitops_committed_at"}  # 끝난 단계의 시각 (0009). 그 전 행은 None
 
@@ -55,6 +57,20 @@ def review_view(row: dict[str, Any]) -> dict[str, Any]:
     reasons = row.get("reasons") or []
     return {**{k: row.get(k) for k in REVIEW_KEYS},
             "reason_messages": {code: REASON_MESSAGES[code] for code in reasons if code in REASON_MESSAGES}}
+
+
+async def deployment_summary(repo, row):
+    events = [e for e in await repo.list_deployments(row["review_id"], limit=50)
+              if e["target_env"] == row["target_env"]]
+    failed = await repo.is_deployment_failing(row["review_id"])  # 마지막 알림 기준 — 실패 뒤 회복하면 성공 쪽을 본다
+    latest = next((e for e in events if (e["kind"] != "deployed") == failed), events[0] if events else None)
+    verified_success = (latest is not None and latest["kind"] == "deployed"
+                        and latest["payload"].get("health") == "Healthy"
+                        and latest["payload"].get("sync_status") == "Synced"
+                        and (latest["payload"].get("operation") or {}).get("phase") == "Succeeded")
+    return {"status": "failed" if failed else "healthy" if verified_success else "unknown",
+            "event_id": latest["event_id"] if latest else None,
+            "analysis_status": latest["analysis_status"] if latest else None}
 
 
 def _envs(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -131,6 +147,75 @@ async def review_chain(repo: ReviewRepository, row: dict[str, Any]) -> list[dict
 
 def _is_autofix(row: dict[str, Any]) -> bool:
     return str(row.get("requested_by") or "").startswith(AUTOFIX_PREFIX)
+
+
+def _commit_link(row: dict[str, Any]) -> str | None:
+    ref = row.get("spec_ref") or {}
+    repository, commit = ref.get("repository") or "", ref.get("commit") or ""
+    if REPO_NAME.fullmatch(repository) and SHA.fullmatch(commit):
+        return f"https://github.com/{repository}/commit/{commit}"
+    return None
+
+
+def _history_ops(patch: dict[str, Any]) -> list[dict[str, Any]]:
+    """공개 이력에 overlay diff·env 원문 값을 내보내지 않는다. 기존 비밀 값 판정을 재사용한다."""
+    ops = []
+    for op in patch.get("ops") or []:
+        view = {k: op[k] for k in ("op", "path", "value") if k in op}
+        # 사람 편집도 rounds 에 들어온다. JSON Pointer 의 env 아래 값은 이름과 무관하게 가린다.
+        parts = str(op.get("path") or "").split("/")[1:]
+        parts = [p.replace("~1", "/").replace("~0", "~") for p in parts]
+        if "value" in view and ("env" in parts or any(looks_secret(p, view["value"]) for p in parts)):
+            view["value"] = MASK
+        ops.append(mask_spec(view))
+    return ops
+
+
+def _history_report(report: dict[str, Any]) -> dict[str, Any]:
+    """화면에 필요한 설명만 고른다. 명세 전체·LLM 내부 정보·files.diff 는 반환하지 않는다."""
+    findings = [{k: f[k] for k in ("finding_id", "rule_id", "severity", "title", "location", "evidence",
+                                  "irreversible", "autofix") if k in f}
+                for f in report.get("findings") or []]
+    for finding in findings:
+        finding["location"] = {"spec_path": (finding.get("location") or {}).get("spec_path")}
+    items = [{k: item[k] for k in ("finding_id", "why", "cited_rule_ids") if k in item}
+             for item in report.get("items") or []]
+    return mask_spec({"findings": findings, "items": items, "doc_ids": report.get("doc_ids") or []})
+
+
+def review_history(chain: list[dict[str, Any]], row: dict[str, Any]) -> list[dict[str, Any]]:
+    """요청한 검토까지의 이력. 현재 findings 와 섞지 않고 커밋 반영은 성공한 연결로만 확인한다."""
+    history = []
+    upto = chain[:chain.index(row) + 1]
+    for i, r in enumerate(upto):
+        nxt = chain[i + 1] if i + 1 < len(chain) else None
+        linked = bool(nxt and r.get("superseded_by") == nxt["review_id"])
+        autofix = bool(linked and r["status"] == "superseded"
+                       and nxt.get("requested_by") == AUTOFIX_PREFIX + r["review_id"]
+                       and r.get("app") == nxt.get("app") and r.get("target_env") == nxt.get("target_env")
+                       and r.get("pr_number") == nxt.get("pr_number")
+                       and (r.get("spec_ref") or {}).get("repository") == (nxt.get("spec_ref") or {}).get("repository")
+                       and _commit_link(nxt))
+        rounds = []
+        for snapshot in r.get("rounds") or []:
+            human = snapshot.get("human")
+            rounds.append({"round": snapshot.get("round"), "verdict": snapshot.get("verdict"),
+                           **_history_report(snapshot), "ops": _history_ops(snapshot.get("patch") or {}),
+                           "actor": "human" if human else "ai",
+                           "approver": human.get("approver") if human else None})
+        history.append({
+            "review_id": r["review_id"], "created_at": r.get("created_at"), "status": r["status"],
+            "verdict": r.get("verdict"), "is_current": r["review_id"] == row["review_id"],
+            "commit": (r.get("spec_ref") or {}).get("commit"), "commit_url": _commit_link(r),
+            **_history_report({"findings": r.get("findings"), "items": (r.get("decision") or {}).get("items")}),
+            "rounds": rounds,
+            "patch_commit": "committed" if autofix else "failed" if r["status"] == "failed"
+                            and str(r.get("error") or "").startswith("commit_fix:") else "unconfirmed",
+            "next": ({"review_id": nxt["review_id"], "kind": "autofix" if autofix else "new_commit",
+                      "commit": (nxt.get("spec_ref") or {}).get("commit"), "commit_url": _commit_link(nxt),
+                      "status": nxt["status"], "verdict": nxt.get("verdict")} if linked else None),
+        })
+    return history
 
 
 # --- 환경 -----------------------------------------------------------------------------------------
@@ -212,6 +297,10 @@ def _deploy_state(cards: list[dict[str, Any]]) -> tuple[str, str, Any]:
         parts.append(f"{card['env']} {HEALTH.get(deploy['kind'], deploy['kind'])}")
         (healthy if deploy["kind"] == "healthy" else degraded).append(deploy["received_at"])
     detail = " · ".join(parts)
+    target_failure = next((c["deploy"] for c in real if c.get("is_target") and c.get("deploy")
+                           and c["deploy"]["kind"] in {"degraded", "sync_failed"}), None)
+    if target_failure:
+        return "failed", detail, target_failure["received_at"]
     if healthy:
         return "done", detail, min(healthy)
     if degraded:
@@ -346,9 +435,11 @@ async def build_progress(repo: ReviewRepository, review_id: str, settings: Progr
                                                "created_at")} if intake_row else None)
     cards = env_cards(row, await repo.deploy_events_for(review_id), settings)
     return {
-        "review": review_view(row),
+        "review": {**review_view(row), "deployment": await deployment_summary(repo, row),
+                   "case_advice_status": (row.get("case_advice") or {}).get("status", "not_checked")},
         "chain": [{"review_id": r["review_id"], "status": r["status"], "verdict": r["verdict"],
                    "created_at": r["created_at"], "autofix": _is_autofix(r)} for r in chain],
+        "history": review_history(chain, row),
         "latest_review_id": latest_review_id,
         "intake": intake,
         "steps": build_steps(row, chain, intake, cards),

@@ -26,6 +26,9 @@
         처리 중에는 HEARTBEAT_EVERY 마다 updated_at 을 찍는다 — 레포 분석·LLM 이 STALE_AFTER 를 넘겨도 살아 있는
         처리를 sweep 이 가져가지 않게. 그래도 두 곳이 겹치면(heartbeat 가 DB 오류로 빠짐 등) 커밋 직전에 행을 다시 읽어
         끝난 행이면 멈추고, 커밋은 행에 먼저 이어진 것 하나만 쓴다 (link_intake 는 result_commit_sha 를 덮지 않는다).
+        처리할 때마다 파드를 죽이는 행(npm 잠금 파일 재생성·대용량 분석 중 OOM 등)을 끝없이 다시 가져가지 않게
+        attempts(웹훅 1, sweep 이 가져갈 때마다 +1)가 MAX_INTAKE_ATTEMPTS 를 넘으면 처리하지 않고
+        failed(RETRY_EXHAUSTED) + 커밋 상태 error 로 끝낸다. 새 커밋은 새 행이라 다시 1번부터 처리한다.
 """
 
 from __future__ import annotations
@@ -63,6 +66,7 @@ STATUS_CONTEXT = "review-service/intake"
 STALE_AFTER = timedelta(minutes=5)  # LLM 복구(수십 초)·코드 패치(파일 전체 재작성, 1~2분)·npm 잠금 파일보다 넉넉하게
 SWEEP_EVERY_SECONDS = 60.0
 HEARTBEAT_EVERY = STALE_AFTER / 4  # DB 가 한두 번 실패해도 STALE_AFTER 안에 다시 찍는다
+MAX_INTAKE_ATTEMPTS = 3  # 처음 처리 1번 + sweep 이 다시 처리 2번. 넘으면 RETRY_EXHAUSTED
 REPAIRABLE = ("yaml_error", "schema_error")
 READ_CONCURRENCY = 8  # 레포 분석 파일 읽기 — GitHub 은 동시 요청이 많으면 secondary rate limit 을 건다
 # 코드 패치가 풀 수 있는 미해결 항목 — 다른 항목이 남으면 어차피 사람 확인으로 가니 코드 패치(LLM)는 하지 않는다
@@ -70,6 +74,7 @@ TRANSFORM_RESOLVES = frozenset({"/database", "/requirements"})
 OTHER_LOCKFILES = ("yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json")
 MAX_READ_BYTES = 256 * 1024  # 레포 분석 파일 하나 — 넘으면 읽지 않은 파일로 둔다('없음' 결론을 막는다)
 MAX_SPEC_BYTES = 4 * MAX_RAW_CHARS  # 복구할 deploy.yaml — 글자 수 상한은 repair 가 다시 본다 (UTF-8 한 글자 ≤ 4바이트)
+MAX_LOCK_BYTES = 16 * 1024 * 1024  # 다시 만들 package-lock.json — 큰 모노레포도 수 MB. 넘으면 커밋하지 않는다
 
 
 class IntakeGitHub(Protocol):
@@ -212,7 +217,10 @@ async def _transform(deps: ApiDeps, github: IntakeGitHub, row: dict[str, Any], c
         return _lock_rejected(outcome, f"npm 이 아닌 잠금 파일({', '.join(other)})은 다시 만들 수 없다")
     if "package-lock.json" not in repo.tree:
         return outcome  # 잠금 파일 없는 레포 — CI 가 npm install 을 쓴다
-    lock = await github.get_file(row["repository"], "package-lock.json", row["head_sha"])
+    try:
+        lock = await github.get_file(row["repository"], "package-lock.json", row["head_sha"], max_bytes=MAX_LOCK_BYTES)
+    except FileTooLarge:
+        return _lock_rejected(outcome, f"package-lock.json 이 {MAX_LOCK_BYTES // (1024 * 1024)}MB 를 넘어 다시 만들지 않는다")
     try:
         new_lock = await deps.lockfile(outcome.files["package.json"] or "", lock)
     except LockfileUnavailable as exc:
@@ -323,9 +331,16 @@ async def process_intake(deps: ApiDeps, intake_id: str) -> None:
     if fields is None:
         log.info("intake %s: 다른 곳이 먼저 끝냈다", intake_id)
         return
-    if await deps.repo.finish_intake(intake_id, **fields):
-        state = {"generated": "success", "repaired": "success", "failed": "error"}.get(fields["status"], "failure")
-        await _post_status(deps, row, state, fields["message"])
+    await _finish(deps, row, fields)
+
+
+async def _finish(deps: ApiDeps, row: dict[str, Any], fields: dict[str, Any]) -> bool:
+    """processing 인 행을 끝내고 PR 에 결과 커밋 상태를 남긴다. 그사이 다른 곳이 끝냈으면 False."""
+    if not await deps.repo.finish_intake(row["intake_id"], **fields):
+        return False
+    state = {"generated": "success", "repaired": "success", "failed": "error"}.get(fields["status"], "failure")
+    await _post_status(deps, row, state, fields["message"])
+    return True
 
 
 async def _heartbeat(deps: ApiDeps, intake_id: str) -> None:
@@ -351,13 +366,30 @@ async def _post_status(deps: ApiDeps, row: dict[str, Any], state: str, descripti
 
 
 async def resume_stale_intakes(deps: ApiDeps) -> list[str]:
-    """처리 중 파드가 죽어 STALE_AFTER 넘게 processing 으로 남은 행을 다시 처리한다. 다시 처리한 intake_id 들."""
+    """처리 중 파드가 죽어 STALE_AFTER 넘게 processing 으로 남은 행을 다시 처리한다. 다시 처리한 intake_id 들.
+
+    attempts 가 MAX_INTAKE_ATTEMPTS 를 넘은 행은 처리하지 않고 failed(RETRY_EXHAUSTED)로 끝낸다 (돌려주는 목록에 없다)."""
     rows = await deps.repo.claim_stale_intakes(STALE_AFTER)
-    if rows:
-        metrics.safe(metrics.INTAKE_SWEEP_RECOVERED.inc, len(rows))
-    for row in rows:
+    exhausted = [row for row in rows if row["attempts"] > MAX_INTAKE_ATTEMPTS]
+    retried = [row for row in rows if row["attempts"] <= MAX_INTAKE_ATTEMPTS]
+    for row in exhausted:
+        await _give_up(deps, row)
+    if retried:
+        metrics.safe(metrics.INTAKE_SWEEP_RECOVERED.inc, len(retried))
+    for row in retried:
+        log.info("intake %s: 다시 처리 %d/%d", row["intake_id"], row["attempts"], MAX_INTAKE_ATTEMPTS)
         await process_intake(deps, row["intake_id"])
-    return [row["intake_id"] for row in rows]
+    return [row["intake_id"] for row in retried]
+
+
+async def _give_up(deps: ApiDeps, row: dict[str, Any]) -> None:
+    """처리하다 매번 멈춘 행 — 다시 처리하면 또 파드를 죽일 수 있다. failed 로 끝내고 PR 에 error 를 남긴다."""
+    log.error("intake %s: %d번 처리해도 끝나지 않아 다시 처리하지 않는다", row["intake_id"], MAX_INTAKE_ATTEMPTS)
+    fields = _done("failed", "RETRY_EXHAUSTED",
+                   f"{KIND_LABELS[row['kind']]} — 처리 {MAX_INTAKE_ATTEMPTS}번이 모두 중간에 멈췄다(파드 재시작 등). "
+                   "deploy.yaml 을 직접 추가하거나 새 커밋을 올려라")
+    if await _finish(deps, row, fields):
+        metrics.safe(metrics.INTAKE_SWEEP_FAILED.inc)
 
 
 async def sweep_stale_intakes(deps: ApiDeps) -> None:

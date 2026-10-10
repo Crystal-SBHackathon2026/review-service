@@ -14,6 +14,7 @@ import hashlib
 import logging
 import os
 from collections.abc import Iterable, Mapping
+from fnmatch import fnmatchcase
 from typing import Any
 
 import httpx
@@ -61,6 +62,14 @@ class ProtectedFileRemoval(RuntimeError):
     def __init__(self, paths: list[str]) -> None:
         super().__init__(f"보호 파일을 지우는 커밋: {', '.join(paths)}")
         self.paths = paths
+
+
+def is_protected(name: str, patterns: Iterable[str]) -> bool:
+    """name(directory 기준 파일 이름)이 보호 패턴에 맞는지. 패턴은 fnmatch 식(대소문자 구분) — "ingress.yaml"·"pvc-*.yaml".
+
+    하위 디렉터리 파일은 보지 않는다 — overlay 는 한 단계다. fnmatch 의 * 는 / 도 맞추므로 따로 거른다.
+    """
+    return "/" not in name and any(fnmatchcase(name, p) for p in patterns)
 
 
 def git_blob_sha(content: str) -> str:
@@ -248,7 +257,7 @@ class GitHubGitClient:
 
     async def commit_files(self, directory: str, files: Mapping[str, str], message: str, *,
                            protected: Iterable[str] = ()) -> str:
-        """protected: directory 기준 파일 이름. 지금 main 에 있는데 files 에 없으면(지우게 되면) ProtectedFileRemoval.
+        """protected: directory 기준 파일 이름 패턴(is_protected). 지금 main 에 있는데 files 에 없으면(지우게 되면) ProtectedFileRemoval.
 
         충돌로 다시 만들 때마다 새로 읽은 main 기준으로 다시 본다 — 커밋 전 검사 뒤에 그 파일이 생겼을 수 있다.
         """
@@ -281,7 +290,7 @@ class GitHubGitClient:
             for p, content in sorted(wanted.items()) if existing.get(p) != git_blob_sha(content)
         ]
         removed = [p for p in sorted(existing) if p not in wanted]  # 생성물이라 명세에서 빠진 파일은 지운다
-        blocked = sorted(name for name in protected if f"{directory}/{name}" in removed)
+        blocked = [name for name in (p[len(directory) + 1:] for p in removed) if is_protected(name, protected)]
         if blocked:  # tree·commit 을 만들기 전에 멈춘다
             raise ProtectedFileRemoval(blocked)
         entries += [{"path": p, "mode": FILE_MODE, "type": "blob", "sha": None} for p in removed]

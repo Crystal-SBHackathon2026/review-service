@@ -10,7 +10,8 @@ import yaml
 
 from review_ai.errors import TransientError
 from review_common.github import GitHubGitClient
-from review_worker.commit_overlay import PROTECTED_OVERLAY_FILES, commit_message, make_commit_overlay
+from review_worker.commit_overlay import (PROTECTED_OVERLAY_FILES, commit_message, make_commit_overlay,
+                                          make_overlay_guard)
 from tests.test_git_client import FakeGitHubApi, client, files_at_head
 
 SAMPLES = Path(__file__).resolve().parents[2] / "ai" / "samples"
@@ -233,3 +234,73 @@ async def test_커밋할_때_보호_파일_목록을_넘긴다():
     git = FakeGit("01-pass-sample-app-aws.yaml")
     await make_commit_overlay(git)(state())
     assert git.protected == PROTECTED_OVERLAY_FILES
+
+
+# --- PVC: 볼륨을 빼는 명세가 PVC(와 local-path 데이터)를 지우지 않게 -----------------------------------
+
+SQLITE_SAMPLE = "02-pass-local-sqlite.yaml"
+LOCAL_DIR = "apps/todo/overlays/local"
+
+
+def without_sqlite_volume(raw: str) -> str:
+    """SQLite 를 버리고 영속 볼륨을 뺀 명세 — 렌더 결과에 pvc-data.yaml 이 없다."""
+    spec = yaml.safe_load(raw)
+    for key in ("database", "storage"):
+        spec.pop(key)
+    spec["requirements"] = {"persistence": False}
+    return yaml.safe_dump(spec, sort_keys=False)
+
+
+@pytest.mark.asyncio
+async def test_지금_있는_pvc_를_지우는_커밋은_막는다():
+    git = FakeGit(SQLITE_SAMPLE)
+    git.raw = without_sqlite_volume(git.raw)
+    git.existing = ["deployment-patch.yaml", "kustomization.yaml", "pvc-data.yaml"]
+    out = await make_commit_overlay(git)(state("local"))
+
+    assert out == {"deploy_result": {"status": "blocked", "commit_sha": None,
+                                     "reason": "OVERLAY_RESOURCE_REMOVED: pvc-data.yaml"}}
+    assert git.commits == []
+
+
+@pytest.mark.asyncio
+async def test_볼륨_이름을_바꿔도_예전_pvc_삭제로_막는다():
+    git = FakeGit(SQLITE_SAMPLE)
+    git.raw = git.raw.replace("volume: data,", "volume: db,").replace("{name: data,", "{name: db,")
+    git.existing = ["kustomization.yaml", "pvc-data.yaml"]
+
+    assert await make_overlay_guard(git)(state("local")) == "OVERLAY_RESOURCE_REMOVED: pvc-data.yaml"
+
+
+@pytest.mark.asyncio
+async def test_볼륨을_유지하면_pvc_가_있어도_통과한다():
+    git = FakeGit(SQLITE_SAMPLE)
+    git.existing = ["kustomization.yaml", "pvc-data.yaml"]
+
+    assert await make_overlay_guard(git)(state("local")) is None
+    out = await make_commit_overlay(git)(state("local"))
+    assert out["deploy_result"]["status"] == "committed"
+    assert "pvc-data.yaml" in git.commits[0][1]
+
+
+@pytest.mark.asyncio
+async def test_병합_전_검사도_pvc_삭제를_사유로_돌려준다():
+    git = FakeGit(SQLITE_SAMPLE)
+    git.raw = without_sqlite_volume(git.raw)
+    git.existing = ["kustomization.yaml", "pvc-data.yaml"]
+
+    assert await make_overlay_guard(git)(state("local")) == "OVERLAY_RESOURCE_REMOVED: pvc-data.yaml"
+
+
+@pytest.mark.asyncio
+async def test_재시도_중에_pvc_가_생기면_지우지_않고_blocked():
+    raw = without_sqlite_volume(FakeGit(SQLITE_SAMPLE).raw)
+    api = FakeGitHubApi({f"{LOCAL_DIR}/kustomization.yaml": "old"})  # 첫 검사 때는 PVC 없음
+    api.conflicts = 1  # 그 사이 다른 커밋이 pvc-data.yaml 을 넣었다
+    api.conflict_files = {f"{LOCAL_DIR}/kustomization.yaml": "old", f"{LOCAL_DIR}/pvc-data.yaml": "pvc"}
+
+    out = await make_commit_overlay(gitops_client(api, raw))(state("local"))
+
+    assert out == {"deploy_result": {"status": "blocked", "commit_sha": None,
+                                     "reason": "OVERLAY_RESOURCE_REMOVED: pvc-data.yaml"}}
+    assert files_at_head(api)[f"{LOCAL_DIR}/pvc-data.yaml"] == "pvc"

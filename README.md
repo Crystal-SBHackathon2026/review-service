@@ -92,7 +92,9 @@ docker compose --profile app up -d --build
 
 - 그 밖의 거절: 포크 PR(`FORK_PR`), 대상 환경 모름(`NO_TARGET`), 처리 중 새 커밋(`BRANCH_MOVED`), 생성 커밋이 다시 intake 대상(`LOOP_GUARD` — 웹훅·커밋 무한 반복 방지), GitHub·Claude 일시 오류(`failed`·`ERROR` — 새 커밋을 올리면 다시 처리)
 - PR 표시: 커밋 상태 `review-service/intake` (pending → success·failure·error). 링크는 `GET /intakes/{id}`. `GET /verify?sha=` 는 검토가 없으면 `intake_failed`·`intake_processing`·`intake_generated`·`intake_repaired` 를 돌려준다(`passed: false`)
-- 처리 중 파드가 죽으면 2분 넘은 `processing` 행을 API 가 1분마다 다시 처리한다. 커밋 SHA 는 브랜치를 옮기기 전에 행에 남겨 같은 커밋으로 마저 끝낸다
+- 처리 중 파드가 죽으면 5분(`STALE_AFTER`) 넘은 `processing` 행을 API 가 1분마다 다시 처리한다. 커밋 SHA 는 브랜치를 옮기기 전에 행에 남겨 같은 커밋으로 마저 끝낸다.
+  처리 시도는 `attempts`(웹훅 1, 다시 가져갈 때마다 +1)로 세고 3번(`MAX_INTAKE_ATTEMPTS`)을 넘으면 다시 처리하지 않고 `failed`·`RETRY_EXHAUSTED` + 커밋 상태 `error` —
+  처리할 때마다 파드를 죽이는 PR(npm 잠금 파일 재생성·대용량 분석 중 OOM 등)이 5분마다 파드를 다시 죽이지 않게. 새 커밋은 새 행이라 다시 처리한다
 - **추측으로 채운 생성 명세는 자동 병합하지 않는다.** intake 는 생성 커밋 SHA 와 함께 `baseline_used`·`unverified_paths`(0012)를 남기고,
   웹훅은 **그 PR(레포·PR 번호)에 baseline 없이, 확인 못 한 값을 후보값으로 채운 `missing`·`empty` 생성 커밋이 있으면**
   `review.requested` 에 `generated_spec: true`·`unverified_paths` 를 싣는다 → judge 가 findings 와 무관하게 `needs_human`(`GENERATED_SPEC_UNVERIFIED`),
@@ -101,7 +103,7 @@ docker compose --profile app up -d --build
   생성 커밋 위에 커밋이 더 올라와도 같다. 판단 근거는 `spec_intakes` 기록뿐 — 명세 내용·커밋 메시지·PR 작성자는 보지 않는다.
   `unverified_paths` 가 NULL 인 0012 전 행은 예전처럼 사람 확인이다. 사람이 승인(·수정)하면 이어서 진행하고, 그 뒤 재검사·봇 수정 커밋 재검토에서는 다시 묻지 않는다.
   전부 확인된 생성 명세(`unverified_paths: []`)는 자동 진행한다. 10/09 sample-app #11(`network: {}` 생성 명세 → ingress 삭제 → ALB 삭제)은
-  배포된 앱이면 마지막 커밋 명세를 baseline 으로 쓰는 것(#39)과 병합 전 overlay 보호 파일 검사(ingress.yaml 삭제 차단)가 막는다.
+  배포된 앱이면 마지막 커밋 명세를 baseline 으로 쓰는 것(#39)과 병합 전 overlay 보호 파일 검사(`ingress.yaml`·`pvc-*.yaml` 삭제 차단 — PVC 는 #52)가 막는다.
   baseline 으로 만든 명세와 형식 오류 복구(`repaired` — 값은 원문 대조)는 예전처럼 일반 검토다
 
 ## 커밋 상태 `review-service/verify`
@@ -123,6 +125,9 @@ docker compose --profile app up -d --build
 PR 에서 들어가서 보는 **읽기 전용** 화면이다 (토큰 입력 없음, 승인은 `/ui`). `GET /ui/reviews` 는 최근 검토 20개(superseded 제외) 목록 — PR 링크가 없을 때 데모용 입구.
 
 - `GET /reviews/{id}/progress` 하나만 3초마다 폴링, `final` 이면 30초. 요청한 검토가 superseded 면 `latest_review_id` 로 주소를 바꿔 이어서 본다
+- 보고서는 **현재 발견 사항**과 **AI 처리 이력**을 분리한다. `history` 는 요청한 검토까지의 검토·회차별 발견 사항, AI 설명, 근거 문서 ID, 변경 경로·값을 오래된 순서로 반환한다. 최신 검토로 이동하거나 새로고침해도 이전 회차가 남는다. 같은 finding ID 가 반복되어도 검토·회차별로 구분한다
+- `history[].patch_commit` 은 `committed`(이전 검토의 superseded_by 와 다음 검토의 `autofix:<이전 ID>` 연결·커밋 확인), `failed`(수정 커밋 단계 실패), `unconfirmed`(반영 확인 전)이다. 검토 중 명세에 적용한 변경과 PR 커밋 반영을 구분한다. 일반 사용자 커밋의 다음 검토가 pass 여도 과거 문제를 AI 가 해결했다고 표시하지 않는다. 회차의 `actor` 는 `ai` 또는 `human`
+- 이력에 명세 전체·LLM 내부 정보·overlay diff 는 추가하지 않는다. 패치의 env 경로 값과 비밀로 보이는 값은 가린다. 이전 값은 추정하지 않고 저장된 변경 경로·값과 커밋 링크를 표시한다
 - 단계: 명세 생성(intake 가 있을 때) → AI 검토 → 사람 확인(needs_human 이었을 때) → CI 확인 → 병합 → overlay 커밋 → 배포.
   `rejected`·`failed`·`blocked` 는 그 단계에서 `failed` 로 멈추고 뒤는 `skipped`. 배포는 실제 환경 중 하나라도 Healthy 면 완료, Degraded 면 실패
 - 단계 시각(`at`)은 아는 것만 — 끝난 단계는 0009 열(`judged_at`·`human_decided_at`·`merged_at`·`gitops_committed_at`), 지금·멈춘 단계는 `updated_at`, 배포는 `deploy_events.received_at`. 0009 전 행과 CI 는 null
@@ -156,9 +161,24 @@ PR 에서 들어가서 보는 **읽기 전용** 화면이다 (토큰 입력 없�
   "links": {"pr": "https://github.com/…/pull/12", "merge_commit": "https://github.com/…/commit/…",
             "gitops_commit": "https://github.com/Crystal-SBHackathon2026/gitops/commit/…"},
   "findings": [], "decision": {}, "rounds": [],   // 검토 보고서용 — /reviews/{id} 와 같은 수준
+  "history": [{"review_id": "rv_…a1", "is_current": false, "verdict": "pass", "status": "superseded",
+               "commit": "…", "commit_url": "https://github.com/…/commit/…", "created_at": "…",
+               "findings": [], "items": [], "doc_ids": [],
+               "rounds": [{"round": 0, "verdict": "fix", "actor": "ai", "approver": null,
+                           "findings": [/* 수정 전 발견 사항 */], "items": [/* why·cited_rule_ids */],
+                           "doc_ids": ["rules/db-003#0"],
+                           "ops": [{"op": "replace", "path": "/runtime/replicas", "value": 1}]}],
+               "patch_commit": "committed",
+               "next": {"review_id": "rv_…53c71e3c", "kind": "autofix", "commit": "…",
+                        "commit_url": "https://github.com/…/commit/…", "status": "committed", "verdict": "pass"}},
+              {"review_id": "rv_…53c71e3c", "is_current": true, "rounds": [] /* 나머지 필드 생략 */}],
   "final": true                                   // 화면이 폴링을 30초로 늦춘다
 }
 ```
+
+5분 데모에서는 정상 명세가 있는 앱 PR 에 안전하게 자동 수정할 수 있는 문제 하나를 넣고, 체크의 Details 를 연다.
+AI 설명·근거·명세 변경 → 수정 커밋 반영 → 재검토 pass → 환경별 배포 상태 순서로 40~60초간 보여 준다.
+SQLite replica 수 문제(DB-003)는 해당 앱의 저장소·배포 환경이 지원되는지 먼저 확인한다. 기존 검토를 미리 끝내 두면 최신 화면의 이력으로도 같은 설명을 할 수 있다.
 
 ## 멈춘 검토 회수 (review sweep, `api/review_api/recovery.py`)
 
@@ -195,6 +215,7 @@ PR 에서 들어가서 보는 **읽기 전용** 화면이다 (토큰 입력 없�
 | `review_sweep_recovered_total` | counter | from_status | review sweep 이 회수한 검토 |
 | `review_sweep_failed_total` | counter | | 회수 3번을 넘어 failed |
 | `review_intake_sweep_recovered_total` | counter | | intake sweep 이 다시 처리한 intake |
+| `review_intake_sweep_failed_total` | counter | | 처리 시도 3번을 넘어 failed(`RETRY_EXHAUSTED`)로 끝낸 intake |
 | `review_reviews` | gauge | app, env, status | 최근 1일 안에 바뀐 검토 수 (scrape 때 업무 DB, 15초 캐시, 실패하면 마지막 값) |
 | `review_needs_human_oldest_seconds` | gauge | app, env | 가장 오래 기다린 needs_human 의 대기 시간 (updated_at 기준) |
 | `review_worker_messages_total` | counter | topic, kind, result | kind: requested·human_decision·ci_completed·retry_overlay / result: processed·skipped·invalid·error |
@@ -235,3 +256,7 @@ received → reviewing ─┬─ needs_human ─┬─ (승인, 적용할 수정
   입력한 값이 우선이며, 기존 명세 그대로 승인하려면 `use_recommendations: false`를 명시한다. 권장값이 없으면 값 없는 승인은 그대로 승인이다. [응답 기본값 안내](ai/docs/human-recommendations.md).
 - 종료 지점(거절·AI 수정 커밋·사람 승인 뒤 committed)과 Argo CD Degraded 에서 판단 사례를 `review_cases` 에 남기고, 다음 검토가 같은 규칙에 걸리면 근거 문서로 붙인다. 기록 실패는 검토 결과를 바꾸지 않는다. [판단 사례](ai/docs/review-ai.md#판단-사례-review_cases)
 - `commit_overlay`(성진님, `worker/review_worker/commit_overlay.py`)가 원본 명세 + `applied_ops` → overlay 를 gitops main 에 커밋한다. 렌더러 blocking 경고면 커밋하지 않고 `blocked`. gitops ref 충돌은 main 을 다시 읽어 최대 5회.
+
+### 배포 실패 분석
+
+Argo CD 오류 수신, 별도 Kafka 진단, 다음 요청의 실패 사례 비교와 운영자 UI는 [배포 실패 분석 문서](ai/docs/deployment-failure-analysis.md)를 참고하세요. 신규 송신 계약은 [JSON Schema](api/schema/deployment.result.v1.schema.json)에 있습니다.

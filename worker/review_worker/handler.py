@@ -94,7 +94,7 @@ class ReviewHandler:
             await self._run(rid, None)
             return True
         spec = dict(msg.deploy_spec)
-        row = await self._repo.get_baseline(msg.app, msg.target_env)
+        row = await self._repo.baseline_or_last_committed(msg.app, msg.target_env)  # 웹훅 없는 local·gcp 대체
         baseline = baseline_for(row)
         if baseline is not None:
             spec["baseline"] = baseline
