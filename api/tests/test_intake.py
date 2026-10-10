@@ -477,6 +477,45 @@ async def test_stale_processing_row_is_resumed_with_its_commit(ienv: IntakeEnv) 
     assert len(ienv.github.parents) == 1
 
 
+async def test_intake_that_keeps_dying_is_retried_up_to_the_cap_then_failed(ienv: IntakeEnv,
+                                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    """처리할 때마다 파드가 죽는 행(OOM 등) — 상한까지만 다시 처리하고, 넘으면 처리하지 않고 failed + error 로 끝낸다."""
+    from review_api import intake as intake_mod
+
+    await ienv.repo.insert_intake(intake_id="in_oom", repository=REPO, head_repository=REPO, pr_number=5,
+                                  head_sha=HEAD, head_ref="feature", path="deploy.yaml", kind="missing",
+                                  errors=[], requested_by="octo-dev")
+    row = ienv.repo.intakes["in_oom"]
+    assert row["attempts"] == 1  # 웹훅이 연 처리가 1번째 시도
+    processed: list[str] = []
+
+    async def dies(deps: Any, intake_id: str) -> None:  # 처리 중 파드가 죽었다 — 행은 processing 으로 남는다
+        processed.append(intake_id)
+
+    monkeypatch.setattr(intake_mod, "process_intake", dies)
+    deps = ienv.client.app.state.deps
+
+    def stale() -> None:
+        row["updated_at"] -= STALE_AFTER + timedelta(seconds=1)
+
+    for attempt in range(2, intake_mod.MAX_INTAKE_ATTEMPTS + 1):
+        stale()
+        assert await resume_stale_intakes(deps) == ["in_oom"]
+        assert (row["status"], row["attempts"]) == ("processing", attempt)
+    assert len(processed) == intake_mod.MAX_INTAKE_ATTEMPTS - 1
+
+    stale()
+    assert await resume_stale_intakes(deps) == []
+
+    assert len(processed) == intake_mod.MAX_INTAKE_ATTEMPTS - 1  # 상한을 넘은 행은 process_intake 를 부르지 않는다
+    assert (row["status"], row["reason"], row["attempts"]) == ("failed", "RETRY_EXHAUSTED",
+                                                               intake_mod.MAX_INTAKE_ATTEMPTS + 1)
+    assert ienv.states() == [(HEAD, "error")]
+    assert ienv.github.statuses[0]["context"] == STATUS_CONTEXT
+    stale()
+    assert await resume_stale_intakes(deps) == [] and len(ienv.github.statuses) == 1  # 끝난 행은 sweep 대상이 아니다
+
+
 async def test_finished_intake_is_not_processed_twice(ienv: IntakeEnv) -> None:
     from review_api.intake import process_intake
 

@@ -10,6 +10,7 @@ from typing import Any
 from review_ai.spec.deploy_spec import AppSpec
 
 SECRET_NAME_SUFFIX = "-secrets"
+NODE_TOPOLOGY = "kubernetes.io/hostname"
 READINESS_PERIOD = 5
 LIVENESS_PERIOD = 10
 
@@ -72,13 +73,36 @@ def pod_volumes(spec: AppSpec) -> list[dict[str, Any]]:
     ]
 
 
-def pvc(spec: AppSpec, volume_name: str) -> dict[str, Any]:
+def has_rwo_pvc(spec: AppSpec) -> bool:
+    return any(v.persistent and v.access_mode == "ReadWriteOnce" for v in spec.storage.volumes)
+
+
+def same_node_term(spec: AppSpec) -> dict[str, Any]:
+    """앱 Pod(label app=<이름>, base·preview Service 와 같은 전제)가 있는 노드."""
+    return {"labelSelector": {"matchLabels": {"app": spec.metadata.name}}, "topologyKey": NODE_TOPOLOGY}
+
+
+def rwo_affinity(spec: AppSpec) -> dict[str, Any]:
+    """ReadWriteOnce 는 한 노드에만 붙는다. canary·bluegreen 은 새 Pod 와 옛 Pod 가 잠시 같이 뜨므로
+    둘이 다른 노드에 놓이면 새 Pod 가 볼륨을 못 붙여(Multi-Attach) Rollout 이 멈춘다 → 같은 노드에만 띄운다.
+
+    required 여도 첫 배포는 막히지 않는다 — 맞는 Pod 가 하나도 없고 자기 label 이 selector 에 맞으면 스케줄러가 통과시킨다.
+    그 노드에 자리가 없으면 새 Pod 는 Pending → progressDeadlineAbort 로 중단되고 옛 버전이 계속 서비스한다.
+    """
+    return {"podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [same_node_term(spec)]}}
+
+
+def pvc(spec: AppSpec, volume_name: str, storage_class: str | None = None) -> dict[str, Any]:
+    """storage_class 가 None 이면 storageClassName 을 쓰지 않는다 — 클러스터 기본 클래스를 쓴다."""
     v = next(v for v in spec.storage.volumes if v.name == volume_name)
+    claim: dict[str, Any] = {"accessModes": [v.access_mode], "resources": {"requests": {"storage": v.size}}}
+    if storage_class:
+        claim["storageClassName"] = storage_class
     return {
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
         "metadata": {"name": pvc_name(spec, v.name)},
-        "spec": {"accessModes": [v.access_mode], "resources": {"requests": {"storage": v.size}}},
+        "spec": claim,
     }
 
 
@@ -102,6 +126,8 @@ def rollout_ops(spec: AppSpec) -> list[dict[str, Any]]:
     volumes = pod_volumes(spec)
     if volumes:
         ops.append({"op": "add", "path": "/spec/template/spec/volumes", "value": volumes})
+    if has_rwo_pvc(spec):
+        ops.append({"op": "add", "path": "/spec/template/spec/affinity", "value": rwo_affinity(spec)})
     return ops
 
 

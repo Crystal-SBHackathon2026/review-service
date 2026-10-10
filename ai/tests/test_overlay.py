@@ -100,6 +100,25 @@ def test_sqlite_volume_renders_pvc_and_mount(tmp_path: Path) -> None:
     assert docs["PersistentVolumeClaim"]["spec"]["resources"]["requests"]["storage"] == "1Gi"
     assert docs["Service"]["spec"]["ports"][0]["targetPort"] == 3000
     assert docs["Ingress"]["spec"]["ingressClassName"] == "traefik"
+    # ReadWriteOnce 는 한 노드에만 붙는다 — canary 의 새 Pod 를 옛 Pod 와 같은 노드에 띄운다 (Multi-Attach 방지)
+    assert pod["affinity"] == {"podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [
+        {"labelSelector": {"matchLabels": {"app": "sample-app"}}, "topologyKey": "kubernetes.io/hostname"}]}}
+    # base Pod label 과 맞아야 첫 배포가 자기 자신으로 통과한다
+    assert docs["Rollout"]["spec"]["template"]["metadata"]["labels"]["app"] == "sample-app"
+
+
+@pytest.mark.parametrize(("volume", "expected"), [
+    ({"persistent": True}, True),
+    ({"persistent": True, "access_mode": "ReadWriteMany"}, False),  # 여러 노드에 붙는다
+    ({"persistent": False}, False),  # emptyDir 은 Pod 마다 따로
+])
+def test_same_node_affinity_only_for_read_write_once_pvc(volume: dict[str, Any], expected: bool) -> None:
+    raw = load_sample_dict("02-pass-local-sqlite.yaml")
+    raw["database"] = {"engine": "none"}
+    raw["storage"] = {"volumes": [{"name": "uploads", "mount_path": "/u", "size": "1Gi", **volume}]}
+    patch = yaml.safe_load(render_overlay(DeploySpec.model_validate(raw)).files["kustomization.yaml"])["patches"][0]
+    paths = {op["path"] for op in yaml.safe_load(patch["patch"])}
+    assert ("/spec/template/spec/affinity" in paths) is expected
 
 
 def test_secrets_render_as_secret_key_refs_without_values() -> None:
@@ -146,13 +165,30 @@ def test_sample_app_has_no_blocking_warning() -> None:
     assert rendered.warnings == ()
 
 
-def test_volume_on_aws_blocks_because_eks_has_no_csi_driver() -> None:
+def test_aws_volume_uses_ebs_storage_class_and_warns_retained() -> None:
+    """2026-10-10: EKS 는 oneaction-monitoring-gp3(EBS, Retain)로 ReadWriteOnce PVC 를 만든다. 배포는 막지 않는다."""
     raw = load_sample_dict("01-pass-sample-app-aws.yaml")
     raw["storage"] = {"volumes": [{"name": "data", "mount_path": "/data", "size": "1Gi"}]}
     rendered = render_overlay(DeploySpec.model_validate(raw))
-    assert [w.code for w in rendered.blocking] == ["VOLUME_UNSUPPORTED"]
-    local = load_sample_dict("02-pass-local-sqlite.yaml")
-    assert "VOLUME_UNSUPPORTED" not in codes(render_overlay(DeploySpec.model_validate(local)))
+    claim = yaml.safe_load(rendered.files["pvc-data.yaml"])["spec"]
+    assert claim == {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}},
+                     "storageClassName": "oneaction-monitoring-gp3"}
+    assert rendered.blocking == ()
+    assert [w.code for w in rendered.warnings] == ["VOLUME_RETAINED"]
+    assert "data 1Gi" in rendered.warnings[0]
+
+
+def test_aws_volume_read_write_many_still_blocks() -> None:
+    raw = load_sample_dict("01-pass-sample-app-aws.yaml")
+    raw["storage"] = {"volumes": [{"name": "data", "mount_path": "/data", "size": "1Gi", "access_mode": "ReadWriteMany"}]}
+    assert [w.code for w in render_overlay(DeploySpec.model_validate(raw)).blocking] == ["VOLUME_UNSUPPORTED"]
+
+
+def test_local_volume_uses_default_class_without_retained_warning() -> None:
+    rendered = render_overlay(DeploySpec.model_validate(load_sample_dict("02-pass-local-sqlite.yaml")))
+    claims = [yaml.safe_load(c)["spec"] for f, c in rendered.files.items() if f.startswith("pvc-")]
+    assert claims and all("storageClassName" not in c for c in claims)
+    assert not codes(rendered) & {"VOLUME_UNSUPPORTED", "VOLUME_RETAINED"}
 
 
 def test_tls_without_host_blocks_tls_secret_does_not() -> None:

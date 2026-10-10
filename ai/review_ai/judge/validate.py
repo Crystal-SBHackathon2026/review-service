@@ -12,6 +12,7 @@
    - 비밀처럼 보이는 env 를 새로 넣지 않는다. env 는 SEC-004 대상 항목을 지우는 것 말고는 바꾸지 않는다
    - secrets 는 이름이 겹친 항목을 지우는 것만(SEC-003), allowed_cidrs 는 전체 대역 항목을 지우는 것만(NET-002) 허용한다
    - 적용한 명세를 다시 검사하면 대상 finding 이 사라지고 새 finding 이 생기지 않는다
+     (low 경고는 예외 — 판정에 들지 않는 환경 한계 안내라, local 에서 managed → in-cluster 로 고치면 DB-010 이 붙는다)
 4. 자유 텍스트(why·extra_opinions)는 비밀처럼 보이는 부분을 가린다
 """
 
@@ -171,9 +172,10 @@ def _cidrs_only_drop_full_range(before: DeploySpec, after: DeploySpec) -> bool:
 
 
 def _resolves_without_new(before_findings: Sequence[Finding], after: DeploySpec, targets: set[str]) -> bool:
-    after_ids = {f["finding_id"] for f in run_static_check(after)}
+    after_findings = run_static_check(after)
     before_ids = {f["finding_id"] for f in before_findings}
-    return not (after_ids & targets) and after_ids <= before_ids
+    new = [f for f in after_findings if f["finding_id"] not in before_ids]
+    return not ({f["finding_id"] for f in after_findings} & targets) and all(f["severity"] == "low" for f in new)
 
 
 def _parse_ops(llm_patch: LlmPatch) -> list[PatchOp] | None:

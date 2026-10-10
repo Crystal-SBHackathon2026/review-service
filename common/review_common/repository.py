@@ -7,7 +7,7 @@ ReviewRepository 프로토콜 하나에 Postgres 구현과 메모리 구현(테�
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
@@ -80,6 +80,11 @@ def baseline_for(row: dict[str, Any] | None) -> dict[str, Any] | None:
         "facts": {"database_has_data": row.get("database_has_data"),
                   "observed_at": observed.isoformat() if observed else None},
     }
+
+
+# committed 검토 → baselines 행 모양. 배포 확인 전이라 데이터 유무를 모른다 — None 은 데이터 있음으로 취급된다.
+_COMMITTED_AS_BASELINE = ("app, target_env, final_spec AS spec, spec_ref, merge_sha,"
+                          " NULL::boolean AS database_has_data, NULL::timestamptz AS observed_at")
 
 
 class ReviewRepository(Protocol):
@@ -175,6 +180,16 @@ class ReviewRepository(Protocol):
 
     async def get_baseline(self, app: str, target_env: str) -> dict[str, Any] | None: ...
 
+    async def baseline_or_last_committed(self, app: str, target_env: str) -> dict[str, Any] | None:
+        """검토가 비교할 이전 배포 — baselines 행, 없으면 같은 app·target_env 로 gitops 에 마지막으로 커밋한
+        검토(committed)의 final_spec 을 baselines 행 모양으로(database_has_data=None → 데이터 있음으로 취급).
+
+        baselines 는 Argo Notifications 웹훅으로만 쓰인다. local(자체 Argo CD, pull 모델)·gcp 는 웹훅이 닿지 않거나
+        구독이 없어 비어 있고, 그러면 STO-006(볼륨 제거)·STO-005·DB-001 이 걸리지 않는다. 대체 규칙은
+        latest_baseline_for_repository 와 같다.
+        """
+        ...
+
     async def upsert_baseline(self, *, app: str, target_env: str, spec: dict[str, Any], spec_ref: dict[str, Any],
                               merge_sha: str | None, observed_at: datetime) -> None: ...
 
@@ -251,9 +266,10 @@ class ReviewRepository(Protocol):
         ...
 
     async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
-        """older_than 보다 오래 processing 인 행(처리 중 파드가 죽은 것)을 가져가며 updated_at 을 새로 찍는다.
+        """older_than 보다 오래 processing 인 행(처리 중 파드가 죽은 것)을 가져가며 updated_at 을 새로 찍고
+        attempts 를 1 올린다 (insert_intake 가 1 로 넣는다). 돌려주는 행의 attempts 는 올린 뒤 값이다.
 
-        API 가 여러 개여도 한 행은 한 곳만 가져간다."""
+        API 가 여러 개여도 한 행은 한 곳만 가져간다. 상한을 넘었는지는 호출하는 쪽(intake)이 판단한다."""
         ...
 
     # --- review_cases ---
@@ -474,6 +490,13 @@ class PostgresReviewRepository(PostgresDeployments):
         return await self._fetchone(
             "SELECT * FROM reviews WHERE superseded_by = %s ORDER BY created_at DESC LIMIT 1", (review_id,))
 
+    async def baseline_or_last_committed(self, app: str, target_env: str) -> dict[str, Any] | None:
+        return await self.get_baseline(app, target_env) or await self._fetchone(
+            f"SELECT {_COMMITTED_AS_BASELINE} FROM reviews r"
+            " WHERE app = %s AND target_env = %s AND status = 'committed' AND final_spec IS NOT NULL"
+            f" AND ({LAST_DEPLOY_FAILED}) IS NOT TRUE"
+            " ORDER BY updated_at DESC LIMIT 1", (app, target_env))
+
     async def latest_baseline_for_repository(self, repository: str) -> dict[str, Any] | None:
         scopes = await self._fetchall("SELECT app,target_env FROM reviews WHERE spec_ref->>'repository'=%s UNION"
                                      " SELECT app,target_env FROM baselines WHERE spec_ref->>'repository'=%s", (repository,repository))
@@ -482,8 +505,7 @@ class PostgresReviewRepository(PostgresDeployments):
         if rows:
             return max(rows, key=lambda b: b["observed_at"] or datetime.min.replace(tzinfo=UTC))
         return await self._fetchone(
-            "SELECT app, target_env, final_spec AS spec, spec_ref, merge_sha, NULL::boolean AS database_has_data,"
-            " NULL::timestamptz AS observed_at FROM reviews r"
+            f"SELECT {_COMMITTED_AS_BASELINE} FROM reviews r"
             " WHERE spec_ref->>'repository' = %s AND status = 'committed' AND final_spec IS NOT NULL"
             f" AND ({LAST_DEPLOY_FAILED}) IS NOT TRUE"
             " ORDER BY updated_at DESC LIMIT 1", (repository,))
@@ -546,8 +568,8 @@ class PostgresReviewRepository(PostgresDeployments):
 
     async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
         rows = await self._fetchall(
-            "UPDATE spec_intakes SET updated_at = now() WHERE status = 'processing' AND updated_at < now() - %s"
-            " RETURNING *", (older_than,))
+            "UPDATE spec_intakes SET updated_at = now(), attempts = attempts + 1"
+            " WHERE status = 'processing' AND updated_at < now() - %s RETURNING *", (older_than,))
         return sorted(rows, key=lambda r: r["created_at"])
 
     async def insert_case(self, **case: Any) -> bool:
@@ -753,8 +775,15 @@ class InMemoryReviewRepository(MemoryDeployments):
         rows.sort(key=lambda b: b["observed_at"] or datetime.min.replace(tzinfo=UTC))
         if rows:
             return copy.deepcopy(rows[-1])
-        committed = [r for r in self.reviews.values() if r["spec_ref"].get("repository") == repository
-                     and r["status"] == "committed" and r["final_spec"] is not None
+        return await self._last_committed_as_baseline(lambda r: r["spec_ref"].get("repository") == repository)
+
+    async def baseline_or_last_committed(self, app: str, target_env: str) -> dict[str, Any] | None:
+        return await self.get_baseline(app, target_env) or await self._last_committed_as_baseline(
+            lambda r: r["app"] == app and r["target_env"] == target_env)
+
+    async def _last_committed_as_baseline(self, match: Callable[[dict[str, Any]], bool]) -> dict[str, Any] | None:
+        committed = [r for r in self.reviews.values()
+                     if match(r) and r["status"] == "committed" and r["final_spec"] is not None
                      and not await self.is_deployment_failing(r["review_id"])]
         if not committed:
             return None
@@ -770,7 +799,8 @@ class InMemoryReviewRepository(MemoryDeployments):
         now = _now()
         self.intakes[intake["intake_id"]] = {
             **copy.deepcopy(intake), "status": "processing", "reason": None, "message": None, "details": [],
-            "result_commit_sha": None, "review_id": None, "baseline_used": None, "created_at": now, "updated_at": now,
+            "result_commit_sha": None, "review_id": None, "baseline_used": None, "attempts": 1, "created_at": now,
+            "updated_at": now,
         }
         return True
 
@@ -824,7 +854,7 @@ class InMemoryReviewRepository(MemoryDeployments):
         now = _now()
         rows = [r for r in self.intakes.values() if r["status"] == "processing" and r["updated_at"] < now - older_than]
         for r in rows:
-            r["updated_at"] = now
+            r.update(updated_at=now, attempts=r["attempts"] + 1)
         return copy.deepcopy(sorted(rows, key=lambda r: r["created_at"]))
 
     async def insert_case(self, **case: Any) -> bool:

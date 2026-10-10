@@ -14,12 +14,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from review_ai.overlay.workload import pvc_name, secret_name
+from review_ai.overlay.workload import pvc_name, same_node_term, secret_name
 from review_ai.spec.deploy_spec import AppSpec
 
 DUMP_IMAGE = "keinos/sqlite3:3.46.1"
 LOAD_IMAGE = "postgres:16-alpine"
 IMPORT_DEADLINE_SECONDS = 600
+SAME_NODE_WEIGHT = 100
 SOURCE_DIR, WORK_DIR = "/source", "/work"
 POSTGRES_UID = 70  # postgres:alpine 의 postgres 사용자
 
@@ -118,6 +119,10 @@ def data_import_job(spec: AppSpec) -> dict[str, Any] | None:
             "activeDeadlineSeconds": IMPORT_DEADLINE_SECONDS,
             "template": {"spec": {
                 "restartPolicy": "Never",
+                # PreSync 라 옛 앱 Pod 가 아직 PVC 를 붙이고 있다 — 다른 노드에 뜨면 Multi-Attach 로 못 붙는다.
+                # required 면 앱 Pod 가 없을 때(내려가 있을 때) 영원히 Pending 이라 preferred 로 둔다.
+                "affinity": {"podAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": [
+                    {"weight": SAME_NODE_WEIGHT, "podAffinityTerm": same_node_term(spec)}]}},
                 "initContainers": [dump],
                 "containers": [load],
                 "volumes": [

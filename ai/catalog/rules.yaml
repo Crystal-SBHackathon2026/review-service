@@ -104,6 +104,16 @@ rules:
     check: baseline 이 데이터 있는(또는 모르는) sqlite 이고 지금 engine 이 다른데 database.data_import 가 없다
     fix: database.data_import{from_volume, file} 를 적고 그 볼륨을 storage.volumes 에 남긴다 — 렌더러가 마이그레이션 다음에 한 번 옮기는 Job 을 만든다
 
+  - id: DB-010
+    category: database
+    severity: low
+    autofix: forbidden
+    priority: P1
+    providers: [local]
+    title: 클러스터 안 DB 에 백업 수단이 없다
+    check: placement 가 in-cluster 나 volume 이고 (requirements.persistence 이거나 이전 배포 데이터가 있다) — local 은 관리형 DB·볼륨 스냅샷이 없어 backup_retention_days 가 효과 없다
+    fix: 클러스터 밖으로 덤프를 보내는 백업(CronJob 등)을 사람이 붙이고, 원격에 산출물이 그 시각·크기로 도착했는지로 성공을 확인한다. 자동으로 고치지 않는다 — 관리형으로 옮길 수 없는 환경이다
+
   # ── secret ──────────────────────────────────────────────────
   - id: SEC-001
     category: secret
@@ -175,6 +185,16 @@ rules:
     title: 내부 전용인데 전체 대역에 열려 있다
     check: network.ingress.public 이 false 인데 allowed_cidrs 에 0.0.0.0/0 또는 ::/0
     fix: 전체 대역 항목 제거. 그것만 있었다면 지운 뒤에도 내부망 전체에 열려 있다 — 좁힐 대역은 사람이 정한다
+
+  - id: NET-003
+    category: network
+    severity: low
+    autofix: forbidden
+    priority: P1
+    providers: [local]
+    title: local 에서 내부 전용(public false)을 overlay 가 강제하지 못한다
+    check: network.ingress.public 이 false 이고 allowed_cidrs 가 비어 있다 (대역이 있으면 INGRESS_CIDRS_NOT_ENFORCED 가 커밋을 막는다)
+    fix: 클러스터 밖 노출 경로를 사람이 확인한다 — 터널 ingress 는 hostname 을 명시하고 끝을 404 로, NodePort 는 쓰지 않거나 호스트 방화벽 앞단(mangle PREROUTING)에서 막는다
 
   # ── storage ─────────────────────────────────────────────────
   - id: STO-001

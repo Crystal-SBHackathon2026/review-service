@@ -112,7 +112,8 @@ async def test_migrate_is_idempotent(conninfo: str) -> None:
     assert await migrate(conninfo) == ["0001_init.sql", "0002_superseded.sql", "0003_pr_number.sql",
                                        "0004_spec_intakes.sql", "0005_review_cases.sql",
                                        "0006_generated_spec_unverified.sql", "0007_review_recovery.sql",
-                                       "0008_review_head_unique.sql", "0009_review_stage_times.sql", "0011_deployment_analysis.sql"]
+                                       "0008_review_head_unique.sql", "0009_review_stage_times.sql",
+                                       "0010_intake_attempts.sql", "0011_deployment_analysis.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -205,8 +206,9 @@ async def test_spec_intakes_on_postgres(pool: Any) -> None:
     assert not await repo.insert_intake(**{**intake, "intake_id": "in_dup"})
     assert (await repo.find_intake_by_head(REPO, HEAD))["intake_id"] == "in_1"
     assert (await repo.latest_intake_by_head_sha(HEAD))["status"] == "processing"
+    assert (await repo.get_intake("in_1"))["attempts"] == 1
     assert not await repo.claim_stale_intakes(timedelta(minutes=5))
-    assert [r["intake_id"] for r in await repo.claim_stale_intakes(timedelta(0))] == ["in_1"]
+    assert [(r["intake_id"], r["attempts"]) for r in await repo.claim_stale_intakes(timedelta(0))] == [("in_1", 2)]
     assert not await repo.claim_stale_intakes(timedelta(seconds=30))  # 방금 가져간 행은 다른 곳이 못 가져간다
 
     assert await repo.unverified_generation_for_pr(REPO, 7) is None  # 아직 커밋 전

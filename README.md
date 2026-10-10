@@ -92,7 +92,9 @@ docker compose --profile app up -d --build
 
 - 그 밖의 거절: 포크 PR(`FORK_PR`), 대상 환경 모름(`NO_TARGET`), 처리 중 새 커밋(`BRANCH_MOVED`), 생성 커밋이 다시 intake 대상(`LOOP_GUARD` — 웹훅·커밋 무한 반복 방지), GitHub·Claude 일시 오류(`failed`·`ERROR` — 새 커밋을 올리면 다시 처리)
 - PR 표시: 커밋 상태 `review-service/intake` (pending → success·failure·error). 링크는 `GET /intakes/{id}`. `GET /verify?sha=` 는 검토가 없으면 `intake_failed`·`intake_processing`·`intake_generated`·`intake_repaired` 를 돌려준다(`passed: false`)
-- 처리 중 파드가 죽으면 2분 넘은 `processing` 행을 API 가 1분마다 다시 처리한다. 커밋 SHA 는 브랜치를 옮기기 전에 행에 남겨 같은 커밋으로 마저 끝낸다
+- 처리 중 파드가 죽으면 5분(`STALE_AFTER`) 넘은 `processing` 행을 API 가 1분마다 다시 처리한다. 커밋 SHA 는 브랜치를 옮기기 전에 행에 남겨 같은 커밋으로 마저 끝낸다.
+  처리 시도는 `attempts`(웹훅 1, 다시 가져갈 때마다 +1)로 세고 3번(`MAX_INTAKE_ATTEMPTS`)을 넘으면 다시 처리하지 않고 `failed`·`RETRY_EXHAUSTED` + 커밋 상태 `error` —
+  처리할 때마다 파드를 죽이는 PR(npm 잠금 파일 재생성·대용량 분석 중 OOM 등)이 5분마다 파드를 다시 죽이지 않게. 새 커밋은 새 행이라 다시 처리한다
 - **baseline 없이 생성한 명세는 자동 병합하지 않는다** (10/09 sample-app #11 — `network: {}` 명세가 pass → 병합 → gitops ingress 삭제 → ALB 삭제).
   intake 는 생성 커밋 SHA 와 함께 `baseline_used` 를 남기고, 웹훅은 **그 PR(레포·PR 번호)에 baseline 없이 만든 `missing`·`empty` 생성 커밋이 있으면**
   `review.requested` 에 `generated_spec: true` 를 싣는다 → judge 가 findings 와 무관하게 `needs_human`(`GENERATED_SPEC_UNVERIFIED`), AI 자동 수정도 하지 않는다.
@@ -191,6 +193,7 @@ PR 에서 들어가서 보는 **읽기 전용** 화면이다 (토큰 입력 없�
 | `review_sweep_recovered_total` | counter | from_status | review sweep 이 회수한 검토 |
 | `review_sweep_failed_total` | counter | | 회수 3번을 넘어 failed |
 | `review_intake_sweep_recovered_total` | counter | | intake sweep 이 다시 처리한 intake |
+| `review_intake_sweep_failed_total` | counter | | 처리 시도 3번을 넘어 failed(`RETRY_EXHAUSTED`)로 끝낸 intake |
 | `review_reviews` | gauge | app, env, status | 최근 1일 안에 바뀐 검토 수 (scrape 때 업무 DB, 15초 캐시, 실패하면 마지막 값) |
 | `review_needs_human_oldest_seconds` | gauge | app, env | 가장 오래 기다린 needs_human 의 대기 시간 (updated_at 기준) |
 | `review_worker_messages_total` | counter | topic, kind, result | kind: requested·human_decision·ci_completed·retry_overlay / result: processed·skipped·invalid·error |
