@@ -11,8 +11,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # kubectl is used only for offline `kustomize`, never for cluster mutation.
-# Match the local validation binary; Trivy still gates the resulting image in CI.
-ARG KUBECTL_VERSION=v1.32.2
+# Use a maintained patch release with Go security fixes; CI still gates the image.
+ARG KUBECTL_VERSION=v1.34.12
 ARG TARGETARCH=amd64
 COPY worker/install_kubectl.py /tmp/install_kubectl.py
 RUN KUBECTL_VERSION=$KUBECTL_VERSION TARGETARCH=$TARGETARCH python /tmp/install_kubectl.py \
