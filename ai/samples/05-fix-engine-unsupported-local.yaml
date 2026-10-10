@@ -1,5 +1,5 @@
 # 로컬 k3s 에 mysql 을 요청 — 로컬은 in-cluster postgres 만 지원. 첫 배포(데이터 없음).
-# 기대: DB-002(high, when_no_data → allowed) → fix (engine postgres 16 으로 전환) → pass
+# 기대: DB-002(high, when_no_data → allowed) → fix (engine postgres 16 으로 전환) → pass. DB-010(low, 백업 없음)은 남는다
 # 구버전 drawio 의 "DB 엔진 변경 자동 수정" 데모를 첫 배포에 한정한 버전. 데이터가 있으면 04 처럼 사람 승인.
 api_version: crystal.review/v1alpha1
 kind: DeploySpec

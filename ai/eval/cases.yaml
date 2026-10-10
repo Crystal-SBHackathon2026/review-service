@@ -34,13 +34,13 @@ cases:
   - {id: s01-sample-app-aws, sample: 01-pass-sample-app-aws.yaml, llm: reviewer,
      expect: {verdict: pass, findings: [NET-001], llm_calls: 0, rounds: 0}}
   - {id: s02-local-sqlite, sample: 02-pass-local-sqlite.yaml, llm: reviewer,
-     expect: {verdict: pass, findings: [], llm_calls: 0, rounds: 0}}
+     expect: {verdict: pass, findings: [DB-010, NET-003], llm_calls: 0, rounds: 0}}
   - {id: s03-sqlite-replicas, sample: 03-fix-sqlite-replicas-gcp.yaml, llm: reviewer,
      expect: {verdict: pass, findings: [DB-003], llm_calls: 1, rounds: 1, no_engine_change: true}}
   - {id: s04-engine-change-with-data, sample: 04-human-engine-change-with-data.yaml, llm: reviewer,
      expect: {verdict: needs_human, reasons_include: [IRREVERSIBLE], findings: [DB-001], rounds: 0}}
   - {id: s05-engine-unsupported-local, sample: 05-fix-engine-unsupported-local.yaml, llm: reviewer,
-     expect: {verdict: pass, findings: [DB-002], rounds: 1}}
+     expect: {verdict: pass, findings: [DB-002, DB-010], rounds: 1}}
   - {id: s06-plaintext-secret, sample: 06-human-plaintext-secret.yaml, llm: reviewer,
      expect: {verdict: needs_human, reasons_include: [AUTOFIX_FORBIDDEN], findings: [SEC-001], rounds: 0,
               prompt_must_not_contain: [sample-not-a-real-token-0000]}}
@@ -69,7 +69,7 @@ cases:
   - id: sqlite-single-volume-no-hallucination
     sample: 02-pass-local-sqlite.yaml
     llm: sqlite_to_postgres
-    expect: {verdict: pass, findings: [], llm_calls: 0, no_engine_change: true}
+    expect: {verdict: pass, findings: [DB-010, NET-003], llm_calls: 0, no_engine_change: true}
   - id: wrong-citation
     sample: 03-fix-sqlite-replicas-gcp.yaml
     llm: wrong_citation
@@ -139,7 +139,7 @@ cases:
       - {op: add, path: /baseline, value: {spec_ref: prev, spec: SELF}}
       - {op: add, path: /baseline/spec/storage/volumes/-, value: {name: uploads, mount_path: /uploads, size: 2Gi}}
     llm: reviewer
-    expect: {verdict: needs_human, reasons_include: [IRREVERSIBLE], findings: [STO-006], rounds: 0}
+    expect: {verdict: needs_human, reasons_include: [IRREVERSIBLE], findings: [DB-010, NET-003, STO-006], rounds: 0}
   - id: p1-sto006-no-answer      # 값 없이 승인하면 baseline 의 볼륨이 되살아난다
     sample: 02-pass-local-sqlite.yaml
     mutate:
@@ -250,7 +250,7 @@ cases:
                                                migration: {command: [node, src/migrate.js], change: expand}}}
       - {op: add, path: /secrets, value: [{name: DATABASE_URL, source: k8s-secret, key: database-url}]}
     llm: reviewer
-    expect: {verdict: needs_human, reasons_include: [IRREVERSIBLE], findings: [DB-001, DB-009], rounds: 0}
+    expect: {verdict: needs_human, reasons_include: [IRREVERSIBLE], findings: [DB-001, DB-009, DB-010, NET-003], rounds: 0}
 
   - id: plan-migration-declared-expand-but-sql-drops
     sample: 04-human-engine-change-with-data.yaml
@@ -322,3 +322,25 @@ cases:
     expect: {intake_kind: yaml_error, intake: repaired, preserves_sample: true, verdict: needs_human,
              reasons_include: [AUTOFIX_FORBIDDEN], findings: [SEC-001],
              prompt_must_not_contain: [sample-not-a-real-token-0000]}
+
+  # ── 온프레미스(local) 경고 — DB-010 백업 없음 · NET-003 내부 전용 미강제 (low, LLM 없이 pass) ──────────
+  - id: local-net003-not-on-public
+    sample: 02-pass-local-sqlite.yaml
+    mutate:
+      - {op: replace, path: /network/ingress, value: {public: true, tls: true, host: todo.example.com}}
+    llm: reviewer
+    expect: {verdict: pass, findings: [DB-010], llm_calls: 0, rounds: 0}
+  - id: local-db010-not-without-persistence
+    sample: 02-pass-local-sqlite.yaml
+    mutate:
+      - {op: replace, path: /requirements/persistence, value: false}
+    llm: reviewer
+    expect: {verdict: pass, findings: [NET-003], llm_calls: 0, rounds: 0}
+  - id: local-managed-db-fixed-to-in-cluster   # 고친 결과 새로 붙는 low(DB-010)는 패치를 버리지 않는다
+    sample: 02-pass-local-sqlite.yaml
+    mutate:
+      - {op: replace, path: /database, value: {engine: postgres, version: "16", placement: managed}}
+      - {op: add, path: /secrets, value: [{name: DATABASE_URL, source: generated}]}
+    llm: reviewer
+    expect: {verdict: pass, findings: [DB-002, NET-003], llm_calls: 1, rounds: 1,
+             values: {/database/placement: in-cluster}}

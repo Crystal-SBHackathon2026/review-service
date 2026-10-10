@@ -58,7 +58,8 @@ def test_parse_document_requires_front_matter() -> None:
 
 
 async def test_file_retriever_returns_exact_docs_for_env() -> None:
-    docs = await FileRetriever().search(findings_for("05-fix-engine-unsupported-local.yaml"), "local")
+    db002 = [f for f in findings_for("05-fix-engine-unsupported-local.yaml") if f["rule_id"] == "DB-002"]
+    docs = await FileRetriever().search(db002, "local")
     uris = {d["source_uri"] for d in docs}
     assert "rules/any/DB-002.md" in uris and "rules/local/DB-002.md" in uris
     assert "rules/aws/DB-002.md" not in uris
@@ -189,3 +190,13 @@ def test_local_documents_hash_matches_s3_etag_format(tmp_path) -> None:
     objects = [{"Key": "rules/", "ETag": '"d41d8cd98f00b204e9800998ecf8427e"'},
                {"Key": "rules/X.md", "ETag": '"5d41402abc4b2a76b9719d911017c592"'}]
     assert compare("s3", local_documents(tmp_path), s3_documents(objects)).ok
+
+
+@pytest.mark.parametrize(
+    ("rule_id", "guide"),
+    [("DB-010", "guides/onprem-backup-verification.md"), ("NET-003", "guides/onprem-exposure-tunnel-nodeport.md")],
+)
+async def test_onprem_rules_bring_their_guides_on_local(rule_id: str, guide: str) -> None:
+    """온프레미스 가이드는 의미 검색이 아니라 규칙 정확 매칭(related_rules)으로 근거에 들어간다."""
+    docs = await FileRetriever().search([{"rule_id": rule_id}], "local")  # type: ignore[list-item]
+    assert guide in {d["source_uri"] for d in docs}
