@@ -12,6 +12,7 @@ failed 는 어느 단계에서 났는지 저장하지 않아서 merge_sha·error
 
 환경 카드: DEPLOY_ENVS(실제, 기본 aws,local)와 PLANNED_ENVS(계획, 기본 gcp). 대상 환경은 렌더 결과(deploy_result)까지,
 다른 실제 환경은 배포 알림만 (review_api.argocd 의 cross_env 기록). 앱 주소는 APP_URLS (JSON {app: {env: url}}).
+모니터링 링크는 GRAFANA_URL 의 앱 대시보드(uid apps-{app})에 var-env={env}. GRAFANA_URL 이 비면 null.
 
 Degraded 중 Argo Rollouts 자동 중단(카나리 분석 실패·progressDeadlineAbort)은 알림 payload 로 가른다 (rollout_abort).
 대상 환경만 실패하고 다른 환경은 Healthy 면 배포 단계는 partial (부분 완료).
@@ -22,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from urllib.parse import quote
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -109,19 +111,40 @@ def parse_app_urls(raw: str | None) -> dict[str, dict[str, str]]:
     return urls
 
 
+def parse_grafana_url(raw: str | None) -> str | None:
+    """GRAFANA_URL — http(s) 주소만. 끝의 / 는 뗀다. 아니면 경고하고 None (화면은 모니터링 버튼을 숨긴다)."""
+    url = (raw or "").strip().rstrip("/")
+    if not url:
+        return None
+    if not re.match(r"^https?://[^\s\"'<>?#]+$", url):
+        log.warning("GRAFANA_URL 이 http(s) 주소가 아니다 — 모니터링 링크 없이 시작")
+        return None
+    return url
+
+
+def monitoring_url(grafana_url: str | None, app: str, env: str) -> str | None:
+    """앱 대시보드(uid apps-{app}, gitops monitoring/dashboards/{app}.json)의 그 환경. env 변수 값은 aws·gcp·local
+    (sample-app overlay 의 DEPLOY_ENV → 메트릭 env 라벨)."""
+    if not grafana_url:
+        return None
+    return f"{grafana_url}/d/apps-{quote(app, safe='')}?var-env={quote(env, safe='')}"
+
+
 @dataclass(frozen=True)
 class ProgressSettings:
     deploy_envs: tuple[str, ...] = ("aws", "local")  # DEPLOY_ENVS — 배포 알림이 오는 실제 환경
     planned_envs: tuple[str, ...] = ("gcp",)          # PLANNED_ENVS — 화면에 "계획"으로만 보이는 환경
     app_urls: Mapping[str, Mapping[str, str]] = field(default_factory=dict)  # APP_URLS
     gitops_repo: str = DEFAULT_GITOPS_REPO            # GITOPS_REPO — overlay 커밋 링크
+    grafana_url: str | None = None                    # GRAFANA_URL — 환경 카드의 모니터링 링크. 없으면 버튼 숨김
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> ProgressSettings:
         return cls(deploy_envs=_envs(environ.get("DEPLOY_ENVS"), cls.deploy_envs),
                    planned_envs=_envs(environ.get("PLANNED_ENVS"), cls.planned_envs),
                    app_urls=parse_app_urls(environ.get("APP_URLS")),
-                   gitops_repo=environ.get("GITOPS_REPO") or DEFAULT_GITOPS_REPO)
+                   gitops_repo=environ.get("GITOPS_REPO") or DEFAULT_GITOPS_REPO,
+                   grafana_url=parse_grafana_url(environ.get("GRAFANA_URL")))
 
 
 # --- 이력 -----------------------------------------------------------------------------------------
@@ -265,7 +288,8 @@ def env_cards(row: dict[str, Any], events: list[dict[str, Any]], settings: Progr
         abort = rollout_abort(event) if event else None
         if deploy is not None and abort is not None:
             deploy.update(rollout_aborted=True, serving_tag=abort["serving_tag"])
-        card: dict[str, Any] = {"env": env, "is_target": env == target, "deploy": deploy, "app_url": urls.get(env)}
+        card: dict[str, Any] = {"env": env, "is_target": env == target, "deploy": deploy, "app_url": urls.get(env),
+                                "monitoring_url": monitoring_url(settings.grafana_url, row["app"], env)}
         if env == target:
             result = row.get("deploy_result") or {}
             card["render"] = ({"status": result.get("status"), "reason": result.get("reason"),

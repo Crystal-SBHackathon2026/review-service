@@ -60,6 +60,7 @@ docker compose --profile app up -d --build
 | `REVIEW_API_PUBLIC_URL` | API·워커 | PR 커밋 상태의 링크 앞부분 — `review-service/verify` 는 진행 화면 `/ui/reviews/{id}`, `review-service/intake` 는 `/intakes/{id}`. 없으면 링크 없이 표시 |
 | `DEPLOY_ENVS` | API | 진행 화면의 실제 환경 카드(배포 알림이 오는 환경), 쉼표 구분. 기본 `aws,local` |
 | `PLANNED_ENVS` | API | 진행 화면에 "계획"으로만 보이는 환경. 기본 `gcp`, 빈 값이면 없음 |
+| `GRAFANA_URL` | API | 진행 화면 환경 카드의 "모니터링" 버튼 — `{GRAFANA_URL}/d/apps-{app}?var-env={env}` 를 새 탭으로. http(s) 만, 비면 버튼 없음 |
 | `APP_URLS` | API | 진행 화면의 앱 주소 JSON `{"sample-app": {"aws": "http://…", "local": "http://…"}}`. http(s) 만 받는다. 없으면 주소 없이 표시 |
 | `ARGOCD_WEBHOOK_TOKEN` | API | `/webhooks/argocd` 의 `Authorization: Bearer <토큰>`. **비어 있으면 503** (fail-closed) |
 | `REVIEW_API_TOKEN` | API | `POST /reviews`·`POST /reviews/{id}/decision` 의 `Authorization: Bearer <토큰>`. **비어 있으면 503** (fail-closed) |
@@ -161,8 +162,9 @@ PR 에서 들어가서 보는 **읽기 전용** 화면이다 (토큰 입력 없�
   "envs": [
     {"env": "aws", "is_target": true, "app_url": "http://…",
      "render": {"status": "committed", "reason": null, "gitops_commit_sha": "0f94208…"},
-     "deploy": {"kind": "healthy", "image_tag": "3c7ad2e", "received_at": "…"}},
-    {"env": "local", "is_target": false, "app_url": "http://…", "deploy": null},
+     "deploy": {"kind": "healthy", "image_tag": "3c7ad2e", "received_at": "…"},
+     "monitoring_url": "http://localhost:3000/d/apps-sample-app?var-env=aws"},   // GRAFANA_URL 없으면 null
+    {"env": "local", "is_target": false, "app_url": "http://…", "deploy": null, "monitoring_url": "…"},
     {"env": "gcp", "planned": true}
   ],
   "links": {"pr": "https://github.com/…/pull/12", "merge_commit": "https://github.com/…/commit/…",

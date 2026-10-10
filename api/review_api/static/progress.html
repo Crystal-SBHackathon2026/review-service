@@ -356,6 +356,13 @@ tbody tr:hover { background: var(--hover); }
     return el("span", {class: "badge " + deploy.kind, text: HEALTH_LABEL[deploy.kind] || deploy.kind});
   }
 
+  // Grafana 앱 대시보드의 그 환경 (응답의 monitoring_url, GRAFANA_URL 이 없으면 null → 버튼 없음)
+  function monitoringButton(c) {
+    const href = safeUrl(c.monitoring_url);
+    return href ? el("p", {}, el("a", {class: "button", href, target: "_blank", rel: "noopener noreferrer",
+                                        title: "Grafana — " + envName(c.env), text: "모니터링"})) : null;
+  }
+
   function envCard(c) {
     if (c.planned) {
       return el("div", {class: "env planned"}, [
@@ -387,6 +394,7 @@ tbody tr:hover { background: var(--hover); }
       el("h3", {}, [envName(c.env), el("span", {class: "chip", text: ENV_PROVIDER[c.env] || c.env}),
                     c.is_target ? el("span", {class: "chip", text: "대상"}) : null]),
       kv(rows),
+      monitoringButton(c),
     ]);
   }
   let currentLinks = {};  // render 가 먼저 채운다 — 환경 카드의 gitops 링크

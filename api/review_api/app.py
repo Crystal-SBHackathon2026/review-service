@@ -112,7 +112,7 @@ class ApiDeps:
     lockfile: Callable[[str, str], Awaitable[str]] = regenerate_lockfile  # 코드 패치가 바꾼 의존성의 잠금 파일
     # /readyz 가 볼 의존성 — 이름 → 실패하면 예외를 내는 확인. 비어 있으면 늘 준비됨
     readiness: dict[str, Callable[[], Awaitable[Any]]] = field(default_factory=dict)
-    progress: ProgressSettings = field(default_factory=ProgressSettings)  # DEPLOY_ENVS·PLANNED_ENVS·APP_URLS
+    progress: ProgressSettings = field(default_factory=ProgressSettings)  # DEPLOY_ENVS·PLANNED_ENVS·APP_URLS·GRAFANA_URL
 
 
 READY_TIMEOUT_SECONDS = 2.0  # 확인 하나의 상한. readinessProbe timeoutSeconds 는 이보다 길게 (gitops, 기본 1초)
