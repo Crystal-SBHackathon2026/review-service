@@ -43,7 +43,7 @@ def strategy_ops(spec: AppSpec) -> list[dict[str, Any]]:
     blue_green = {
         "activeService": spec.metadata.name,
         "previewService": preview_service_name(spec),
-        "autoPromotionEnabled": True,  # readiness 를 통과하면 전환한다. 실패하면 progressDeadlineAbort 로 중단된다
+        "autoPromotionEnabled": spec.rollout.auto_promotion,
         "scaleDownDelaySeconds": SCALE_DOWN_DELAY_SECONDS,
     }
     return [{"op": "replace", "path": "/spec/strategy", "value": {"blueGreen": blue_green}}]

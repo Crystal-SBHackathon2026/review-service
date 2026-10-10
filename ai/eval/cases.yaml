@@ -221,6 +221,16 @@ cases:
     expect: {verdict: pass, findings: [NET-001, STO-004], rounds: 1, values: {/storage/buckets/0/encryption: true}}
 
   # ── 배포 계획: 스키마·DB 변경이면 전략을 bluegreen 으로, 호환 안 되는 스키마 변경은 사람에게 ──────────
+  - id: demo-busan-resource-fix
+    sample: 23-fix-busan-resource-limits.yaml
+    llm: reviewer
+    expect: {verdict: pass, findings: [NET-001, RUN-005], rounds: 1, llm_calls: 1,
+             values: {/runtime/resources/cpu_limit: 250m, /runtime/resources/memory_limit: 128Mi}}
+  - id: demo-tokyo-human-manual-bluegreen
+    sample: 24-human-tokyo-manual-bluegreen.yaml
+    llm: reviewer
+    expect: {verdict: needs_human, reasons_include: [AUTOFIX_FORBIDDEN], findings: [NET-001, RUN-006], rounds: 0,
+             values: {/rollout/strategy: bluegreen, /rollout/auto_promotion: false}}
   - id: plan-db-switch-without-data-goes-bluegreen
     sample: 04-human-engine-change-with-data.yaml
     mutate:

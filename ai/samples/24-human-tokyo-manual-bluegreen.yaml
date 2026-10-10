@@ -1,0 +1,53 @@
+# 도쿄: breaking 명시 → needs_human → 원안 승인 → CI. 수동 승격은 렌더링 계약까지만 검증.
+# 외부 DB 접속·마이그레이션 실행은 이 검증에 포함되지 않는다.
+api_version: crystal.review/v1alpha1
+kind: DeploySpec
+metadata:
+  name: sample-app
+  repository: Crystal-SBHackathon2026/sample-app
+  commit: b084c24
+target:
+  env: gcp
+  region: asia-northeast1
+  namespace: sample-app
+image:
+  repository: ghcr.io/crystal-sbhackathon2026/sample-app
+  tag: b084c24
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  platforms:
+  - amd64
+runtime:
+  port: 8080
+  replicas: 2
+  health:
+    readiness: /healthz
+    liveness: /healthz
+  resources:
+    cpu_request: 50m
+    memory_request: 64Mi
+    cpu_limit: 250m
+    memory_limit: 128Mi
+  env:
+    DEPLOY_ENV: gcp
+    DEPLOY_REGION: asia-northeast1
+network:
+  ingress:
+    public: true
+    tls: false
+database:
+  engine: postgres
+  placement: external
+  version: '16'
+  migration:
+    command:
+    - npm
+    - run
+    - migrate
+    change: breaking
+secrets:
+- name: DATABASE_URL
+  source: k8s-secret
+  key: demo-db-url
+rollout:
+  strategy: bluegreen
+  auto_promotion: false

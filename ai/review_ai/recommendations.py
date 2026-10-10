@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from review_ai.patching import PatchError, apply_ops, parse_pointer, path_under
+from review_ai.resource_limits import check_resource_limits
 from review_ai.secrets_pattern import MASK
 from review_ai.spec.deploy_spec import BASE_RESOURCES, PIPELINE_FIELDS, DeploySpec, Volume
 from review_ai.state import Finding, Patch
@@ -158,6 +159,7 @@ def build_recommendations(spec: dict[str, Any], findings: Sequence[Finding],
         try:
             changed = apply_ops(current_spec, candidate["ops"])
             after = DeploySpec.model_validate(changed)
+            check_resource_limits(after.runtime.resources)
             remaining = {f["finding_id"] for f in run_static_check(after)}
         except (ValueError, TypeError, KeyError, IndexError):
             continue
@@ -228,7 +230,8 @@ def resolve_human_decision(state: dict[str, Any], human: dict[str, Any]) -> dict
 
     전체 응답을 기다리는 타이머는 아니다. approved 응답이 왔을 때만 실행한다.
     use_recommendations=False 는 현재 명세를 그대로 승인하는 명시적 선택이다.
-    입력도 권장값도 없으면 edited_ops=[] — 기존 계약대로 그대로 승인이다(권장값을 못 만드는 사유도 막히지 않게).
+    입력도 권장값도 없으면 edited_ops=[] — 기본 상한이 요청량에 못 미치는 누락 필드는 명시 입력 또는 예외 선택이 필요하다.
+    선언된 리소스 상한은 예외 선택과 관계없이 요청량 이상이어야 한다.
     """
     if human["decision"] != "approved":
         return copy.deepcopy(human)
@@ -263,6 +266,17 @@ def resolve_human_decision(state: dict[str, Any], human: dict[str, Any]) -> dict
     for op in ops:
         if parse_pointer(op["path"])[0] in PIPELINE_FIELDS:
             raise PatchError(f"{parse_pointer(op['path'])[0]}은 수정할 수 없다")
-    DeploySpec.model_validate(apply_ops(state["deploy_spec"], ops))
+    after = DeploySpec.model_validate(apply_ops(state["deploy_spec"], ops))
+    check_resource_limits(after.runtime.resources)
+    if human.get("use_recommendations", True):
+        # 안전한 기본 상한이 없는 누락 필드는 묵시적으로 승인하지 않는다.
+        # 명세 그대로 승인(use_recommendations=False)은 기존의 명시적 예외 선택이다.
+        missing = {field: value for field, value in BASE_LIMITS.items()
+                   if getattr(after.runtime.resources, field) is None}
+        try:
+            check_resource_limits(after.runtime.resources.model_copy(update=missing))
+        except ValueError as exc:
+            raise PatchError(f"안전한 기본 리소스 상한이 없다: {exc}. 요청량 이상의 상한을 입력하거나 "
+                             "명세 그대로 승인하려면 use_recommendations: false를 명시하라") from exc
     return {**copy.deepcopy(human), "edited_ops": ops,
             "defaulted_ops": copy.deepcopy(human.get("defaulted_ops", defaults))}

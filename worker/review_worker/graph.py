@@ -56,6 +56,7 @@ from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.patching import apply_ops
 from review_ai.recommendations import resolve_human_decision
+from review_ai.resource_limits import check_resource_limits
 from review_ai.retrieval import Retriever, make_retrieve_evidence
 from review_ai.spec.deploy_spec import DeploySpec, user_fields
 from review_ai.state import DeployResult, ReviewState
@@ -324,7 +325,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
                 raise GitHubError(f"PR #{pull['number']} 은 포크 브랜치라 자동 커밋할 수 없다")
             raw = await _retry("deploy.yaml 읽기", lambda: github.get_file(repository, path, parent))
             fixed = apply_ops(yaml.safe_load(raw), ops)  # 원본(가리지 않은 값)에 적용. ops 는 env·시크릿을 건드리지 못한다
-            DeploySpec.model_validate(fixed)
+            check_resource_limits(DeploySpec.model_validate(fixed).runtime.resources)
             content = (f"# AI 검토 {rid} 가 고친 명세입니다. 무엇을 왜 고쳤는지는 검토 결과(rounds)에 있습니다.\n"
                        + yaml.safe_dump(fixed, sort_keys=False, allow_unicode=True))
             new_sha = await github.prepare_file_commit(repository, parent=parent, path=path, content=content,

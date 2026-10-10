@@ -27,6 +27,7 @@ from review_ai.judge.node import make_judge
 from review_ai.judge.validate import overlay_files
 from review_ai.patching import PatchError, apply_ops, parse_pointer
 from review_ai.recommendations import resolve_human_decision
+from review_ai.resource_limits import check_resource_limits
 from review_ai.retrieval import Retriever, make_retrieve_evidence
 from review_ai.spec.deploy_spec import PIPELINE_FIELDS, DeploySpec
 from review_ai.state import Patch, ReviewState
@@ -90,7 +91,7 @@ def check_edited_ops(deploy_spec: dict[str, Any], ops: list[Any]) -> dict[str, A
             raise PatchError(f"{parse_pointer(op['path'])[0]} 은 사람이 고칠 수 없다 — 파이프라인이 채우는 관측 사실이다: "
                              f"{op['path']}")
     edited = apply_ops(deploy_spec, ops)
-    DeploySpec.model_validate(edited)
+    check_resource_limits(DeploySpec.model_validate(edited).runtime.resources)
     return edited
 
 

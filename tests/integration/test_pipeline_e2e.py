@@ -409,6 +409,177 @@ async def test_api_to_kafka_to_worker(pool: Any) -> None:
         await producer.stop()
 
 
+@pytest.mark.parametrize("sample,large_requests", [
+    ("23-fix-busan-resource-limits.yaml", False),
+    ("24-human-tokyo-manual-bluegreen.yaml", False),
+    ("23-fix-busan-resource-limits.yaml", True),
+])
+@pytest.mark.parametrize("deterministic,strict", [(False, False), (True, False), (False, True), (True, True)])
+async def test_demo_api_kafka_postgres_fix_and_approval(
+    pool: Any, sample: str, large_requests: bool, deterministic: bool, strict: bool,
+) -> None:
+    """실DB·실Kafka·실승인 API·체크포인트. Claude·GitHub·GitOps 는 외부 변경 없이 대체한다."""
+    from review_ai.overlay import render_overlay
+
+    fix_sha = "b" * 40
+    original = yaml.safe_load((SAMPLES / sample).read_text())
+    if large_requests:
+        original["runtime"]["resources"]["memory_request"] = "256Mi"
+    repo = PostgresReviewRepository(pool)
+
+    class DemoGitHub(FakeGitHub):
+        def __init__(self):
+            super().__init__(yaml.safe_dump(original, sort_keys=False))
+            self.head = HEAD
+            self.files = {HEAD: self.spec_text}
+            self.prepared = None
+            self.commits = []
+            self.head_statuses = []
+
+        async def get_file(self, repository, path, ref):
+            assert repository == REPO and path == "deploy.yaml"
+            return self.files[ref]
+
+        async def pulls_for_commit(self, repository, sha):
+            return [{"number": 3, "state": "open", "head": {
+                "sha": self.head, "ref": "demo-local", "repo": {"full_name": REPO}}}]
+
+        async def prepare_file_commit(self, repository, **kwargs):
+            assert kwargs["parent"] == self.head and self.prepared is None
+            self.prepared = kwargs
+            return fix_sha
+
+        async def update_branch(self, repository, branch, sha):
+            assert sha == fix_sha and self.prepared is not None
+            self.files[sha] = self.prepared["content"]
+            self.commits.append(self.prepared)
+            self.prepared = None
+            self.head = sha
+
+        async def merge_pull(self, repository, number, *, head_sha):
+            assert head_sha == self.head
+            return await super().merge_pull(repository, number, head_sha=head_sha)
+
+        async def create_commit_status(self, repository, sha, **kwargs):
+            self.head_statuses.append((sha, kwargs["state"]))
+            await super().create_commit_status(repository, sha, **kwargs)
+
+    github = DemoGitHub()
+    await _ensure_topics("review.requested", "review.resumed")
+    producer = AIOKafkaProducer(bootstrap_servers=BOOTSTRAP, acks="all", enable_idempotence=True)
+    await producer.start()
+
+    class Publisher:
+        async def send(self, topic, key, value):
+            await producer.send_and_wait(topic, value=value, key=key.encode())
+
+    publisher = Publisher()
+    saver = AsyncPostgresSaver(pool)
+    await saver.setup()
+    rendered = []
+
+    async def local_overlay(state):
+        rendered.append(render_overlay(DeploySpec.model_validate(state["deploy_spec"])))
+        # 로컬 렌더링까지만 검증한다. GitOps commit 은 수행하지 않는다.
+        return {"deploy_result": {"status": "blocked", "commit_sha": None, "reason": "LOCAL_RENDER_ONLY"}}
+
+    from review_ai.spec.deploy_spec import DeploySpec
+    deps = Deps(repo=repo, github=github, publisher=publisher, llm=ScriptedLLM(oracle_review),
+                retriever=FileRetriever(), strict_citations=strict, deterministic_fixes=deterministic,
+                commit_overlay=local_overlay)
+    handler = ReviewHandler(repo, build_graph(deps, saver))
+    consumer = AIOKafkaConsumer("review.requested", "review.resumed", bootstrap_servers=BOOTSTRAP,
+                                group_id=f"demo-{uuid.uuid4().hex[:8]}", enable_auto_commit=False,
+                                auto_offset_reset="latest")
+    try:
+        await consumer.start()
+        async with asyncio.timeout(10):
+            while not consumer.assignment():
+                await consumer.getmany(timeout_ms=100)
+            await consumer.seek_to_end()
+
+        async def drain_until(rid, status):
+            async with asyncio.timeout(20):
+                while True:
+                    for records in (await consumer.getmany(timeout_ms=100)).values():
+                        for record in records:
+                            await handler.handle(record.topic, record.value)
+                            await consumer.commit()
+                    row = await repo.get_review(rid)
+                    if row and row["status"] == status:
+                        return row
+
+        app = create_app(ApiDeps(repo=repo, specs=github, publisher=publisher, api_token="local-it-token"))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://local",
+                                     headers={"Authorization": "Bearer local-it-token"}) as client:
+            response = await client.post("/reviews", json={"spec_ref": {
+                "repository": REPO, "commit": HEAD, "path": "deploy.yaml"}, "requested_by": "local-demo"})
+            assert response.status_code == 202, response.text
+            rid = response.json()["review_id"]
+            if original["target"]["env"] == "local":
+                if large_requests:
+                    paused = await drain_until(rid, "needs_human")
+                    assert "PATCH_OUT_OF_SCOPE" in paused["reasons"] and not paused["decision"]["recommendations"]
+                    human = {"decision": "approved", "approver": "demo"}
+                    assert (await client.post(f"/reviews/{rid}/decision", json=human)).status_code == 422
+                    bad = {**human, "edited_ops": [
+                        {"op": "add", "path": "/runtime/resources/memory_limit", "value": "128Mi"},
+                    ]}
+                    assert (await client.post(f"/reviews/{rid}/decision", json=bad)).status_code == 422
+                    assert (await repo.get_review(rid))["status"] == "needs_human"
+                    assert not github.prepared and not github.commits and not github.merged
+                    # PostgreSQL 체크포인트를 새 워커에서 재개한다.
+                    handler = ReviewHandler(repo, build_graph(deps, AsyncPostgresSaver(pool)))
+                    safe = {**human, "edited_ops": [
+                        {"op": "add", "path": "/runtime/resources/cpu_limit", "value": "250m"},
+                        {"op": "add", "path": "/runtime/resources/memory_limit", "value": "256Mi"},
+                    ]}
+                    response = await client.post(f"/reviews/{rid}/decision", json=safe)
+                    assert response.status_code == 202, response.text
+                parent = await drain_until(rid, "superseded")
+                assert parent["rounds"][0]["verdict"] == ("needs_human" if large_requests else "fix")
+                assert any(f["rule_id"] == "RUN-005" for f in parent["rounds"][0]["findings"])
+                if large_requests:
+                    assert parent["rounds"][0]["human"]["decision"] == "approved"
+                else:
+                    assert parent["rounds"][0]["patch_source"] == "llm"
+                rid = parent["superseded_by"]
+                row = await drain_until(rid, "waiting_ci")
+                assert row["pr_head_sha"] == fix_sha and row["verdict"] == "pass"
+                assert len(github.commits) == 1
+                fixed = yaml.safe_load(github.files[fix_sha])
+                assert fixed["runtime"]["resources"] == {**original["runtime"]["resources"],
+                                                          "cpu_limit": "250m", "memory_limit": "256Mi" if large_requests else "128Mi"}
+            else:
+                row = await drain_until(rid, "needs_human")
+                assert "AUTOFIX_FORBIDDEN" in row["reasons"] and not github.merged
+                assert (await client.get("/verify", params={"sha": HEAD})).json()["passed"] is False
+                # API 승인 → Kafka 메시지 → 재시작한 워커의 PostgreSQL 체크포인트 재개.
+                handler = ReviewHandler(repo, build_graph(deps, AsyncPostgresSaver(pool)))
+                response = await client.post(f"/reviews/{rid}/decision", json={"decision": "approved", "approver": "demo"})
+                assert response.status_code == 202, response.text
+                row = await drain_until(rid, "waiting_ci")
+                assert row["human_decision"]["decision"] == "approved" and not github.commits
+                assert row["final_spec"]["rollout"] == {"strategy": "bluegreen", "auto_promotion": False}
+            assert (await client.get("/verify", params={"sha": github.head})).json()["passed"] is True
+            assert (github.head, "success") in github.head_statuses and not github.merged
+            github.suites = [{"status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}}]
+            await publisher.send("review.resumed", rid, json.dumps({"schema_version": "review.resumed/v1",
+                "review_id": rid, "kind": "ci_completed", "ci": {"head_sha": github.head, "conclusion": "success"},
+                "resumed_at": datetime.now(UTC).isoformat()}).encode())
+            row = await drain_until(rid, "blocked")
+            assert github.merged == [3] and row["deploy_result"]["reason"] == "LOCAL_RENDER_ONLY"
+            assert len(rendered) == 1
+            if original["target"]["env"] == "gcp":
+                config = yaml.safe_load(rendered[0].files["kustomization.yaml"])
+                strategy = next(op["value"] for patch in config["patches"] for op in yaml.safe_load(patch["patch"])
+                                if op["path"] == "/spec/strategy")
+                assert strategy["blueGreen"]["autoPromotionEnabled"] is False
+    finally:
+        await consumer.stop()
+        await producer.stop()
+
+
 async def seed_deployment_review(repo, rid, revision, *, readiness="/wrong"):
     import copy
     spec = yaml.safe_load((SAMPLES / "01-pass-sample-app-aws.yaml").read_text())

@@ -281,7 +281,7 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             raise HTTPException(404, "검토가 없다")
         if row["status"] != "needs_human":
             raise HTTPException(409, f"needs_human 상태에서만 결정할 수 있다 (지금 {row['status']})")
-        if body.decision == "approved" and (body.edited_ops or body.use_recommendations):
+        if body.decision == "approved":
             # edited_ops 는 멈춘 State 의 deploy_spec 기준 — 워커가 멈출 때 final_spec 에 남긴 것과 같다
             if row["final_spec"] is None:
                 raise HTTPException(409, "검토 중인 명세가 아직 기록되지 않았다")
