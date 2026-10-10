@@ -70,6 +70,8 @@ jobs:
       - name: 의존성 설치
         run: pip install -e "./ai[dev]" -e ./common -e "./api[dev]" -e "./worker[dev]"
       - name: 통합 테스트 (skip 이 있으면 실패)
+        # 기본 셸(bash -e)엔 pipefail 이 없어 `pytest | tee` 가 tee 의 종료 코드로 끝난다 — 실패해도 초록 (#54)
+        shell: bash
         run: |
           pytest -q -rs | tee result.txt
           ! grep -q "skipped" result.txt
