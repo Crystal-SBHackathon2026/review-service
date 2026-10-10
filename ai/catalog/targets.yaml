@@ -11,7 +11,9 @@ targets:
     # 2026-10-08 실측 (EKS 인계서 · Notion "배포 에이전트 설계" 6절): oneaction EKS 1.36,
     # t3.medium 2대(AL2023 x86_64), 애드온은 VPC CNI·kube-proxy·CoreDNS·Pod Identity Agent 4개뿐(Terraform 고정).
     # 2026-10-10 갱신 (Slack, 박찬건): EBS CSI 사용 가능 — StorageClass oneaction-monitoring-gp3(Retain)에
-    # Prometheus 10Gi·Grafana 2Gi PVC 가 Bound. 같은 클래스를 일반 앱 PVC 에도 쓴다.
+    # Prometheus 10Gi·Grafana 2Gi PVC 가 Bound. 같은 클래스를 일반 앱 PVC 에도 쓴다. 노드는 지금 3대 Ready.
+    # 클래스 정의는 인프라 레포 infra/eks-storage/manifests/storage-class.yaml (gitops·terraform 아님) —
+    # volumeBindingMode WaitForFirstConsumer 라 PV 는 Pod 가 놓인 노드의 AZ 에 만들어진다(AZ 불일치 없음).
     verified: true
     arch: [amd64]
     database:
