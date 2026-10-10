@@ -61,6 +61,31 @@ async def test_failed_sync_with_healthy_old_service_is_preserved(setup):
     assert "permission denied" not in publisher.sent[0][2].decode()
 
 
+async def test_progress_shows_saved_case_but_keeps_diagnosis_operator_only(setup):
+    repo, client, _ = setup
+    eid = (await post(client, payload())).json()["event_id"]
+    body = (await client.get("/reviews/new/progress")).json()
+    assert body["failure_cases"] == [{"event_id": eid, "env": "aws", "kind": "sync_failed",
+        "occurred_at": body["failure_cases"][0]["occurred_at"], "analysis_status": "queued", "saved": True}]
+    assert all(key not in str(body["failure_cases"]) for key in ("payload", "spec_snapshot", "diagnosis", "permission denied"))
+    assert (await client.get(f"/deployments/{eid}")).status_code == 401
+    repo.failure_cases.pop(eid)
+    assert (await client.get("/reviews/new/progress")).json()["failure_cases"][0]["saved"] is False
+
+
+async def test_progress_case_history_is_bounded_and_stays_in_scope(setup):
+    repo, client, _ = setup
+    from datetime import timedelta
+    for i in range(15):
+        await repo.record_deployment(dict(event_id=f"event-{i}", attempt_key=str(i), review_id="new",
+            app="sample-app", target_env="aws", repository="org/app", kind="sync_failed",
+            spec_snapshot={"private": "not-public"}, payload={}, occurred_at=datetime.now(UTC)+timedelta(seconds=i)))
+    rows = (await client.get("/reviews/new/progress")).json()["failure_cases"]
+    assert len(rows) == 10 and rows[0]["event_id"] == "event-14"
+    repo.observations["event-14"]["repository"] = "another/app"
+    assert "event-14" not in str((await client.get("/reviews/new/progress")).json()["failure_cases"])
+
+
 async def test_no_images_no_matching_revision_is_retained_unlinked(setup):
     repo, client, _ = setup
     body = payload(revision="c"*40)

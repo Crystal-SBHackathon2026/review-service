@@ -298,7 +298,8 @@ tbody tr:hover { background: var(--hover); }
     }
     const text = JSON.stringify(body);
     if (text !== lastJson) { lastJson = text; render(body); }
-    schedule(body.final ? SLOW_MS : FAST_MS);
+    const analyzing = (body.failure_cases || []).some(c => ["pending", "queued", "processing"].includes(c.analysis_status));
+    schedule(body.final && !analyzing ? SLOW_MS : FAST_MS);
   }
 
   function render(p) {
@@ -557,6 +558,22 @@ tbody tr:hover { background: var(--hover); }
       ]));
     }
     out.push(...historyPanel(p));
+    out.push(el("h3", {text: "배포 실패 사례"}));
+    const cases = p.failure_cases || [];
+    if (!cases.length) out.push(el("p", {class: "muted", text: "이 검토에 연결된 배포 실패 사례가 없습니다."}));
+    const analysisLabels = {pending: "분석 대기", queued: "분석 요청됨", processing: "분석 중",
+      completed: "분석 완료", insufficient: "분석 정보 부족", failed: "분석 실패", skipped: "분석 한도 도달"};
+    for (const c of cases) {
+      out.push(el("div", {class: "card"}, [
+        el("strong", {text: envName(c.env) + " · " + (c.kind === "degraded" ? "상태 악화" : "동기화 실패")}),
+        el("p", {class: "notice " + (c.saved ? "ok" : "warn"),
+          text: c.saved ? "다음 검토에서 조회할 실패 사례로 저장됐습니다." : "실패 이벤트 수신 · 사례 저장 확인 전"}),
+        el("p", {class: "meta", text: (analysisLabels[c.analysis_status] || "분석 상태 미확인") + " · " + localTime(c.occurred_at)}),
+        el("code", {text: c.event_id}),
+        el("p", {}, [el("a", {href: "/ui#" + encodeURIComponent("deploy:" + c.event_id),
+          text: "오류 증거·원인 분석 확인 (운영자 토큰 필요)"})]),
+      ]));
+    }
     return el("section", {class: "panel", "aria-label": "검토 보고서"}, out);
   }
 
