@@ -33,9 +33,9 @@ class NoPublisher:
 
 
 class Env:
-    def __init__(self) -> None:
+    def __init__(self, **settings_fields: Any) -> None:
         self.repo = InMemoryReviewRepository()
-        settings = ProgressSettings(app_urls={"sample-app": {"aws": AWS_URL, "local": LOCAL_URL}})
+        settings = ProgressSettings(app_urls={"sample-app": {"aws": AWS_URL, "local": LOCAL_URL}}, **settings_fields)
         self.client = TestClient(create_app(ApiDeps(repo=self.repo, specs=NoSpecs(), publisher=NoPublisher(),
                                                     progress=settings)))  # 토큰 헤더 없이
 
@@ -374,6 +374,68 @@ async def test_degraded_deploy_fails_step(env: Env) -> None:
 
     assert step(body, "deploy")["state"] == "failed"
     assert body["final"] is True
+
+
+STABLE = "31b77bef5a78d4273b6e3d541818687e761194b0"  # 지금 서비스 중인 이전 버전
+
+
+def aborted_payload(message: str = "RolloutAborted: Rollout aborted update to revision 7: Metric \"error-rate\" "
+                                   "assessed Failed due to failed (1) > failureLimit (0)") -> dict[str, Any]:
+    """Argo CD 알림 payload 의 resources(Application status.resources) — Rollout 헬스가 status.message 를 그대로 올린다."""
+    return {"health": "Degraded", "images": [f"{IMAGE}:{STABLE[:7]}", f"{IMAGE}:{MERGE[:7]}"],
+            "resources": [{"kind": "Service", "name": "sample-app", "health": {"status": "Healthy"}},
+                          {"kind": "Rollout", "name": "sample-app", "health": {"status": "Degraded", "message": message}}]}
+
+
+async def scene_14(env: Env, payload: dict[str, Any]) -> str:
+    """데모 장면 14 — PR 하나가 서울(aws, 대상)·도쿄(gcp)·부산(local)에 배포, 서울만 카나리 분석에서 중단."""
+    rid = await env.review("rv_s14", head="a" * 40, **COMMITTED)
+    await env.repo.add_deploy_event(review_id=rid, app="sample-app", target_env="aws", kind="degraded",
+                                    image_tag=MERGE, payload=payload)
+    for other in ("gcp", "local"):
+        await env.repo.add_deploy_event(review_id=rid, app="sample-app", target_env=other, kind="healthy",
+                                        image_tag=MERGE, payload={"health": "Healthy"})
+    return rid
+
+
+async def test_target_rollout_aborted_others_healthy_is_partial() -> None:
+    env = Env(deploy_envs=("aws", "gcp", "local"))
+    rid = await scene_14(env, aborted_payload())
+
+    body = env.progress(rid)
+
+    assert [c["env"] for c in body["envs"]] == ["aws", "gcp", "local"]  # 도쿄가 계획 카드가 아니다
+    assert card(body, "aws")["deploy"] == {"kind": "degraded", "image_tag": MERGE, "rollout_aborted": True,
+                                           "serving_tag": STABLE[:7],
+                                           "received_at": card(body, "aws")["deploy"]["received_at"]}
+    assert "rollout_aborted" not in card(body, "gcp")["deploy"]
+    assert step(body, "deploy")["state"] == "partial"
+    assert step(body, "deploy")["detail"] == "aws 자동 중단 → 이전 버전 유지 · gcp Healthy · local Healthy"
+    assert body["review"]["deployment"]["status"] == "failed"  # 대상 환경 판단은 그대로
+    assert body["final"] is True
+    assert "payload" not in str(body["envs"]) and "error-rate" not in str(body)
+
+
+async def test_degraded_rollout_without_abort_is_plain_degraded() -> None:
+    env = Env(deploy_envs=("aws", "gcp", "local"))
+    rid = await scene_14(env, aborted_payload(message="InvalidSpec: The Rollout is invalid"))
+
+    body = env.progress(rid)
+
+    assert "rollout_aborted" not in card(body, "aws")["deploy"]
+    assert step(body, "deploy")["state"] == "partial"
+    assert step(body, "deploy")["detail"] == "aws Degraded · gcp Healthy · local Healthy"
+
+
+async def test_target_aborted_without_other_healthy_fails(env: Env) -> None:
+    rid = await env.review("rv_a", head="a" * 40, **COMMITTED)
+    await env.repo.add_deploy_event(review_id=rid, app="sample-app", target_env="aws", kind="degraded",
+                                    image_tag=MERGE, payload=aborted_payload())
+
+    body = env.progress(rid)
+
+    assert card(body, "aws")["deploy"]["rollout_aborted"] is True
+    assert step(body, "deploy")["state"] == "failed"
 
 
 async def test_done_steps_use_stage_time_columns(env: Env) -> None:
