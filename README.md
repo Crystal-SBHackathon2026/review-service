@@ -121,6 +121,9 @@ docker compose --profile app up -d --build
 PR 에서 들어가서 보는 **읽기 전용** 화면이다 (토큰 입력 없음, 승인은 `/ui`). `GET /ui/reviews` 는 최근 검토 20개(superseded 제외) 목록 — PR 링크가 없을 때 데모용 입구.
 
 - `GET /reviews/{id}/progress` 하나만 3초마다 폴링, `final` 이면 30초. 요청한 검토가 superseded 면 `latest_review_id` 로 주소를 바꿔 이어서 본다
+- 보고서는 **현재 발견 사항**과 **AI 처리 이력**을 분리한다. `history` 는 요청한 검토까지의 검토·회차별 발견 사항, AI 설명, 근거 문서 ID, 변경 경로·값을 오래된 순서로 반환한다. 최신 검토로 이동하거나 새로고침해도 이전 회차가 남는다. 같은 finding ID 가 반복되어도 검토·회차별로 구분한다
+- `history[].patch_commit` 은 `committed`(이전 검토의 superseded_by 와 다음 검토의 `autofix:<이전 ID>` 연결·커밋 확인), `failed`(수정 커밋 단계 실패), `unconfirmed`(반영 확인 전)이다. 검토 중 명세에 적용한 변경과 PR 커밋 반영을 구분한다. 일반 사용자 커밋의 다음 검토가 pass 여도 과거 문제를 AI 가 해결했다고 표시하지 않는다. 회차의 `actor` 는 `ai` 또는 `human`
+- 이력에 명세 전체·LLM 내부 정보·overlay diff 는 추가하지 않는다. 패치의 env 경로 값과 비밀로 보이는 값은 가린다. 이전 값은 추정하지 않고 저장된 변경 경로·값과 커밋 링크를 표시한다
 - 단계: 명세 생성(intake 가 있을 때) → AI 검토 → 사람 확인(needs_human 이었을 때) → CI 확인 → 병합 → overlay 커밋 → 배포.
   `rejected`·`failed`·`blocked` 는 그 단계에서 `failed` 로 멈추고 뒤는 `skipped`. 배포는 실제 환경 중 하나라도 Healthy 면 완료, Degraded 면 실패
 - 단계 시각(`at`)은 아는 것만 — 끝난 단계는 0009 열(`judged_at`·`human_decided_at`·`merged_at`·`gitops_committed_at`), 지금·멈춘 단계는 `updated_at`, 배포는 `deploy_events.received_at`. 0009 전 행과 CI 는 null
@@ -154,9 +157,24 @@ PR 에서 들어가서 보는 **읽기 전용** 화면이다 (토큰 입력 없�
   "links": {"pr": "https://github.com/…/pull/12", "merge_commit": "https://github.com/…/commit/…",
             "gitops_commit": "https://github.com/Crystal-SBHackathon2026/gitops/commit/…"},
   "findings": [], "decision": {}, "rounds": [],   // 검토 보고서용 — /reviews/{id} 와 같은 수준
+  "history": [{"review_id": "rv_…a1", "is_current": false, "verdict": "pass", "status": "superseded",
+               "commit": "…", "commit_url": "https://github.com/…/commit/…", "created_at": "…",
+               "findings": [], "items": [], "doc_ids": [],
+               "rounds": [{"round": 0, "verdict": "fix", "actor": "ai", "approver": null,
+                           "findings": [/* 수정 전 발견 사항 */], "items": [/* why·cited_rule_ids */],
+                           "doc_ids": ["rules/db-003#0"],
+                           "ops": [{"op": "replace", "path": "/runtime/replicas", "value": 1}]}],
+               "patch_commit": "committed",
+               "next": {"review_id": "rv_…53c71e3c", "kind": "autofix", "commit": "…",
+                        "commit_url": "https://github.com/…/commit/…", "status": "committed", "verdict": "pass"}},
+              {"review_id": "rv_…53c71e3c", "is_current": true, "rounds": [] /* 나머지 필드 생략 */}],
   "final": true                                   // 화면이 폴링을 30초로 늦춘다
 }
 ```
+
+5분 데모에서는 정상 명세가 있는 앱 PR 에 안전하게 자동 수정할 수 있는 문제 하나를 넣고, 체크의 Details 를 연다.
+AI 설명·근거·명세 변경 → 수정 커밋 반영 → 재검토 pass → 환경별 배포 상태 순서로 40~60초간 보여 준다.
+SQLite replica 수 문제(DB-003)는 해당 앱의 저장소·배포 환경이 지원되는지 먼저 확인한다. 기존 검토를 미리 끝내 두면 최신 화면의 이력으로도 같은 설명을 할 수 있다.
 
 ## 멈춘 검토 회수 (review sweep, `api/review_api/recovery.py`)
 

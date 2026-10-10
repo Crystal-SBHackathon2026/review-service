@@ -108,6 +108,9 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
 .card { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; }
 .why { border-left: 3px solid var(--accent); padding-left: 8px; margin-top: 6px; }
 .fix { border-left: 3px solid var(--ok); padding-left: 8px; margin-top: 6px; }
+.history-entry { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 12px; }
+.history-entry summary { cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
+.history-entry .round { border-left: 2px solid var(--border); padding-left: 10px; margin-top: 10px; }
 .button { display: inline-block; padding: 6px 12px; border-radius: 6px; background: var(--accent);
   color: var(--accent-text); text-decoration: none; font-weight: 600; }
 
@@ -221,7 +224,7 @@ tbody tr:hover { background: var(--hover); }
       setConn(true);
       const text = JSON.stringify(rows);
       if (text !== lastJson) { lastJson = text; renderList(rows); }
-    } catch (e) { setConn(false); }
+    } catch (e) { console.error("검토 목록 조회 실패", e); setConn(false); }
     schedule(FAST_MS * 2);
   }
   function renderList(rows) {
@@ -257,6 +260,7 @@ tbody tr:hover { background: var(--hover); }
     try {
       body = await getJson("/reviews/" + encodeURIComponent(id) + "/progress");
     } catch (e) {
+      console.error("검토 진행 조회 실패", id, e);
       if (e.status === 404) {
         setConn(true);
         $("root").replaceChildren(el("p", {class: "notice err", text: "검토가 없습니다: " + id}));
@@ -392,32 +396,81 @@ tbody tr:hover { background: var(--hover); }
     ]);
   }
 
-  // findings 는 회차 기록(rounds)에서도 모은다 — 고쳐서 통과하면 최종 findings 는 비어 있다
-  function collectFindings(p) {
-    const byId = new Map();
-    const add = (f, item, fixOps, round) => {
-      const prev = byId.get(f.finding_id) || {finding: f, item: null, fixes: [], rounds: new Set()};
-      if (item && !prev.item) prev.item = item;
-      if (fixOps && fixOps.length) prev.fixes.push(...fixOps);
-      if (round !== null && round !== undefined) prev.rounds.add(round);
-      byId.set(f.finding_id, prev);
-    };
-    for (const r of p.rounds || []) {
-      const items = new Map((r.items || []).map((i) => [i.finding_id, i]));
-      const patch = r.patch || {};
-      const targets = new Set(patch.target_finding_ids || []);
-      for (const f of r.findings || []) {
-        add(f, items.get(f.finding_id), targets.has(f.finding_id) && !r.human ? patch.ops : null, r.round);
-      }
-    }
-    const items = new Map(((p.decision || {}).items || []).map((i) => [i.finding_id, i]));
-    for (const f of p.findings || []) add(f, items.get(f.finding_id), null, null);
-    return [...byId.values()];
-  }
-
   function opRow(op) {
     return el("div", {}, [el("code", {text: op.op + " " + op.path}),
       op.op === "remove" ? el("span", {class: "muted", text: " (삭제)"}) : [" → ", el("code", {text: valueText(op.value)})]].flat());
+  }
+
+  function findingCards(report) {
+    const items = new Map((report.items || []).map((i) => [i.finding_id, i]));
+    return (report.findings || []).map((f) => {
+      const item = items.get(f.finding_id);
+      return el("div", {class: "card"}, [
+        el("div", {class: "row"}, [
+          el("span", {class: "chip rule", text: f.rule_id}),
+          el("span", {class: "badge " + f.severity, text: f.severity}),
+          el("span", {class: "grow", text: f.title || ""}),
+        ]),
+        el("div", {class: "meta"}, [
+          "위치 ", el("code", {text: (f.location || {}).spec_path || "-"}),
+          f.irreversible ? " · 되돌릴 수 없음" : "", f.autofix === "forbidden" ? " · 자동 수정 금지" : "",
+        ]),
+        f.evidence ? el("pre", {text: f.evidence}) : null,
+        item && item.why ? el("div", {class: "why"}, [el("strong", {text: "AI 설명 "}), el("div", {text: item.why})]) : null,
+        item && (item.cited_rule_ids || []).length
+          ? el("div", {class: "meta"}, ["근거 문서 ", ...item.cited_rule_ids.map((c) => el("span", {class: "chip rule", text: c}))])
+          : null,
+      ]);
+    });
+  }
+
+  function historyPanel(p) {
+    // 구 API 응답에도 현재 검토의 rounds 는 보여 준다. 이전 검토 복원은 history 가 있을 때만 가능하다.
+    const historyRows = p.history || [{review_id: p.review.review_id, is_current: true,
+      verdict: p.review.verdict, status: p.review.status, rounds: (p.rounds || []).map((r) => ({...r,
+        actor: r.human ? "human" : "ai", approver: (r.human || {}).approver, ops: (r.patch || {}).ops || []})),
+      findings: [], patch_commit: "unconfirmed"}];
+    const out = [el("h3", {text: "AI 처리 이력"}),
+      el("p", {class: "meta", text: "과거 발견 사항과 수정 기록입니다. 현재 결과와 구분해서 표시합니다."})];
+    for (const h of historyRows) {
+      const rounds = h.rounds || [];
+      const contents = [el("p", {class: "meta"}, [localTime(h.created_at), " · ",
+        link(h.commit_url, "검토 커밋 " + short(h.commit)) || "검토 " + h.review_id])];
+      for (const r of rounds) {
+        const actor = r.actor === "human" ? "사람 수정" + (r.approver ? " · " + r.approver : "") : "AI 수정";
+        const docs = r.doc_ids || [];
+        contents.push(el("div", {class: "round"}, [
+          el("h4", {text: "회차 " + (Number.isInteger(r.round) ? r.round + 1 : "-") + " · " + actor
+            + (r.verdict ? " · 판정 " + r.verdict : "")}),
+          ...findingCards(r),
+          (r.ops || []).length ? el("div", {class: "fix"}, [
+            el("strong", {text: "검토 중 명세에 적용한 변경"}), ...r.ops.map(opRow),
+          ]) : null,
+          docs.length ? el("p", {class: "meta"}, ["회차 근거 문서 ", ...docs.map((d) => el("span", {class: "chip", text: d}))]) : null,
+        ]));
+      }
+      if (!h.is_current && (h.findings || []).length) {
+        contents.push(el("h4", {text: "이 검토의 마지막 발견 사항"}), ...findingCards(h));
+      }
+      if (!rounds.length && !(h.findings || []).length) {
+        contents.push(el("p", {class: "muted", text: "저장된 발견 사항·수정 회차 없음"}));
+      }
+      if (rounds.some((r) => (r.ops || []).length)) {
+        const commitText = {committed: "수정 커밋 반영 확인", failed: "수정 커밋 실패", unconfirmed: "수정 커밋 반영 확인 전"};
+        contents.push(el("p", {class: "notice " + (h.patch_commit === "committed" ? "ok" : h.patch_commit === "failed" ? "err" : "info"),
+          text: commitText[h.patch_commit] || commitText.unconfirmed}));
+      }
+      if (h.next) {
+        const n = h.next;
+        contents.push(el("p", {class: "meta"}, [n.kind === "autofix" ? "자동 수정 커밋 → 재검토 " : "새 커밋 → 별도 검토 ",
+          link(n.commit_url, short(n.commit)), " · 판정 ", el("strong", {text: n.verdict || "검토 중"}), " · ", badge(n.status)]));
+      }
+      out.push(el("details", {class: "history-entry", open: rounds.length > 0}, [
+        el("summary", {text: (h.is_current ? "현재 검토" : "이전 검토") + " · " + h.review_id + " · 판정 " + (h.verdict || "검토 중")}),
+        ...contents,
+      ]));
+    }
+    return out;
   }
 
   function reportPanel(p) {
@@ -434,32 +487,10 @@ tbody tr:hover { background: var(--hover); }
       out.push(el("p", {}, [el("a", {class: "button", href: "/ui#" + encodeURIComponent(r.review_id), text: "승인 화면에서 결정하기"})]));
     }
 
-    const findings = collectFindings(p);
-    out.push(el("h3", {text: "걸린 규칙 (" + findings.length + ")"}));
-    if (!findings.length) out.push(el("p", {class: "muted", text: "걸린 규칙 없음"}));
-    for (const {finding: f, item, fixes} of findings) {
-      out.push(el("div", {class: "card"}, [
-        el("div", {class: "row"}, [
-          el("span", {class: "chip rule", text: f.rule_id}),
-          el("span", {class: "badge " + f.severity, text: f.severity}),
-          el("span", {class: "grow", text: f.title || ""}),
-        ]),
-        el("div", {class: "meta"}, [
-          "위치 ", el("code", {text: (f.location || {}).spec_path || "-"}),
-          f.irreversible ? " · 되돌릴 수 없음" : "", f.autofix === "forbidden" ? " · 자동 수정 금지" : "",
-        ]),
-        f.evidence ? el("pre", {text: f.evidence}) : null,
-        item && item.why ? el("div", {class: "why"}, [el("strong", {text: "AI 설명 "}), el("div", {text: item.why})]) : null,
-        fixes.length ? el("div", {class: "fix"}, [el("strong", {text: "자동 수정"}), ...fixes.map(opRow)]) : null,
-        item && (item.cited_rule_ids || []).length
-          ? el("div", {class: "meta"}, ["근거 문서 ", ...item.cited_rule_ids.map((c) => el("span", {class: "chip rule", text: c}))])
-          : null,
-      ]));
-    }
-    const docs = [...new Set((p.rounds || []).flatMap((x) => x.doc_ids || []))];
-    if (docs.length) {
-      out.push(el("p", {class: "meta"}, ["회차 근거 문서 ", ...docs.map((d) => el("span", {class: "chip", text: d}))]));
-    }
+    const findings = p.findings || [];
+    out.push(el("h3", {text: "현재 발견 사항 (" + findings.length + ")"}));
+    if (!findings.length) out.push(el("p", {class: "muted", text: r.verdict ? "현재 발견 사항 없음" : "검토 결과 대기 중"}));
+    out.push(...findingCards({findings, items: (p.decision || {}).items}));
     const opinions = (p.decision || {}).extra_opinions || [];
     if (opinions.length) {
       out.push(el("h3", {text: "참고 의견"}));
@@ -485,6 +516,7 @@ tbody tr:hover { background: var(--hover); }
         edited.length ? el("div", {class: "fix"}, [el("strong", {text: "사람이 고친 값"}), ...edited.map(opRow)]) : null,
       ]));
     }
+    out.push(...historyPanel(p));
     return el("section", {class: "panel", "aria-label": "검토 보고서"}, out);
   }
 
