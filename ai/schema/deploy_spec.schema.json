@@ -71,7 +71,8 @@
         "rollout": {
           "$ref": "#/$defs/Rollout",
           "default": {
-            "strategy": "canary"
+            "strategy": "canary",
+            "auto_promotion": true
           }
         },
         "smoke": {
@@ -649,6 +650,12 @@
           ],
           "title": "Strategy",
           "type": "string"
+        },
+        "auto_promotion": {
+          "default": true,
+          "description": "bluegreen 새 버전 자동 승격. false 면 운영자가 수동 승격",
+          "title": "Auto Promotion",
+          "type": "boolean"
         }
       },
       "title": "Rollout",
@@ -942,7 +949,8 @@
     "rollout": {
       "$ref": "#/$defs/Rollout",
       "default": {
-        "strategy": "canary"
+        "strategy": "canary",
+        "auto_promotion": true
       }
     },
     "smoke": {

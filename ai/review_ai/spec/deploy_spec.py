@@ -214,6 +214,7 @@ class Rollout(_Frozen):
     """canary: base Rollout 의 단계 배포를 그대로 쓴다. bluegreen: 새 버전을 미리보기 Service 로 띄워 확인한 뒤 한 번에 전환한다."""
 
     strategy: Strategy = "canary"
+    auto_promotion: bool = Field(default=True, description="bluegreen 새 버전 자동 승격. false 면 운영자가 수동 승격")
 
 
 class Smoke(_Frozen):

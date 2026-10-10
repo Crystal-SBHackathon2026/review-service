@@ -49,3 +49,12 @@ cases:
     findings: [RUN-001, STO-003]
     verdict: needs_human
     reasons: [AUTOFIX_FORBIDDEN]
+  - file: 23-fix-busan-resource-limits.yaml
+    findings: [NET-001, RUN-005]
+    verdict: fix
+    reasons: []
+    after_patch: {findings: [NET-001], verdict: pass}
+  - file: 24-human-tokyo-manual-bluegreen.yaml
+    findings: [NET-001, RUN-006]
+    verdict: needs_human
+    reasons: [AUTOFIX_FORBIDDEN]

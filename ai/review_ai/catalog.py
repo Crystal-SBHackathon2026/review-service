@@ -25,9 +25,13 @@ class Rule:
     title: str
     check: str
     fix: str
+    severity_by_env: tuple[tuple[str, Literal["high", "medium", "low"]], ...] = ()
 
     def applies_to(self, env: str) -> bool:
         return "any" in self.providers or env in self.providers
+
+    def severity_for(self, env: str) -> Literal["high", "medium", "low"]:
+        return dict(self.severity_by_env).get(env, self.severity)
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,7 @@ def load_rules() -> dict[str, Rule]:
             title=raw["title"],
             check=raw["check"],
             fix=raw["fix"],
+            severity_by_env=tuple((raw.get("severity_by_env") or {}).items()),
         )
         rules[rule.id] = rule
     return rules

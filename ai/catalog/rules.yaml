@@ -297,6 +297,8 @@ rules:
   - id: RUN-005
     category: runtime
     severity: low
+    # 부산 자동 수정 정책 후보. AWS·GCP 는 기존 low 경고를 유지한다.
+    severity_by_env: {local: medium}
     autofix: allowed
     priority: P1
     providers: [any]
