@@ -69,6 +69,7 @@ TRANSFORM_RESOLVES = frozenset({"/database", "/requirements"})
 OTHER_LOCKFILES = ("yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json")
 MAX_READ_BYTES = 256 * 1024  # 레포 분석 파일 하나 — 넘으면 읽지 않은 파일로 둔다('없음' 결론을 막는다)
 MAX_SPEC_BYTES = 4 * MAX_RAW_CHARS  # 복구할 deploy.yaml — 글자 수 상한은 repair 가 다시 본다 (UTF-8 한 글자 ≤ 4바이트)
+MAX_LOCK_BYTES = 16 * 1024 * 1024  # 다시 만들 package-lock.json — 큰 모노레포도 수 MB. 넘으면 커밋하지 않는다
 
 
 class IntakeGitHub(Protocol):
@@ -206,7 +207,10 @@ async def _transform(deps: ApiDeps, github: IntakeGitHub, row: dict[str, Any], c
         return _lock_rejected(outcome, f"npm 이 아닌 잠금 파일({', '.join(other)})은 다시 만들 수 없다")
     if "package-lock.json" not in repo.tree:
         return outcome  # 잠금 파일 없는 레포 — CI 가 npm install 을 쓴다
-    lock = await github.get_file(row["repository"], "package-lock.json", row["head_sha"])
+    try:
+        lock = await github.get_file(row["repository"], "package-lock.json", row["head_sha"], max_bytes=MAX_LOCK_BYTES)
+    except FileTooLarge:
+        return _lock_rejected(outcome, f"package-lock.json 이 {MAX_LOCK_BYTES // (1024 * 1024)}MB 를 넘어 다시 만들지 않는다")
     try:
         new_lock = await deps.lockfile(outcome.files["package.json"] or "", lock)
     except LockfileUnavailable as exc:
