@@ -89,6 +89,8 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
   컨테이너를 바꿀 때도 base 의 `image`(CI 태그가 붙은 값)를 JSON Patch `copy` 로 옮긴다 — 안 그러면 태그 없는 이미지(`:latest`)가 된다.
 - 지금 gitops 의 sample-app aws·gcp·local overlay 를 `kubectl kustomize` 결과 기준으로 그대로 재현한다(테스트). 차이는 의도한 한 가지 — `terminationGracePeriodSeconds` 명시.
 - 시크릿은 `secretKeyRef`(`<앱>-secrets`)로만 렌더링한다. 값은 넣지 않는다.
+- persistent ReadWriteOnce 볼륨이 있으면 Rollout Pod 에 같은 노드 podAffinity(`app=<앱>`, `kubernetes.io/hostname`, required)를 넣는다.
+  canary·bluegreen 중 새·옛 Pod 가 다른 노드에 뜨면 볼륨을 못 붙이기(Multi-Attach) 때문이다. 데이터 이전 Job 은 preferred.
 - overlay 로 못 만드는 것(관리형 DB, 버킷, Secret 값 생성, 로컬·GCP 의 allowed_cidrs)은 `warnings` 로 돌려준다.
 - 경고는 `RenderWarning`(str)이고 `code`·`blocking`·`doc_uri` 가 있다 (`overlay/warnings.py`). 커밋 단계는 문장을 파싱하지 말고 `rendered.blocking` 만 본다.
   `to_dict()` = `{code, blocking, message, doc}` — `doc` 은 멈춘 이유·고치는 법 문서(`warnings/<code>.md`).

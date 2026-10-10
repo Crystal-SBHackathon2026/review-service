@@ -102,5 +102,9 @@ def test_import_job_runs_after_migration_before_the_new_version(tmp_path: Path) 
                             "valueFrom": {"secretKeyRef": {"name": "sample-app-secrets", "key": "DATABASE_URL"}}}]
     assert load["securityContext"]["runAsNonRoot"] and dump["securityContext"]["readOnlyRootFilesystem"]
     assert job["spec"]["backoffLimit"] == 0
+    # PreSync 동안 옛 앱 Pod 가 PVC 를 붙이고 있다 — 같은 노드를 선호한다 (앱 Pod 가 없을 때 Pending 이 되지 않게 preferred)
+    assert pod["affinity"] == {"podAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": [
+        {"weight": 100, "podAffinityTerm": {"labelSelector": {"matchLabels": {"app": "sample-app"}},
+                                            "topologyKey": "kubernetes.io/hostname"}}]}}
     # PVC 는 overlay 에 남아 있다 — 옮기기 전에 지워지지 않는다
     assert _one(docs, "PersistentVolumeClaim", "sample-app-data")
