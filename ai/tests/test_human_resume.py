@@ -213,3 +213,74 @@ def test_message_without_generated_spec_is_readable_by_previous_workers() -> Non
     assert ReviewRequested.model_validate_json(plain).generated_spec is False
     flagged = build_review_requested(spec, **kw, generated_spec=True).encode()
     assert ReviewRequested.model_validate_json(flagged).generated_spec is True
+    assert "unverified_paths" not in json.loads(flagged)  # 0012 전 기록 — 경로를 모르면 싣지 않는다
+
+
+# --- 후보값으로 채운 경로 (unverified_paths) -------------------------------------------------------
+
+UNVERIFIED = ["/image", "/runtime", "/database"]
+
+
+def test_unverified_paths_ride_the_message_only_with_generated_spec() -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from pydantic import ValidationError
+
+    from review_ai.messages import ReviewRequested, build_review_requested
+
+    spec = load_sample_dict("01-pass-sample-app-aws.yaml")
+    kw = {"review_id": "r", "spec_ref": {"repository": "r", "commit": "c"}, "requested_by": "hyeyeon",
+          "requested_at": datetime.now(UTC)}
+    sent = build_review_requested(spec, **kw, generated_spec=True, unverified_paths=UNVERIFIED).encode()
+    assert json.loads(sent)["unverified_paths"] == UNVERIFIED
+    assert ReviewRequested.model_validate_json(sent).unverified_paths == tuple(UNVERIFIED)
+    with pytest.raises(ValidationError, match="generated_spec"):
+        build_review_requested(spec, **kw, unverified_paths=UNVERIFIED)
+    with pytest.raises(ValidationError):
+        build_review_requested(spec, **kw, generated_spec=True, unverified_paths=["runtime"])
+
+
+async def test_unverified_paths_become_check_items_with_candidate_values() -> None:
+    final = await _review("01-pass-sample-app-aws.yaml", generated_spec=True, unverified_paths=UNVERIFIED)
+
+    assert (final["status"], final["decision"]["reasons"]) == ("needs_human", ["GENERATED_SPEC_UNVERIFIED"])
+    recs = [r for r in final["decision"]["recommendations"] if r["source"] == "generated"]
+    assert [op["path"] for r in recs for op in r["ops"]] == [
+        "/image/repository", "/image/platforms", "/runtime/port", "/runtime/health", "/database"]
+    spec = load_sample_dict("01-pass-sample-app-aws.yaml")
+    assert recs[1]["ops"][0]["value"] == spec["runtime"]["port"]  # 지금 명세의 후보값 그대로
+    assert "database" not in spec and recs[2]["ops"][0]["value"]["engine"] == "none"  # 생략 = 스키마 기본값
+    assert all(r["finding_ids"] == [] and r["why"].startswith("확인 필요") for r in recs)
+
+
+def test_check_item_falls_back_to_top_level_when_parent_is_omitted() -> None:
+    from review_ai.recommendations import unverified_recommendations
+
+    spec = load_sample_dict("01-pass-sample-app-aws.yaml")
+    assert "requirements" not in spec
+    (rec,) = unverified_recommendations(spec, ["/requirements"])
+    assert rec["ops"] == [{"op": "add", "path": "/requirements", "value": {"persistence": False}}]
+    assert apply_ops(spec, rec["ops"])["requirements"] == {"persistence": False}  # 부모가 없어도 적용된다
+
+
+async def test_accepting_candidates_is_not_an_edit() -> None:
+    """'권장값으로 진행' = 후보값 그대로 승인. 명세가 안 바뀌니 수정 회차(→ AI 수정 커밋)를 만들지 않는다."""
+    from review_ai.graph import route_start
+    from review_ai.recommendations import resolve_human_decision
+
+    paused = await _review("01-pass-sample-app-aws.yaml", generated_spec=True, unverified_paths=UNVERIFIED)
+    human = _approved()
+
+    assert resolve_human_decision(paused, human)["edited_ops"] == []
+    assert route_start({**paused, "human_decision": human}) == "static_check"
+    final = await _resume(paused, human)
+    assert (final["status"], final["applied_ops"]) == ("pass", [])
+
+
+async def test_changed_candidate_is_applied_and_rechecked() -> None:
+    paused = await _review("01-pass-sample-app-aws.yaml", generated_spec=True, unverified_paths=UNVERIFIED)
+    final = await _resume(paused, _approved({"op": "add", "path": "/runtime/port", "value": 3000}))
+
+    assert final["status"] == "pass"
+    assert final["applied_ops"] == [{"op": "add", "path": "/runtime/port", "value": 3000}]  # 후보값 그대로인 항목은 빠진다

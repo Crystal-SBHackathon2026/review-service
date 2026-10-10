@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 
 from review_ai.messages import ReviewRequested
+from review_ai.state import REASON_MESSAGES
 from tests.test_api import HEAD, REPO, pr_event, sample_text, send_pr
 from tests.test_intake import BROKEN, SAMPLE_TREE, IntakeEnv, ienv, repairing_llm  # noqa: F401 — ienv 는 fixture
 
@@ -24,13 +25,15 @@ def _generated_text() -> str:
     return yaml.safe_dump(spec, sort_keys=False)
 
 
-async def _seed(env: IntakeEnv, *, baseline_used: bool | None, kind: str = "missing") -> str:
-    """intake 가 PR #5 head 에 생성 커밋(GENERATED)을 올린 상태 — 행과 커밋 파일."""
+async def _seed(env: IntakeEnv, *, baseline_used: bool | None, kind: str = "missing",
+                unverified_paths: list[str] | None = None) -> str:
+    """intake 가 PR #5 head 에 생성 커밋(GENERATED)을 올린 상태 — 행과 커밋 파일. unverified_paths None = 0012 전 행."""
     intake_id = "in_gen"
     await env.repo.insert_intake(intake_id=intake_id, repository=REPO, head_repository=REPO, pr_number=5,
                                  head_sha=HEAD, head_ref="feature", path="deploy.yaml", kind=kind, errors=[],
                                  requested_by="octo-dev")
-    await env.repo.link_intake(intake_id, result_commit_sha=GENERATED, baseline_used=baseline_used)
+    await env.repo.link_intake(intake_id, result_commit_sha=GENERATED, baseline_used=baseline_used,
+                               unverified_paths=unverified_paths)
     status, reason = ("generated", "GENERATED") if kind in ("missing", "empty") else ("repaired", "REPAIRED")
     await env.repo.finish_intake(intake_id, status=status, reason=reason, message="m", result_commit_sha=GENERATED)
     env.put(_generated_text(), sha=GENERATED)
@@ -108,6 +111,51 @@ async def test_intake_records_baseline_unused_when_repairing_new_app() -> None:
     assert (row["status"], row["baseline_used"]) == ("repaired", False)
 
 
+async def test_unverified_paths_are_sent_with_generated_spec(ienv: IntakeEnv) -> None:
+    await _seed(ienv, baseline_used=False, unverified_paths=["/image", "/database"])
+    _, msg = _review(ienv, GENERATED)
+
+    assert (msg.generated_spec, msg.unverified_paths) == (True, ("/image", "/database"))
+
+
+async def test_fully_verified_generation_is_a_plain_review(ienv: IntakeEnv) -> None:
+    """레포 분석으로 전부 확인한 생성 명세 — 사람 확인 없이 자동 진행 (기본값은 커밋 메시지로 알린다)."""
+    await _seed(ienv, baseline_used=False, unverified_paths=[])
+    body, msg = _review(ienv, GENERATED)
+
+    assert msg.generated_spec is False and "generated_spec" not in body
+
+
+async def test_any_unverified_generation_in_the_pr_still_counts(ienv: IntakeEnv) -> None:
+    """같은 PR 에 후보값으로 만든 생성 커밋이 하나라도 있었으면 — 나중 생성이 전부 확인됐어도 사람에게."""
+    await _seed(ienv, baseline_used=False, unverified_paths=["/runtime"])
+    await ienv.repo.insert_intake(intake_id="in_gen2", repository=REPO, head_repository=REPO, pr_number=5,
+                                  head_sha="f" * 40, head_ref="feature", path="deploy.yaml", kind="missing",
+                                  errors=[], requested_by="octo-dev")
+    await ienv.repo.link_intake("in_gen2", result_commit_sha="c" * 40, baseline_used=False, unverified_paths=[])
+    ienv.put(_generated_text(), sha="c" * 40)
+
+    assert _review(ienv, "c" * 40)[1].unverified_paths == ("/runtime",)
+
+
+async def test_unverified_paths_are_kept_from_the_first_link(ienv: IntakeEnv) -> None:
+    """다시 처리하는 행은 처음 만든 커밋을 쓴다 — 확인 못 한 경로도 처음 값을 지킨다."""
+    intake_id = await _seed(ienv, baseline_used=False, unverified_paths=["/runtime"])
+    await ienv.repo.link_intake(intake_id, result_commit_sha="b" * 40, unverified_paths=[])
+
+    assert ienv.repo.intakes[intake_id]["unverified_paths"] == ["/runtime"]
+
+
+async def test_new_app_end_to_end_unverified_generation_needs_human(ienv: IntakeEnv) -> None:
+    send_pr(ienv, pr_event("opened"))  # 파일 없는 새 앱 — 전부 후보값
+    row = ienv.only_intake()
+    commit = row["result_commit_sha"]
+    ienv.put(ienv.github.contents[commit], sha=commit)
+    _, msg = _review(ienv, commit)
+
+    assert msg.generated_spec is True and msg.unverified_paths == tuple(row["unverified_paths"])
+
+
 async def test_review_detail_explains_generated_spec_reason(ienv: IntakeEnv) -> None:
     ienv.put(sample_text())
     review_id = send_pr(ienv, pr_event("opened")).json()["review_id"]
@@ -116,5 +164,5 @@ async def test_review_detail_explains_generated_spec_reason(ienv: IntakeEnv) -> 
 
     detail = ienv.client.get(f"/reviews/{review_id}").json()
     assert detail["reasons"] == ["GENERATED_SPEC_UNVERIFIED"]
-    assert detail["reason_messages"] == {
-        "GENERATED_SPEC_UNVERIFIED": "baseline 없이 생성된 명세 — 공개 범위(network·ingress)·env·replicas 확인 필요"}
+    assert detail["reason_messages"] == {"GENERATED_SPEC_UNVERIFIED": REASON_MESSAGES["GENERATED_SPEC_UNVERIFIED"]}
+    assert "확인 필요" in detail["reason_messages"]["GENERATED_SPEC_UNVERIFIED"]

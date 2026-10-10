@@ -23,8 +23,9 @@ DB 항목이 있으면 생성 명세가 이렇게 된다: `database: {engine: po
 migration: {command: [node, src/migrate.js], change: expand}}`, 시크릿 `DATABASE_URL`(aws-secrets-manager `<앱>/database-url`),
 `requirements.persistence: true`. 마이그레이션은 렌더러가 PreSync Job 으로 만든다(deploy-spec.md 배포 계획).
 
-다른 언어(Python·Go)의 SQLite 는 자동 패치하지 않고 이유만 남긴다 — 지금처럼 `UNVERIFIED` 로 커밋하지 않는다.
-다른 미해결 항목(포트·시크릿 등)이 남은 레포는 고쳐도 명세를 못 만드므로 LLM 을 부르지 않는다.
+다른 언어(Python·Go)의 SQLite 는 자동 패치하지 않고 이유만 남긴다 — DB 는 후보값으로 커밋되고 그 PR 은 사람 확인(`unverified_paths`)이다.
+다른 미해결 항목(포트·시크릿 등)이 남은 레포는 어차피 사람 확인으로 가므로 LLM 을 부르지 않는다.
+코드 패치를 시도했는데 막혔으면(게이트·잠금 파일) 후보값으로 덮지 않고 그 사유로 거절한다.
 
 ## 게이트
 

@@ -103,7 +103,8 @@ class ReviewHandler:
             if observed is not None:
                 spec["observed"] = observed
         await self._run(rid, initial_state(spec, review_id=rid, spec_ref=msg.spec_ref.model_dump(),
-                                           autofix_commit=msg.autofix_commit, generated_spec=msg.generated_spec))
+                                           autofix_commit=msg.autofix_commit, generated_spec=msg.generated_spec,
+                                           unverified_paths=msg.unverified_paths))
         return True
 
     async def on_resumed(self, msg: HumanDecisionResumed | CiCompletedResumed | RetryOverlayResumed) -> bool:

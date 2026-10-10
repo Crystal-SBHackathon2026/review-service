@@ -85,8 +85,8 @@ docker compose --profile app up -d --build
 | 종류(`kind`) | 처리 | 결과(`status`·`reason`) |
 |---|---|---|
 | `missing`·`empty` | 그 레포의 최근 baseline(없으면 `DEFAULT_TARGET`)으로 `review_ai.intake.prepare_intake` → PR 브랜치에 `deploy.yaml` 커밋 → synchronize 웹훅이 그 커밋을 **일반 검토**로 시작(`autofix_commit` 아님), `review_id` 로 연결 | `generated`·`GENERATED` |
-| `missing`·`empty` (새 앱 — baseline 없음) | PR head 의 Dockerfile·의존성 파일·CI 워크플로·소스를 읽어 근거가 분명한 값만 채운다(`review_ai.intake.analyze`, LLM 없음). 다 채워지면 위와 같이 커밋하고, 커밋 메시지에 값마다 근거 파일을 적는다. **그 PR 의 검토는 pass 여도 `needs_human`(`GENERATED_SPEC_UNVERIFIED`)** — 레포 분석으로는 공개 범위·env·replicas 를 모른다(아래) | `generated`·`GENERATED` |
-| `missing`·`empty` (새 앱, 확인 안 된 값 남음) | 추정값은 자동 병합·배포로 이어질 수 있어 커밋하지 않는다. `details` 에 항목별로 레포 분석이 못 채운 이유(DB 드라이버는 있는데 배치 모름, 비밀 이름의 환경변수 등) | `rejected`·`UNVERIFIED` |
+| `missing`·`empty` (새 앱 — baseline 없음, 전부 확인) | PR head 의 Dockerfile·의존성 파일·CI 워크플로·소스를 읽어 근거가 분명한 값만 채운다(`review_ai.intake.analyze`, LLM 없음). 다 채워지면 위와 같이 커밋하고, 커밋 메시지에 값마다 근거 파일을 적는다. **그 PR 은 일반 검토처럼 자동 병합·배포된다.** 틀려도 해가 없는 값만 기본값으로 채우고 커밋 메시지·`details` 로 알린다 — `network` 내부 전용(외부 노출 없음), `replicas` 1, 리소스 50m/64Mi(상한 250m/128Mi), 배포 전략 | `generated`·`GENERATED`, `unverified_paths: []` |
+| `missing`·`empty` (새 앱, 확인 안 된 값 남음) | 틀리면 앱이 안 뜨거나 데이터가 사라지는 값(이미지·포트/헬스·DB·시크릿·저장소·데이터 보존)을 레포로 확인하지 못하면 **후보값으로 채워 커밋하고 그 경로를 `unverified_paths` 에 남긴다** → 그 PR 검토는 pass 여도 `needs_human`(아래). 커밋 메시지 '사람 확인 필요' 절과 `details` 앞쪽에 항목별로 레포 분석이 못 채운 이유(DB 드라이버는 있는데 배치 모름, 비밀 이름의 환경변수 등). 코드 패치(SQLite→Postgres 등)가 필요했는데 막혔으면 예전처럼 그 사유로 거절한다 | `generated`·`GENERATED` (코드 패치 실패는 `rejected`·`TRANSFORM_*`) |
 | `yaml_error`·`schema_error` | 기본값으로 덮지 않는다. PR head 원문을 비밀을 가려 Claude 에 보내 **형식만** 고치게 하고(`review_ai.intake.repair`), 코드 게이트가 결과 값을 원문과 하나씩 대조한다 — 원문 값을 바꾸거나 지우거나 원문·확인된 값(baseline·레포 분석)·스키마 기본값에 없는 값을 쓰면 버린다. 통과하면 생성과 같이 커밋(`fix:`, 메시지에 바꾼 곳·이유) → 일반 검토. 가린 비밀은 원문 같은 위치에서만 되돌린다 | `repaired`·`REPAIRED` |
 | `yaml_error`·`schema_error` (복구 실패) | 게이트 위반은 `details` 에 경로·코드(`VALUE_CONFLICT`·`INVENTED_VALUE`·`DROPPED_VALUE`·`OUTPUT_INVALID`). 비밀을 옮겨야 하면 `MASKED_VALUE`. API 에 키가 없으면 LLM 을 부르지 않는다. 오류 기록은 줄·칸·경로만(원문 조각 없음) | `rejected`·`REPAIR_REJECTED`·`MASKED_VALUE`·`REPAIR_UNAVAILABLE` |
 
@@ -95,11 +95,15 @@ docker compose --profile app up -d --build
 - 처리 중 파드가 죽으면 5분(`STALE_AFTER`) 넘은 `processing` 행을 API 가 1분마다 다시 처리한다. 커밋 SHA 는 브랜치를 옮기기 전에 행에 남겨 같은 커밋으로 마저 끝낸다.
   처리 시도는 `attempts`(웹훅 1, 다시 가져갈 때마다 +1)로 세고 3번(`MAX_INTAKE_ATTEMPTS`)을 넘으면 다시 처리하지 않고 `failed`·`RETRY_EXHAUSTED` + 커밋 상태 `error` —
   처리할 때마다 파드를 죽이는 PR(npm 잠금 파일 재생성·대용량 분석 중 OOM 등)이 5분마다 파드를 다시 죽이지 않게. 새 커밋은 새 행이라 다시 처리한다
-- **baseline 없이 생성한 명세는 자동 병합하지 않는다** (10/09 sample-app #11 — `network: {}` 명세가 pass → 병합 → gitops ingress 삭제 → ALB 삭제).
-  intake 는 생성 커밋 SHA 와 함께 `baseline_used` 를 남기고, 웹훅은 **그 PR(레포·PR 번호)에 baseline 없이 만든 `missing`·`empty` 생성 커밋이 있으면**
-  `review.requested` 에 `generated_spec: true` 를 싣는다 → judge 가 findings 와 무관하게 `needs_human`(`GENERATED_SPEC_UNVERIFIED`), AI 자동 수정도 하지 않는다.
+- **추측으로 채운 생성 명세는 자동 병합하지 않는다.** intake 는 생성 커밋 SHA 와 함께 `baseline_used`·`unverified_paths`(0012)를 남기고,
+  웹훅은 **그 PR(레포·PR 번호)에 baseline 없이, 확인 못 한 값을 후보값으로 채운 `missing`·`empty` 생성 커밋이 있으면**
+  `review.requested` 에 `generated_spec: true`·`unverified_paths` 를 싣는다 → judge 가 findings 와 무관하게 `needs_human`(`GENERATED_SPEC_UNVERIFIED`),
+  AI 자동 수정도 하지 않는다. 승인 화면 권장값 표에 그 경로가 **'확인 필요' 항목(지금 후보값)**으로 나온다 —
+  "권장값으로 진행"은 후보값 그대로 승인(명세가 안 바뀌어 봇 수정 커밋 없이 병합), 값을 고치면 그 값만 커밋·재검토한다.
   생성 커밋 위에 커밋이 더 올라와도 같다. 판단 근거는 `spec_intakes` 기록뿐 — 명세 내용·커밋 메시지·PR 작성자는 보지 않는다.
-  사람이 승인(·수정)하면 이어서 진행하고, 그 뒤 재검사·봇 수정 커밋 재검토에서는 다시 묻지 않는다. `GET /reviews/{id}` 의 `reason_messages` 에 확인할 항목이 나온다.
+  `unverified_paths` 가 NULL 인 0012 전 행은 예전처럼 사람 확인이다. 사람이 승인(·수정)하면 이어서 진행하고, 그 뒤 재검사·봇 수정 커밋 재검토에서는 다시 묻지 않는다.
+  전부 확인된 생성 명세(`unverified_paths: []`)는 자동 진행한다. 10/09 sample-app #11(`network: {}` 생성 명세 → ingress 삭제 → ALB 삭제)은
+  배포된 앱이면 마지막 커밋 명세를 baseline 으로 쓰는 것(#39)과 병합 전 overlay 보호 파일 검사(`ingress.yaml`·`pvc-*.yaml` 삭제 차단 — PVC 는 #52)가 막는다.
   baseline 으로 만든 명세와 형식 오류 복구(`repaired` — 값은 원문 대조)는 예전처럼 일반 검토다
 
 ## 커밋 상태 `review-service/verify`

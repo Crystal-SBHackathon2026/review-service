@@ -133,9 +133,10 @@ def test_other_package_managers_lockfiles_are_not_regenerated() -> None:
 def test_llm_is_not_called_when_other_values_are_still_unknown() -> None:
     llm = ScriptedLLM(good_answer)
     env = todo_env(llm)
-    del env.github.tree["Dockerfile"]  # 포트를 모른다 — 코드를 고쳐도 명세를 만들 수 없다
+    del env.github.tree["Dockerfile"]  # 포트를 모른다 — 어차피 사람이 확인하니 코드 패치(LLM)까지 하지 않는다
     send_pr(env, pr_event("opened"))
 
     row = env.only_intake()
-    assert (row["status"], row["reason"], llm.calls) == ("rejected", "UNVERIFIED", 0)
+    assert (row["status"], row["reason"], llm.calls) == ("generated", "GENERATED", 0)
+    assert {"/runtime", "/database"} <= set(row["unverified_paths"])
     assert env.github.statuses[-1]["sha"] == HEAD

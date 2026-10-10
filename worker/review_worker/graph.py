@@ -332,7 +332,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         new_ref = {**ref, "commit": new_sha}
         message = build_review_requested(fixed, review_id=new_rid, spec_ref=new_ref, requested_by=f"autofix:{rid}",
                                          requested_at=datetime.now(UTC), autofix_commit=True,
-                                         generated_spec=spec_unverified(state))
+                                         generated_spec=spec_unverified(state),
+                                         unverified_paths=(state.get("unverified_paths") or ()) if spec_unverified(state) else ())
         await repo.insert_review(review_id=new_rid, app=message.app, target_env=message.target_env,
                                  repo_id=message.repo_id, spec_ref=new_ref, pr_head_sha=new_sha,
                                  requested_by=message.requested_by, pr_number=pull["number"])

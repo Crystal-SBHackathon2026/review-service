@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -18,6 +19,8 @@ from review_ai.spec.deploy_spec import PIPELINE_FIELDS, AppSpec, user_fields
 
 SCHEMA_VERSION = "review.requested/v1"
 TOPIC = "review.requested"
+# intake 가 확인하지 못한 명세 최상위 경로 (preparation.prepare_spec 의 verification 경로)
+UNVERIFIED_PATH = r"^/[a-z_]+$"
 
 
 class SpecRef(BaseModel):
@@ -50,6 +53,11 @@ class ReviewRequested(BaseModel):
         description="intake 가 baseline 없이 만든 명세가 들어 있는 PR 이면 True — pass 여도 needs_human. "
                     "Review API 가 spec_intakes 기록으로 정한다 (명세 내용·PR 작성자가 바꿀 수 있는 표시가 아님)",
     )
+    unverified_paths: tuple[Annotated[str, Field(pattern=UNVERIFIED_PATH)], ...] = Field(
+        default=(), max_length=20,
+        description="generated_spec 일 때 intake 가 레포로 확인하지 못해 후보값으로 채운 경로 (/image·/runtime …). "
+                    "승인 화면이 그 값을 확인할 항목으로 보여 준다. 비어 있으면 0012 전 기록 — 무엇을 확인할지 모른다",
+    )
 
     @model_validator(mode="after")
     def _safe_payload(self) -> ReviewRequested:
@@ -60,11 +68,16 @@ class ReviewRequested(BaseModel):
         if spec_sha256(self.deploy_spec) != self.spec_sha256:
             raise ValueError("spec_sha256 이 deploy_spec 과 맞지 않다")
         AppSpec.model_validate(self.deploy_spec)
+        if self.unverified_paths and not self.generated_spec:
+            raise ValueError("unverified_paths 는 generated_spec 일 때만 싣는다")
         return self
 
     def encode(self) -> bytes:
-        """Kafka 값. generated_spec 이 False 면 빼고 보낸다 — 배포 중 남은 이전 워커(extra=forbid, 필드 모름)도 읽는다."""
-        return self.model_dump_json(exclude=None if self.generated_spec else {"generated_spec"}).encode()
+        """Kafka 값. 기본값인 선택 필드(generated_spec False·unverified_paths 빔)는 빼고 보낸다 —
+        배포 중 남은 이전 워커(extra=forbid, 필드 모름)도 읽는다."""
+        exclude = {name for name, empty in (("generated_spec", not self.generated_spec),
+                                            ("unverified_paths", not self.unverified_paths)) if empty}
+        return self.model_dump_json(exclude=exclude or None).encode()
 
 
 def spec_sha256(spec: dict[str, Any]) -> str:
@@ -81,6 +94,7 @@ def build_review_requested(
     requested_at: datetime,
     autofix_commit: bool = False,
     generated_spec: bool = False,
+    unverified_paths: Sequence[str] = (),
 ) -> ReviewRequested:
     body = mask_spec(user_fields(spec))
     return ReviewRequested(
@@ -95,4 +109,5 @@ def build_review_requested(
         requested_at=requested_at,
         autofix_commit=autofix_commit,
         generated_spec=generated_spec,
+        unverified_paths=tuple(unverified_paths),
     )

@@ -99,10 +99,11 @@ def test_unresolved_reasons_reach_unverified_details() -> None:
                                        "package.json": json.dumps({"dependencies": {"pg": "^8"}})}))
     outcome = prepare_intake("missing", context=analysis.context, findings=analysis.findings)
 
-    assert (outcome.action, outcome.reason) == ("rejected", "UNVERIFIED")
-    database = next(d for d in outcome.details if d["path"] == "/database")
+    assert (outcome.action, outcome.reason) == ("generated", "GENERATED")
+    database = next(d for d in outcome.unverified if d["path"] == "/database")
     assert database["source"] == "package.json" and "pg → postgres" in database["message"]
-    assert {d["code"] for d in outcome.details} == {"DATABASE_UNVERIFIED", "PERSISTENCE_UNVERIFIED"}
+    assert {d["code"] for d in outcome.unverified} == {"DATABASE_UNVERIFIED", "PERSISTENCE_UNVERIFIED"}
+    assert outcome.unverified_paths == ("/requirements", "/database")
 
 
 # --- runtime --------------------------------------------------------------------------------------

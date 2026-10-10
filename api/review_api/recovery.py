@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_api import metrics
-from review_api.intake import SpecProblem, load_spec
+from review_api.intake import SpecProblem, load_spec, unverified_of
 from review_common.github import SpecNotFound
 from review_common.repository import RECOVERABLE
 from review_common.resumed import TOPIC as RESUMED_TOPIC
@@ -106,12 +106,12 @@ async def _republish(deps: ApiDeps, row: dict[str, Any]) -> str:
         loaded = load_spec(raw, ref["path"])
     except (SpecNotFound, SpecProblem) as exc:  # 다시 해도 같다
         return await _give_up(deps, row, f"회수: 명세를 다시 읽을 수 없다 — {exc}")
-    generated = row["pr_number"] is not None and (
-        await deps.repo.unverified_generation_for_pr(ref["repository"], row["pr_number"])) is not None
+    intake = None if row["pr_number"] is None else (
+        await deps.repo.unverified_generation_for_pr(ref["repository"], row["pr_number"]))
     message = build_review_requested(loaded, review_id=row["review_id"], spec_ref=ref, requested_by=row["requested_by"],
                                      requested_at=row["created_at"],
                                      autofix_commit=row["requested_by"].startswith("autofix:"),
-                                     generated_spec=generated)
+                                     generated_spec=intake is not None, unverified_paths=unverified_of(intake))
     await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
     return "requested"
 

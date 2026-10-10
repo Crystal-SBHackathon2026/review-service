@@ -247,12 +247,13 @@ class ReviewRepository(Protocol):
         ...
 
     async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
-                          review_id: str | None = None, baseline_used: bool | None = None) -> str | None:
-        """만든 커밋·그 커밋의 검토·baseline 으로 만들었는지를 잇는다. None 인 값은 그대로 둔다.
+                          review_id: str | None = None, baseline_used: bool | None = None,
+                          unverified_paths: Sequence[str] | None = None) -> str | None:
+        """만든 커밋·그 커밋의 검토·baseline 으로 만들었는지·확인하지 못한 경로를 잇는다. None 인 값은 그대로 둔다.
         행에 남은 result_commit_sha 를 돌려준다.
 
         result_commit_sha 는 이미 있으면 덮지 않는다 — 두 곳이 같은 행을 처리해도 먼저 이은 커밋 하나로 브랜치를 옮긴다.
-        baseline_used 도 처음 기록한 값을 지킨다 — 다시 처리하는 행은 처음 만든 커밋을 그대로 쓰기 때문이다."""
+        baseline_used·unverified_paths 도 처음 기록한 값을 지킨다 — 다시 처리하는 행은 처음 만든 커밋을 그대로 쓰기 때문이다."""
         ...
 
     async def touch_intake(self, intake_id: str) -> None:
@@ -260,9 +261,10 @@ class ReviewRepository(Protocol):
         ...
 
     async def unverified_generation_for_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
-        """그 PR 에 intake 가 baseline 없이 만든 명세(missing·empty) 커밋이 있으면 그 행.
+        """그 PR 에 intake 가 baseline 없이, 확인하지 못한 값을 후보값으로 채워 만든 명세(missing·empty) 커밋이 있으면 그 행.
 
-        baseline_used 가 NULL 인 행(0006 전·기록 실패)도 baseline 없이 만든 것으로 본다 — 모르면 사람에게."""
+        baseline_used 가 NULL 인 행(0006 전·기록 실패)도 baseline 없이 만든 것으로 본다 — 모르면 사람에게.
+        unverified_paths 가 빈 배열이면(전부 확인된 생성 명세) 해당하지 않는다. NULL(0012 전 행)은 해당한다."""
         ...
 
     async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
@@ -548,12 +550,15 @@ class PostgresReviewRepository(PostgresDeployments):
             " WHERE intake_id = %s AND status = 'processing'", (*values, intake_id)) == 1
 
     async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
-                          review_id: str | None = None, baseline_used: bool | None = None) -> str | None:
+                          review_id: str | None = None, baseline_used: bool | None = None,
+                          unverified_paths: Sequence[str] | None = None) -> str | None:
+        paths = list(unverified_paths) if unverified_paths is not None else None
         row = await self._fetchone(
             "UPDATE spec_intakes SET result_commit_sha = COALESCE(result_commit_sha, %s),"
             " review_id = COALESCE(%s, review_id), baseline_used = COALESCE(baseline_used, %s),"
+            " unverified_paths = COALESCE(unverified_paths, %s::text[]),"
             " updated_at = now() WHERE intake_id = %s RETURNING result_commit_sha",
-            (result_commit_sha, review_id, baseline_used, intake_id))
+            (result_commit_sha, review_id, baseline_used, paths, intake_id))
         return row["result_commit_sha"] if row else None
 
     async def touch_intake(self, intake_id: str) -> None:
@@ -563,7 +568,8 @@ class PostgresReviewRepository(PostgresDeployments):
     async def unverified_generation_for_pr(self, repository: str, pr_number: int) -> dict[str, Any] | None:
         return await self._fetchone(
             "SELECT * FROM spec_intakes WHERE repository = %s AND pr_number = %s AND kind = ANY(%s)"
-            " AND result_commit_sha IS NOT NULL AND baseline_used IS NOT TRUE ORDER BY created_at DESC LIMIT 1",
+            " AND result_commit_sha IS NOT NULL AND baseline_used IS NOT TRUE"
+            " AND (unverified_paths IS NULL OR cardinality(unverified_paths) > 0) ORDER BY created_at DESC LIMIT 1",
             (repository, pr_number, list(GENERATED_KINDS)))
 
     async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
@@ -799,8 +805,8 @@ class InMemoryReviewRepository(MemoryDeployments):
         now = _now()
         self.intakes[intake["intake_id"]] = {
             **copy.deepcopy(intake), "status": "processing", "reason": None, "message": None, "details": [],
-            "result_commit_sha": None, "review_id": None, "baseline_used": None, "attempts": 1, "created_at": now,
-            "updated_at": now,
+            "result_commit_sha": None, "review_id": None, "baseline_used": None, "unverified_paths": None,
+            "attempts": 1, "created_at": now, "updated_at": now,
         }
         return True
 
@@ -830,12 +836,14 @@ class InMemoryReviewRepository(MemoryDeployments):
         return True
 
     async def link_intake(self, intake_id: str, *, result_commit_sha: str | None = None,
-                          review_id: str | None = None, baseline_used: bool | None = None) -> str | None:
+                          review_id: str | None = None, baseline_used: bool | None = None,
+                          unverified_paths: Sequence[str] | None = None) -> str | None:
         row = self.intakes.get(intake_id)
         if row is None:
             return None
+        paths = list(unverified_paths) if unverified_paths is not None and row["unverified_paths"] is None else None
         links = {"result_commit_sha": row["result_commit_sha"] or result_commit_sha, "review_id": review_id,
-                 "baseline_used": baseline_used if row["baseline_used"] is None else None}
+                 "baseline_used": baseline_used if row["baseline_used"] is None else None, "unverified_paths": paths}
         row.update({k: v for k, v in links.items() if v is not None}, updated_at=_now())
         return row["result_commit_sha"]
 
@@ -848,7 +856,7 @@ class InMemoryReviewRepository(MemoryDeployments):
         return self._latest(r for r in self.intakes.values()
                             if r["repository"] == repository and r["pr_number"] == pr_number
                             and r["kind"] in GENERATED_KINDS and r["result_commit_sha"] is not None
-                            and r.get("baseline_used") is not True)
+                            and r.get("baseline_used") is not True and r.get("unverified_paths") != [])
 
     async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
         now = _now()
