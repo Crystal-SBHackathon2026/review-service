@@ -10,7 +10,7 @@ database.placement 가 volume(SQLite) 이 아니면 DB 는 overlay 밖에서 만
 없는 DB 를 바라보는 앱은 뜨지 않으므로 커밋 단계에서 멈춘다.
 
 ## 환경별
-- aws: RDS postgres 16 은 있지만 앱마다 DB 를 만드는 수단(Crossplane 등)이 아직 없다. in-cluster·volume 은 EBS CSI 가 없어 불가.
+- aws: RDS postgres 16 은 있지만 앱마다 DB 를 만드는 수단(Crossplane 등)이 아직 없다. in-cluster·volume 은 열지 않았다(EBS 단일 AZ·Retain — DB-002).
 - gcp: Cloud SQL 은 Terraform 미작성. in-cluster postgres 16 과 volume sqlite 는 능력표상 가능하다.
 - local: in-cluster postgres 16, volume sqlite 가 가능하다.
 

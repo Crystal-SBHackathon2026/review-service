@@ -246,7 +246,8 @@ def test_sto005_volume_shrink(sample_app: dict[str, Any], prev: str, cur: str, h
 @pytest.mark.parametrize(
     ("env", "volume", "hit"),
     [
-        ("aws", {"persistent": True}, True),  # EBS CSI 없음 — 지원 접근 모드가 없다
+        ("aws", {"persistent": True}, False),  # 2026-10-10: EBS gp3 — ReadWriteOnce
+        ("aws", {"persistent": True, "access_mode": "ReadWriteMany"}, True),  # EBS 는 단일 노드 — EFS 없음
         ("aws", {"persistent": False}, False),  # emptyDir 은 PVC 가 아니다
         ("local", {"persistent": True}, False),
         ("local", {"persistent": True, "access_mode": "ReadWriteMany"}, True),
@@ -273,7 +274,7 @@ def test_sto001_volume_access_mode_must_be_supported(
     ids=["in-cluster", "sqlite-volume", "managed"],
 )
 def test_db002_aws_has_no_pvc_backed_database(sample_app: dict[str, Any], db: dict[str, Any], hit: bool) -> None:
-    """2026-10-08 실측: EKS 에 EBS CSI 가 없어 PVC 를 쓰는 DB 배치는 AWS 에서 못 쓴다."""
+    """PVC 는 되지만(10/10) EBS 가 단일 AZ·Retain 이라 PVC 를 쓰는 DB 배치는 AWS 에서 열지 않았다."""
     spec = {**sample_app, "database": db, "secrets": DB_SECRET}
     assert ("DB-002" in rule_ids(spec)) is hit
 

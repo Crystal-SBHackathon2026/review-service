@@ -97,7 +97,8 @@ SEC-001·mask_spec·패치 게이트·LLM 출력 검사가 같은 기준을 쓴�
   |---|---|---|
   | `DB_PROVISIONING_REQUIRED` | ✅ | managed·in-cluster·external DB — overlay 로 안 만든다 |
   | `BUCKET_PROVISIONING_REQUIRED` | ✅ | 버킷은 인프라 쪽에서 만든다 |
-  | `VOLUME_UNSUPPORTED` | ✅ | 대상 환경에 그 접근 모드의 스토리지가 없다 (지금 aws 는 볼륨 불가, STO-001) |
+  | `VOLUME_UNSUPPORTED` | ✅ | 대상 환경에 그 접근 모드의 스토리지가 없다 (지금 aws 는 ReadWriteOnce 만, STO-001) |
+  | `VOLUME_RETAINED` | — | 영속 볼륨 클래스가 Retain(지금 aws) — PVC 를 지워도 PV·디스크와 과금이 남는다. 정리 담당은 문서 참고 |
   | `TLS_HOST_MISSING` | ✅ | TLS 를 요구했는데 host 가 없어 인증서를 못 붙인다 |
   | `SECRET_KEYS_REQUIRED` | — | `<앱>-secrets` 에 키가 미리 있어야 한다. 없으면 Rollout 이 멈추고 자동 롤백 |
   | `TLS_SECRET_REQUIRED` | — | `<앱>-tls` 인증서 Secret 이 미리 있어야 한다 |
