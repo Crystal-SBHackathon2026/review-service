@@ -46,6 +46,8 @@ def strategy_ops(spec: AppSpec) -> list[dict[str, Any]]:
         "autoPromotionEnabled": spec.rollout.auto_promotion,
         "scaleDownDelaySeconds": SCALE_DOWN_DELAY_SECONDS,
     }
+    if spec.rollout.auto_promotion_seconds is not None:
+        blue_green["autoPromotionSeconds"] = spec.rollout.auto_promotion_seconds
     return [{"op": "replace", "path": "/spec/strategy", "value": {"blueGreen": blue_green}}]
 
 

@@ -76,6 +76,9 @@ class ReviewHandler:
     async def on_requested(self, msg: ReviewRequested) -> bool:
         """처리했으면 True, 건너뛰었으면(claim 실패) False."""
         rid = msg.review_id
+        stored = await self._repo.get_review(rid)
+        if stored and stored.get("deployment_request_id") != msg.deployment_request_id:
+            raise ValueError("request ownership does not match the stored review")
         if not await self._repo.claim(rid, from_statuses=["received"], to_status="reviewing"):
             log.info("review %s: 이미 처리 중이거나 끝남 — 건너뜀", rid)
             return False
@@ -102,9 +105,11 @@ class ReviewHandler:
             observed = await observe_migrations(self._files, msg.spec_ref.repository, msg.spec_ref.commit, row)
             if observed is not None:
                 spec["observed"] = observed
-        await self._run(rid, initial_state(spec, review_id=rid, spec_ref=msg.spec_ref.model_dump(),
+        state = initial_state(spec, review_id=rid, spec_ref=msg.spec_ref.model_dump(),
                                            autofix_commit=msg.autofix_commit, generated_spec=msg.generated_spec,
-                                           unverified_paths=msg.unverified_paths))
+                                           unverified_paths=msg.unverified_paths)
+        state["deployment_request_id"] = msg.deployment_request_id
+        await self._run(rid, state)
         return True
 
     async def on_resumed(self, msg: HumanDecisionResumed | CiCompletedResumed | RetryOverlayResumed) -> bool:
@@ -112,6 +117,9 @@ class ReviewHandler:
         if isinstance(msg, RetryOverlayResumed):
             return await self.on_retry_overlay(rid)
         if isinstance(msg, CiCompletedResumed):
+            row = await self._repo.get_review(rid)
+            if row and row.get("deployment_request_id"):
+                return False  # parent coordinator owns CI and merging
             claimed = await self._repo.claim(rid, from_statuses=["waiting_ci"], to_status="merging",
                                              pr_head_sha=msg.ci.head_sha)
             value = msg.ci.model_dump(mode="json")

@@ -38,8 +38,8 @@ class PostgresDeployments:
         if not revision:
             return None
         rows = await self._fetchall(
-            "SELECT * FROM reviews WHERE app=%s AND (%s::text IS NULL OR target_env=%s) AND gitops_commit_sha=%s LIMIT 2",
-            (app, env, env, revision))
+            "SELECT * FROM reviews WHERE app=%s AND (%s::text IS NULL OR target_env=%s) AND (%s::text IS NOT NULL OR deployment_request_id IS NULL) AND gitops_commit_sha=%s LIMIT 2",
+            (app, env, env, env, revision))
         return rows[0] if len(rows) == 1 else None
 
     async def record_deployment(self, event):
@@ -168,6 +168,7 @@ class MemoryDeployments:
 
     async def find_deployment_review(self, app, env, revision):
         rows = [r for r in self.reviews.values() if r["app"] == app and (env is None or r["target_env"] == env)
+                and (env is not None or r.get("deployment_request_id") is None)
                 and revision and r["gitops_commit_sha"] == revision]
         return copy.deepcopy(rows[0]) if len(rows) == 1 else None
 

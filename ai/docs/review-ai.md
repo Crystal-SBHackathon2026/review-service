@@ -224,3 +224,17 @@ cd ai && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 
 .venv/bin/pytest -q --cov=review_ai
 .venv/bin/python scripts/validate_samples.py
 ```
+
+## 다중 환경 요청 연결 (기본 비활성)
+
+`ReviewRequested`와 `ReviewState`의 선택 필드 `deployment_request_id`가 부모 요청을 가리킨다.
+필드를 생략하면 기존 단일 환경 경로를 유지한다. 자식 검토는 승인·수정 후 `prepare_request`에서 끝나며,
+공유 verify 상태·원본 수정 커밋·CI·PR 병합·GitOps 쓰기는 부모 `RequestCoordinator`만 수행한다.
+수정 커밋으로 SHA가 바뀌면 선택한 모든 환경을 다시 검토하고 이전 SHA의 승인은 재사용하지 않는다.
+`GET /deployment-requests/{id}`의 인증된 부모·환경별 결과 API는 구현했으며,
+기존 개발자 HTML 화면에 부모 집계를 표시하는 작업은 별도로 남아 있다.
+
+`rollout.auto_promotion`은 수동 승격 여부, `rollout.auto_promotion_seconds`는 자동 승격 지연을 나타낸다.
+Argo Rollouts에서 자동 승격이 false면 지연은 무시된다. 현재 외부 DB 명세는
+`DB_PROVISIONING_REQUIRED` 보호가 남아 있으므로, DB가 준비되었다는 주장만으로 배포 통과로 표시하지 않는다.
+활성화·DB 인덱스·이미지 pin·복구 계약은 [다중 환경 안내](../../docs/multi-target.md)를 따른다.

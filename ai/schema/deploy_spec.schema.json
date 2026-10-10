@@ -72,7 +72,8 @@
           "$ref": "#/$defs/Rollout",
           "default": {
             "strategy": "canary",
-            "auto_promotion": true
+            "auto_promotion": true,
+            "auto_promotion_seconds": null
           }
         },
         "smoke": {
@@ -656,6 +657,20 @@
           "description": "bluegreen 새 버전 자동 승격. false 면 운영자가 수동 승격",
           "title": "Auto Promotion",
           "type": "boolean"
+        },
+        "auto_promotion_seconds": {
+          "anyOf": [
+            {
+              "maximum": 3600,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Auto Promotion Seconds"
         }
       },
       "title": "Rollout",
@@ -950,7 +965,8 @@
       "$ref": "#/$defs/Rollout",
       "default": {
         "strategy": "canary",
-        "auto_promotion": true
+        "auto_promotion": true,
+        "auto_promotion_seconds": null
       }
     },
     "smoke": {

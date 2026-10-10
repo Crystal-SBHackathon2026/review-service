@@ -1,0 +1,35 @@
+# 손 파일 — 렌더러는 overlays/aws 만 만든다 (명세 하나 = 환경 하나, sample-app 명세는 aws).
+#
+# GCP 만 블루그린으로 배포한다. base 의 canary 를 통째로 바꾼다.
+# 🔴 GCP Application 을 처음 적용하기 전에 머지돼야 한다. canary 로 먼저 뜬 Rollout 을
+# blueGreen 으로 바꾸면 SkipSteps 문제가 생긴다 — 처음부터 blueGreen 으로 생성되게 한다.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sample-app
+resources:
+  - ../../base
+  - service-preview.yaml
+patches:
+  - target:
+      kind: Rollout
+      name: sample-app
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: DEPLOY_ENV
+            value: gcp
+          - name: DEPLOY_REGION
+            value: asia-northeast1
+      # 렌더러의 bluegreen 출력(plan.strategy_ops)과 같은 모양에 autoPromotionSeconds 만 더했다.
+      # 기본값(0)이면 그린이 Ready 되자마자 바로 전환돼 데모에서 두 버전이 함께 뜬 순간이
+      # 안 보인다. 30초는 base 의 progressDeadlineSeconds(60) 와 겹치는지 리허설에서 잰다.
+      - op: replace
+        path: /spec/strategy
+        value:
+          blueGreen:
+            activeService: sample-app
+            previewService: sample-app-preview
+            autoPromotionEnabled: true
+            autoPromotionSeconds: 30
+            scaleDownDelaySeconds: 30

@@ -111,6 +111,7 @@ async def _republish(deps: ApiDeps, row: dict[str, Any]) -> str:
     message = build_review_requested(loaded, review_id=row["review_id"], spec_ref=ref, requested_by=row["requested_by"],
                                      requested_at=row["created_at"],
                                      autofix_commit=row["requested_by"].startswith("autofix:"),
+                                     deployment_request_id=row.get("deployment_request_id"),
                                      generated_spec=intake is not None, unverified_paths=unverified_of(intake))
     await deps.publisher.send(REQUESTED_TOPIC, message.repo_id, message.encode())
     return "requested"

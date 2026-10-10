@@ -81,7 +81,7 @@ class FakeGitHub:
                            "head": {"sha": sha, "ref": "feature", "repo": {"full_name": repository}}}
 
     async def get_file(self, repository: str, path: str, ref: str, **_: Any) -> str:
-        if ref not in self.files:
+        if path != "deploy.yaml" or ref not in self.files:
             raise SpecNotFound("없음", 404)
         return self.files[ref]
 

@@ -1,0 +1,13 @@
+# 블루그린의 미리보기 Service. 전환 전 새 버전(그린)만 가리킨다.
+# selector 는 base Service 와 같고, Argo Rollouts 가 rollouts-pod-template-hash 를
+# 덧붙여 active(sample-app) 는 옛 버전, preview 는 새 버전으로 나눈다.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app-preview
+spec:
+  selector:
+    app: sample-app
+  ports:
+    - port: 80
+      targetPort: 8080
