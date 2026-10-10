@@ -1,0 +1,17 @@
+# 로컬(k3d) 클러스터에서 http://localhost:8081 로 접속하기 위한 Ingress (k3s 기본 Traefik 사용)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sample-app
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sample-app
+                port:
+                  number: 80

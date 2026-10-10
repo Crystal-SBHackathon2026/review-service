@@ -215,6 +215,13 @@ class Rollout(_Frozen):
 
     strategy: Strategy = "canary"
     auto_promotion: bool = Field(default=True, description="bluegreen 새 버전 자동 승격. false 면 운영자가 수동 승격")
+    auto_promotion_seconds: int | None = Field(default=None, ge=0, le=3600)
+
+    @model_validator(mode="after")
+    def _promotion(self):
+        if self.strategy != "bluegreen" and self.auto_promotion_seconds is not None:
+            raise ValueError("auto_promotion_seconds is only valid for bluegreen")
+        return self
 
 
 class Smoke(_Frozen):

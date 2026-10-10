@@ -41,7 +41,7 @@ jobs:
       - name: 샘플·규칙 목록·기대 결과 정합성, JSON Schema 가 커밋된 것과 같은지
         run: |
           python scripts/validate_samples.py
-          git diff --exit-code -- schema/deploy_spec.schema.json \
+          git diff --exit-code -- schema/deploy_spec.schema.json schema/deployment_request.schema.json \
             || { echo "::error::DeploySpec 을 바꿨으면 validate_samples.py 로 schema/deploy_spec.schema.json 을 다시 만들어 커밋하세요"; exit 1; }
 
       - name: 평가셋 (가짜 LLM — 코드 게이트가 틀린 출력을 잡는지)

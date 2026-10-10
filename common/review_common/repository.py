@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
+from review_common.deployment_requests import MemoryRequests, PostgresRequests
 from review_common.deployment_repository import LAST_DEPLOY_FAILED, MemoryDeployments, PostgresDeployments
 
 from psycopg.rows import dict_row
@@ -115,7 +116,7 @@ class ReviewRepository(Protocol):
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
-                            pr_number: int | None = None) -> str:
+                            pr_number: int | None = None, deployment_request_id: str | None = None) -> str:
         """received 로 넣고 review_id 를 돌려준다. 같은 repo_id·pr_head_sha 의 검토(failed·superseded 빼고)가
         이미 있으면 넣지 않고 그 review_id 를 돌려준다 — 같은 웹훅이 동시에 와도 검토는 하나."""
         ...
@@ -299,7 +300,7 @@ def tag_matches(merge_sha: str | None, image_tag: str) -> bool:
     return bool(merge_sha) and len(tag) >= 7 and merge_sha.lower().startswith(tag)
 
 
-class PostgresReviewRepository(PostgresDeployments):
+class PostgresReviewRepository(PostgresRequests, PostgresDeployments):
     def __init__(self, pool: AsyncConnectionPool) -> None:
         self._pool = pool
 
@@ -320,17 +321,26 @@ class PostgresReviewRepository(PostgresDeployments):
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
-                            pr_number: int | None = None) -> str:
+                            pr_number: int | None = None, deployment_request_id: str | None = None) -> str:
+        if deployment_request_id is not None:
+            await self._execute(
+                "INSERT INTO reviews(review_id,app,target_env,repo_id,spec_ref,pr_head_sha,requested_by,pr_number,"
+                "deployment_request_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (review_id, app, target_env, repo_id, Jsonb(spec_ref), pr_head_sha, requested_by, pr_number,
+                 deployment_request_id))
+            row = await self._fetchone("SELECT review_id FROM reviews WHERE deployment_request_id=%s AND target_env=%s",
+                                       (deployment_request_id, target_env))
+            return row["review_id"]
         for _ in range(3):  # 겹친 행이 그사이 failed·superseded 가 되면 다시 넣는다
             row = await self._fetchone(
                 "INSERT INTO reviews (review_id, app, target_env, repo_id, spec_ref, pr_head_sha, requested_by,"
                 " pr_number, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'received')"
-                " ON CONFLICT (repo_id, pr_head_sha) WHERE status NOT IN ('failed', 'superseded') DO NOTHING"
+                " ON CONFLICT (repo_id, pr_head_sha) WHERE status NOT IN ('failed', 'superseded') AND deployment_request_id IS NULL DO NOTHING"
                 " RETURNING review_id",
                 (review_id, app, target_env, repo_id, Jsonb(spec_ref), pr_head_sha, requested_by, pr_number))
             if row is None:
                 row = await self._fetchone(
-                    "SELECT review_id FROM reviews WHERE repo_id = %s AND pr_head_sha = %s AND NOT status = ANY(%s)",
+                    "SELECT review_id FROM reviews WHERE repo_id = %s AND pr_head_sha = %s AND deployment_request_id IS NULL AND NOT status = ANY(%s)",
                     (repo_id, pr_head_sha, list(HEAD_REUSABLE)))
             if row is not None:
                 return row["review_id"]
@@ -413,8 +423,8 @@ class PostgresReviewRepository(PostgresDeployments):
             return None
         return await self._fetchone(
             "SELECT * FROM reviews WHERE app = %s AND (%s::text IS NULL OR target_env = %s) AND merge_sha IS NOT NULL"
-            " AND starts_with(lower(merge_sha), lower(%s)) ORDER BY created_at DESC LIMIT 1",
-            (app, target_env, target_env, image_tag),
+            " AND (%s::text IS NOT NULL OR deployment_request_id IS NULL) AND starts_with(lower(merge_sha), lower(%s)) ORDER BY created_at DESC LIMIT 1",
+            (app, target_env, target_env, target_env, image_tag),
         )
 
     async def find_by_merge_sha_exact(self, merge_sha: str) -> dict[str, Any] | None:
@@ -606,10 +616,13 @@ class PostgresReviewRepository(PostgresDeployments):
             (rule_id, app, repository, list(outcomes), target_env, limit))
 
 
-class InMemoryReviewRepository(MemoryDeployments):
+class InMemoryReviewRepository(MemoryRequests, MemoryDeployments):
     """테스트·DB 없는 로컬 실행용. Postgres 구현과 같은 규칙으로 동작한다."""
 
     def __init__(self) -> None:
+        self.requests = {}
+        self.request_locks = {}
+        self.request_retries = {}
         self.reviews: dict[str, dict[str, Any]] = {}
         self.baselines: dict[tuple[str, str], dict[str, Any]] = {}
         self.deploy_events: list[dict[str, Any]] = []
@@ -618,11 +631,14 @@ class InMemoryReviewRepository(MemoryDeployments):
 
     async def insert_review(self, *, review_id: str, app: str, target_env: str, repo_id: str,
                             spec_ref: dict[str, Any], pr_head_sha: str, requested_by: str,
-                            pr_number: int | None = None) -> str:
+                            pr_number: int | None = None, deployment_request_id: str | None = None) -> str:
         if review_id in self.reviews:
             raise ValueError(f"review_id 중복: {review_id}")
         for r in self.reviews.values():
-            if r["repo_id"] == repo_id and r["pr_head_sha"] == pr_head_sha and r["status"] not in HEAD_REUSABLE:
+            if ((deployment_request_id is not None and r.get("deployment_request_id") == deployment_request_id
+                 and r["target_env"] == target_env) or
+                (deployment_request_id is None and r.get("deployment_request_id") is None and
+                 r["repo_id"] == repo_id and r["pr_head_sha"] == pr_head_sha and r["status"] not in HEAD_REUSABLE)):
                 return r["review_id"]
         now = _now()
         self.reviews[review_id] = {
@@ -631,7 +647,7 @@ class InMemoryReviewRepository(MemoryDeployments):
             "status": "received", "verdict": None, "reasons": [], "decision": None, "findings": None,
             "rounds": None, "human_decision": None, "deploy_result": None, "gitops_commit_sha": None,
             "final_spec": None, "error": None, "superseded_by": None, "requested_by": requested_by,
-            "pr_number": pr_number, "recover_count": 0, **dict.fromkeys(STAGE_TIMES), "created_at": now,
+            "pr_number": pr_number, "deployment_request_id": deployment_request_id, "recover_count": 0, **dict.fromkeys(STAGE_TIMES), "created_at": now,
             "updated_at": now,
         }
         return review_id
@@ -719,6 +735,7 @@ class InMemoryReviewRepository(MemoryDeployments):
     async def find_by_merge_sha(self, *, app: str, target_env: str | None, image_tag: str) -> dict[str, Any] | None:
         return self._latest(r for r in self.reviews.values()
                             if r["app"] == app and target_env in (None, r["target_env"])
+                            and (target_env is not None or r.get("deployment_request_id") is None)
                             and tag_matches(r["merge_sha"], image_tag))
 
     async def find_by_merge_sha_exact(self, merge_sha: str) -> dict[str, Any] | None:

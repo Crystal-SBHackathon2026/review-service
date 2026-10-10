@@ -1,0 +1,51 @@
+# 카나리 단계에서 새 버전이 멀쩡한지 재는 분석.
+#
+# 앱을 직접 불러 응답 내용을 본다. 10초마다 6번(약 60초) 재고, 기준을 넘으면
+# Argo Rollouts 가 배포를 중단하고 이전 버전으로 되돌린다.
+#
+# 🔵 이것은 **Prometheus 가 없는 환경용** 기본 분석이다 (로컬 k3s · GCP GKE).
+# 앱 응답만 본다. Prometheus 가 있는 환경은 ../prometheus/ 를 쓴다 — 에러율 지표가 더 있다.
+# Argo CD Application 이 환경에 맞는 쪽을 두 번째 소스로 가져간다.
+#
+# ⚠️ URL 은 반드시 FQDN 이어야 한다. web 프로바이더는 argo-rollouts 컨트롤러 파드에서
+# 실행되므로 짧은 이름 sample-app 은 argo-rollouts 네임스페이스에서 찾다가 실패한다.
+#   실측: dial tcp: lookup sample-app ... no such host  →  카나리 배포가 전부 중단됨
+# 네임스페이스가 박혀 있다. 명세의 target.namespace 를 바꾸면 이 값도 같이 바꿔야 한다.
+# aws·local·gcp overlay 모두 sample-app 을 쓰고 있어 지금은 하나로 충분하다.
+#
+# ⚠️ failureLimit 과 consecutiveErrorLimit 은 다르다 (실측으로 확인).
+#   Failed = successCondition 이 거짓      → failureLimit 적용
+#   Error  = 측정 자체가 안 됨(연결 실패,
+#            5xx, 기대한 JSON 필드 없음)   → consecutiveErrorLimit 적용 (기본 4)
+# 앱이 500 을 주면 body 에 app 필드가 없어 Error 로 잡히므로 둘 다 낮춰야 한다.
+#
+# 이 분석이 잡는 것과 못 잡는 것
+#   잡는다   파드는 Ready 인데 응답이 계속 틀린 경우 (잘못된 이미지, 설정 오류)
+#   이미 있다 readiness 실패는 Rollouts 가 progressDeadline 으로 되돌린다 (10/7 검증)
+#   못 잡는다 일부 요청만 실패하는 부분 에러율. Service 가 카나리·안정 파드를 함께
+#            가리켜 요청이 번갈아 가므로 연속 오류가 잘 안 생긴다
+#            → 그래서 error-rate 를 더했다 (이슈 #24)
+#
+# Service 가 양쪽을 함께 가리키는 건 의도한 것이다. canaryService·stableService 를 쓰면
+# ALB 가 안정 Service 만 보게 되어 "절반이 새 버전을 본다"가 깨진다.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: sample-app-health
+spec:
+  # Rollout 이 canary-hash 를 넘긴다. 여기서는 쓰지 않지만, 선언해 두지 않으면
+  # 넘어온 값이 갈 곳이 없다. ../prometheus/ 쪽과 모양을 맞춰 둔다.
+  args:
+    - name: canary-hash
+  metrics:
+    - name: api-ok
+      interval: 10s
+      count: 6
+      failureLimit: 1              # 2번째 Failed 에서 중단
+      consecutiveErrorLimit: 2     # 3번 연속 Error 에서 중단
+      provider:
+        web:
+          url: http://sample-app.sample-app.svc.cluster.local/api/info
+          timeoutSeconds: 5
+          jsonPath: "{$.app}"
+      successCondition: result == "sample-app"

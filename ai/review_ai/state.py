@@ -113,6 +113,7 @@ class HumanDecision(TypedDict):
 
 class ReviewState(TypedDict, total=False):
     review_id: str
+    deployment_request_id: str | None
     target_env: TargetEnv
     spec_ref: dict[str, str]  # {repository, commit, path}
     deploy_spec: dict[str, Any]  # 워커가 baseline 까지 채운 명세 (dict)
