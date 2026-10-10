@@ -83,7 +83,7 @@ def test_only_verified_fix_conditions_suppress_repeat_warning():
 async def test_case_advice_never_requires_static_findings_and_reports_search_failure():
     class Repo:
         async def find_failure_cases(self, **kwargs):
-            assert kwargs == dict(app="app", repository="org/app", target_env="gcp")
+            assert kwargs == dict(app="app", repository="org/app", target_env="gcp", limit=50)
             return [case()]
     result = await case_advice(Repo(), SPEC, "org/app")
     assert result["status"] == "completed" and result["items"][0]["case_id"] == "case1"
@@ -104,3 +104,42 @@ def test_error_redaction_and_multiple_evidence_sources():
         config_value(SPEC, "/runtime/env/PASSWORD")
     with pytest.raises(ValueError):
         config_value(SPEC, "/runtime/health")
+
+
+@pytest.mark.asyncio
+async def test_observation_requires_verified_nonempty_changed_conditions():
+    c = case()
+    class Repo:
+        async def find_failure_cases(self, **kwargs):
+            return [c]
+    assert (await case_advice(Repo(), SPEC, "org/app"))["observation"]["match_count"] == 0
+    c["resolution"] = dict(confirmed_by="review-api-operator", success_event_id="success",
+                           cause="fixed", conditions=[])
+    assert (await case_advice(Repo(), SPEC, "org/app"))["observation"]["match_count"] == 0
+    c["resolution"]["conditions"] = [dict(path="/runtime/health/readiness", failed_value="/wrong", resolved_value="/ready")]
+    observed = (await case_advice(Repo(), SPEC, "org/app"))["observation"]
+    assert observed["matched_case_ids"] == ["case1"] and observed["enforcement_ready"] is False
+    fixed = copy.deepcopy(SPEC)
+    fixed["runtime"]["health"]["readiness"] = "/ready"
+    assert (await case_advice(Repo(), fixed, "org/app"))["observation"]["match_count"] == 0
+    c["resolution"]["conditions"][0]["resolved_value"] = "/wrong"
+    assert (await case_advice(Repo(), SPEC, "org/app"))["observation"]["match_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_observation_scans_beyond_display_limit_and_reports_search_cap():
+    cases = [{**case(), "case_id": str(i)} for i in range(50)]
+    cases[-1]["resolution"] = dict(confirmed_by="review-api-operator", success_event_id="success", cause="fixed",
+        conditions=[dict(path="/runtime/health/readiness", failed_value="/wrong", resolved_value="/ready")])
+    class Repo:
+        async def find_failure_cases(self, **kwargs):
+            return cases
+    result = await case_advice(Repo(), SPEC, "org/app")
+    assert len(result["items"]) == 5
+    assert result["observation"]["matched_case_ids"] == ["49"]
+    assert not result["observation"]["search_complete"]
+    class Down:
+        async def find_failure_cases(self, **kwargs):
+            raise ConnectionError()
+    unavailable = (await case_advice(Down(), SPEC, "org/app"))["observation"]
+    assert unavailable["status"] == "unavailable" and unavailable["match_count"] is None

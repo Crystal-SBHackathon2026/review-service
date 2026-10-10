@@ -113,11 +113,12 @@ def route_after_judge(state: dict[str, Any]) -> str:
     return END
 
 
-def build_graph(llm: LlmClient | None, retriever: Retriever) -> Any:
+def build_graph(llm: LlmClient | None, retriever: Retriever, *, deterministic_fixes: bool = False,
+                strict_citations: bool = False) -> Any:
     graph = StateGraph(ReviewState)
     graph.add_node("static_check", make_static_check())
     graph.add_node("retrieve_evidence", make_retrieve_evidence(retriever))
-    graph.add_node("judge", make_judge(llm))
+    graph.add_node("judge", make_judge(llm, deterministic_fixes=deterministic_fixes, strict_citations=strict_citations))
     graph.add_node("apply_patch", apply_patch)
     graph.add_node("apply_human_edits", apply_human_edits)
     graph.add_conditional_edges(START, route_start, ["apply_human_edits", "static_check"])
@@ -149,11 +150,14 @@ def initial_state(deploy_spec: dict[str, Any], *, review_id: str, spec_ref: dict
     )
 
 
-async def run_graph(state: ReviewState, *, llm: LlmClient | None, retriever: Retriever) -> dict[str, Any]:
+async def run_graph(state: ReviewState, *, llm: LlmClient | None, retriever: Retriever,
+                    deterministic_fixes: bool = False, strict_citations: bool = False) -> dict[str, Any]:
     """최종 State + status(verdict) + applied_ops(원본에 적용할 ops) + patched(ops 가 하나라도 있는지).
 
     고쳐서 통과 = status == "pass" and patched. 수정 없이 통과면 applied_ops == [] 이다.
     """
-    final = await build_graph(llm, retriever).ainvoke(state, {"recursion_limit": RECURSION_LIMIT})
+    final = await build_graph(llm, retriever, deterministic_fixes=deterministic_fixes,
+                             strict_citations=strict_citations).ainvoke(
+        state, {"recursion_limit": RECURSION_LIMIT})
     ops = applied_ops(final)
     return {**final, "applied_ops": ops, "patched": bool(ops)}  # status 는 judge 가 verdict 로 채운다

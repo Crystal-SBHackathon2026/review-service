@@ -106,6 +106,22 @@ async def test_static_pass_still_runs_case_advice_and_keeps_original_verdict(har
     assert row["verdict"] == "pass"
     assert row["case_advice"]["status"] == "completed"
     assert row["case_advice"]["items"][0]["applicability"] == "applicable"
+    assert row["decision"]["failure_case_observation"]["mode"] == "observe"
+
+
+async def test_verified_failure_recurrence_only_records_metadata(harness):
+    spec = load_sample("01-pass-sample-app-aws.yaml")
+    path = "/runtime/health/readiness"
+    await harness.repo.save_failure_case(dict(case_id="verified", app=spec["metadata"]["name"],
+        repository=spec["metadata"]["repository"], target_env=spec["target"]["env"], failed_spec=spec,
+        diagnosis=dict(summary="과거 probe", spec_paths=[path], hypotheses=[])))
+    await harness.repo.confirm_resolution("verified", dict(cause="fixed", actions=["probe 경로 수정"],
+        success_event_id="success", confirmed_by="review-api-operator",
+        conditions=[dict(path=path, failed_value=spec["runtime"]["health"]["readiness"], resolved_value="/ready")]))
+    await harness.request(spec)
+    row = harness.row()
+    assert row["verdict"] == "pass" and row["reasons"] == [] and row["status"] == "waiting_ci"
+    assert row["decision"]["failure_case_observation"]["matched_case_ids"] == ["verified"]
 
 
 async def test_case_advice_recompares_final_spec_after_existing_auto_fix(harness):

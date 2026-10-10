@@ -17,12 +17,13 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from review_ai.judge.deterministic import VERSION as DETERMINISTIC_VERSION, deterministic_review
 from review_ai.judge.llm import LlmClient, LlmRefused, LlmUnavailable
 from review_ai.judge.prompt import PROMPT_VERSION, build_request
 from review_ai.judge.schema import LlmItem, LlmReview
-from review_ai.judge.validate import validate_output
+from review_ai.judge.validate import citation_evidence, citations_ok, validate_output
 from review_ai.recommendations import build_recommendations, unverified_recommendations
-from review_ai.state import Finding
+from review_ai.state import Doc, Finding
 from review_ai.verdict import Validation, decide_verdict
 
 Node = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -30,8 +31,10 @@ log = logging.getLogger(__name__)
 SKIP = Validation(llm_available=False, schema_ok=True, citations_ok=True, patch_scope_ok=True)
 
 
-def _warning_review(findings: list[Finding]) -> LlmReview:
-    items = [LlmItem(finding_id=f["finding_id"], cited_rule_ids=[f["rule_id"]], why=f"경고: {f['title']}", fix_kind="none")
+def _warning_review(findings: list[Finding], docs: list[Doc]) -> LlmReview:
+    items = [LlmItem(finding_id=f["finding_id"], cited_rule_ids=[f["rule_id"]],
+                    cited_chunk_ids=[d["chunk_id"] for d in docs if d["doc_type"] == "rule"
+                                     and d["rule_id"] == f["rule_id"]][:1], why=f"경고: {f['title']}", fix_kind="none")
              for f in findings]
     return LlmReview(items=items)
 
@@ -42,6 +45,16 @@ def _result(state: dict[str, Any], review: LlmReview | None, validation: Validat
                               rounds=state.get("rounds") or [], llm_meta=meta, autofix_allowed=autofix_allowed(state),
                               spec_unverified=spec_unverified(state))
     verdict = decision["verdict"]
+    if review is not None and validation.get("schema_ok") and validation.get("citations_ok"):
+        evidence = citation_evidence(review, state.get("retrieved_docs") or [])
+        chunk_verified = validation.get("chunk_citations_ok")
+        if chunk_verified is None:
+            chunk_verified = citations_ok(review, state.get("findings") or [], state.get("retrieved_docs") or [])
+        for item in decision["items"]:
+            item["evidence"] = evidence[item["finding_id"]]
+            item["citation_status"] = "chunk_verified" if chunk_verified else "rule_only"
+    if patch is not None:
+        decision["patch_source"] = "deterministic" if validation.get("deterministic_available") else "llm"
     trusted_patch = patch if validation.get("schema_ok") and validation.get("citations_ok") else None
     decision["recommendations"] = build_recommendations(state["deploy_spec"], state.get("findings") or [], trusted_patch)
     if spec_unverified(state):
@@ -63,13 +76,20 @@ def judge_unavailable(state: dict[str, Any], error: str = "llm_not_configured") 
     return _result(state, None, Validation(llm_available=False), {"error": error})
 
 
-def make_judge(llm: LlmClient | None) -> Node:
+def make_judge(llm: LlmClient | None, *, deterministic_fixes: bool = False, strict_citations: bool = False) -> Node:
     async def judge(state: dict[str, Any]) -> dict[str, Any]:
         findings: list[Finding] = state.get("findings") or []
         if not findings:
             return _result(state, None, SKIP, None)
         if all(f["severity"] == "low" for f in findings):
-            return _result(state, _warning_review(findings), SKIP, None)
+            return _result(state, _warning_review(findings, state.get("retrieved_docs") or []), SKIP, None)
+        if deterministic_fixes and autofix_allowed(state) and not spec_unverified(state):
+            deterministic = deterministic_review(state["deploy_spec"], findings, state.get("retrieved_docs") or [])
+            if deterministic is not None:
+                review, patch = deterministic
+                validation = Validation(llm_available=False, deterministic_available=True, schema_ok=True,
+                                        citations_ok=True, chunk_citations_ok=True, patch_scope_ok=True)
+                return _result(state, review, validation, {"source": "deterministic", "version": DETERMINISTIC_VERSION}, patch)
         if llm is None:
             log.warning("review %s: LLM 클라이언트 없음 → LLM_UNAVAILABLE", state.get("review_id"))
             return judge_unavailable(state)
@@ -85,7 +105,9 @@ def make_judge(llm: LlmClient | None) -> Node:
             log.warning("review %s: 모델 거절 → CITATION_INVALID", state.get("review_id"))
             invalid = Validation(llm_available=True, schema_ok=False, citations_ok=False, patch_scope_ok=False)
             return _result(state, None, invalid, {**meta, "refused": True})
-        review, validation, patch = validate_output(response.text, findings, docs, state["deploy_spec"])
+        review, validation, patch = validate_output(response.text, findings, docs, state["deploy_spec"],
+                                                   strict_citations=strict_citations)
+        meta["citation_mode"] = "strict" if strict_citations else "compatible"
         meta = {**meta, "model": response.model, "usage": response.usage, "stop_reason": response.stop_reason}
         if not (validation.get("schema_ok") and validation.get("citations_ok") and validation.get("patch_scope_ok")):
             log.warning("review %s: LLM 출력 검증 실패 %s (stop_reason=%s)", state.get("review_id"),

@@ -51,6 +51,7 @@ async def main() -> None:
     parser.add_argument("--retriever", choices=["file", "qdrant"], default="file")
     parser.add_argument("--qdrant-url", default=None)
     parser.add_argument("--only", default=None, help="케이스 id 접두사")
+    parser.add_argument("--strict-citations", action="store_true", help="자기 규칙 문서 조각 인용을 필수로 검사")
     args = parser.parse_args()
 
     if args.llm == "claude":
@@ -68,7 +69,7 @@ async def main() -> None:
             continue
         times = args.repeat if case["llm"] == REVIEWER else 1
         for _ in range(times):
-            result = await run_case(case, reviewer, retriever, repairer)
+            result = await run_case(case, reviewer, retriever, repairer, strict_citations=args.strict_citations)
             results.append(result)
             mark = "OK " if result.ok else "FAIL"
             print(f"{mark} {case['id']:<40} {result.verdict:<12} {','.join(result.reasons) or '-':<30} "
@@ -78,7 +79,7 @@ async def main() -> None:
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     out_dir = ROOT / "eval" / "reports"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{args.llm}.json"
+    out = out_dir / f"{datetime.now():%Y%m%d-%H%M%S-%f}-{args.llm}.json"
     out.write_text(json.dumps({"args": vars(args), "summary": summary, "results": [asdict(r) for r in results]},
                               ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"→ {out.relative_to(ROOT)}")

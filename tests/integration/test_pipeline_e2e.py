@@ -524,6 +524,11 @@ async def test_deployment_api_kafka_analysis_and_verified_next_request(pool):
             advice = await case_advice(PostgresReviewRepository(pool), fixed_spec, REPO)
             resolved = next(a for a in advice["items"] if a["case_id"] == eid)
             assert resolved["applicability"] == "resolved" and resolved["actions"] == []
+            assert advice["observation"]["match_count"] == 0
+            recurrence = await case_advice(PostgresReviewRepository(pool), failed_spec, REPO)
+            assert recurrence["observation"]["matched_case_ids"] == [eid]
+            await repo.update_review("rv_failed", decision={"failure_case_observation": recurrence["observation"]})
+            assert (await repo.get_review("rv_failed"))["decision"]["failure_case_observation"]["match_count"] == 1
             assert (await repo.get_review("rv_failed"))["status"] == "committed"
     finally:
         await consumer.stop(); await producer.stop()
@@ -616,3 +621,23 @@ async def test_last_deploy_state_decides_baseline_on_postgres(pool):
     assert not (await legacy("Healthy")).get("duplicate")
     assert (await repo.get_baseline("sample-app", "aws"))["merge_sha"] == "b"*40
     assert await repo.has_failed_deployment("rv_flap")  # 해결 근거 자격은 '한 번이라도'를 유지
+
+
+async def test_chunk_evidence_and_deterministic_source_persist_without_migration(pool):
+    from review_ai.graph import initial_state, run_graph
+    from review_api.progress import build_progress, ProgressSettings
+    spec = yaml.safe_load((SAMPLES / '07-fix-public-bucket.yaml').read_text())
+    final = await run_graph(initial_state(spec, review_id='rv_evidence'), llm=None,
+                            retriever=FileRetriever(), deterministic_fixes=True, strict_citations=True)
+    repo = PostgresReviewRepository(pool)
+    await repo.insert_review(review_id='rv_evidence', app=spec['metadata']['name'], target_env='aws', repo_id=REPO,
+                            spec_ref={'repository': REPO, 'commit': HEAD, 'path': 'deploy.yaml'},
+                            pr_head_sha=HEAD, requested_by='it')
+    await repo.update_review('rv_evidence', status='waiting_ci', verdict='pass', decision=final['decision'],
+                             rounds=final['rounds'], findings=final['findings'], final_spec=final['deploy_spec'])
+    recreated = PostgresReviewRepository(pool)
+    progress = await build_progress(recreated, 'rv_evidence', ProgressSettings())
+    snapshot = progress['history'][0]['rounds'][0]
+    assert snapshot['patch_source'] == 'deterministic'
+    evidence = snapshot['items'][0]['evidence'][0]
+    assert evidence['rule_id'] == 'STO-003' and evidence['excerpt'] and len(evidence['content_hash']) == 64

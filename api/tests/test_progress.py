@@ -492,3 +492,23 @@ def test_settings_from_env() -> None:
     assert settings.deploy_envs == ("aws", "local")
     assert settings.planned_envs == ()
     assert ProgressSettings.from_env({}).planned_envs == ("gcp",)
+
+
+async def test_history_preserves_chunk_evidence_and_legacy_items(env: Env) -> None:
+    evidence = {"chunk_id": "rules/any/STO-003.md#0", "rule_id": "STO-003", "doc_type": "rule",
+                "source_uri": "rules/any/STO-003.md", "excerpt": "공개 버킷을 비공개로 유지합니다.",
+                "content_hash": "a" * 64, "truncated": False}
+    finding = {"finding_id": "bucket", "rule_id": "STO-003", "severity": "high", "title": "공개 버킷",
+               "location": {"spec_path": "/storage/buckets/0/public"}}
+    current = {"finding_id": "bucket", "why": "규칙에 따라 공개를 끕니다.", "cited_rule_ids": ["STO-003"],
+               "cited_chunk_ids": [evidence["chunk_id"]], "evidence": [evidence], "citation_status": "chunk_verified"}
+    rid = await env.review("rv_evidence", head="a" * 40, status="needs_human", verdict="needs_human",
+                           findings=[finding], decision={"items": [current]},
+                           rounds=[{"round": 0, "findings": [finding], "items": [current], "verdict": "fix",
+                                    "patch_source": "deterministic", "doc_ids": [evidence["chunk_id"]]}])
+    report = env.progress(rid)["history"][0]
+    assert report["items"][0]["evidence"] == [evidence]
+    assert report["rounds"][0]["patch_source"] == "deterministic"
+    legacy = {"finding_id": "bucket", "why": "기존 설명", "cited_rule_ids": ["STO-003"]}
+    await env.repo.update_review(rid, decision={"items": [legacy]}, rounds=[])
+    assert env.progress(rid)["history"][0]["items"] == [legacy]
