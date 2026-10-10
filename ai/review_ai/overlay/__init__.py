@@ -66,6 +66,13 @@ def _warnings(spec: AppSpec, caps: TargetCaps) -> list[RenderWarning]:
                 "VOLUME_UNSUPPORTED",
                 f"{caps.env}: 볼륨 {v.name} ({v.access_mode}) 를 만들 수 없다 — 지원 접근 모드: {supported} (STO-001)",
             ))
+    retained = [f"{v.name} {v.size}" for v in spec.storage.volumes if v.persistent]
+    if retained and caps.volume_reclaim_policy == "Retain":
+        out.append(RenderWarning(
+            "VOLUME_RETAINED",
+            f"{caps.env}: PVC [{', '.join(retained)}] 는 {caps.storage_class or '기본 클래스'}(Retain) — "
+            "PVC 를 지워도 PV·디스크와 과금이 남는다. 정리는 사람이 한다",
+        ))
     return out
 
 
@@ -86,7 +93,7 @@ def render_overlay(spec: AppSpec, *, apps_root: str = "apps") -> RenderedOverlay
     for v in spec.storage.volumes:
         if v.persistent:
             filename = f"pvc-{v.name}.yaml"
-            files[filename] = dump_with_header(pvc(spec, v.name), HEADER)
+            files[filename] = dump_with_header(pvc(spec, v.name, caps.storage_class), HEADER)
             resources.append(filename)
     if spec.rollout.strategy == "bluegreen":
         files["service-preview.yaml"] = dump_with_header(preview_service(spec), HEADER)

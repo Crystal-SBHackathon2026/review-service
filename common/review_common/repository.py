@@ -235,9 +235,10 @@ class ReviewRepository(Protocol):
         ...
 
     async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
-        """older_than 보다 오래 processing 인 행(처리 중 파드가 죽은 것)을 가져가며 updated_at 을 새로 찍는다.
+        """older_than 보다 오래 processing 인 행(처리 중 파드가 죽은 것)을 가져가며 updated_at 을 새로 찍고
+        attempts 를 1 올린다 (insert_intake 가 1 로 넣는다). 돌려주는 행의 attempts 는 올린 뒤 값이다.
 
-        API 가 여러 개여도 한 행은 한 곳만 가져간다."""
+        API 가 여러 개여도 한 행은 한 곳만 가져간다. 상한을 넘었는지는 호출하는 쪽(intake)이 판단한다."""
         ...
 
     # --- review_cases ---
@@ -490,8 +491,8 @@ class PostgresReviewRepository:
 
     async def claim_stale_intakes(self, older_than: timedelta) -> list[dict[str, Any]]:
         rows = await self._fetchall(
-            "UPDATE spec_intakes SET updated_at = now() WHERE status = 'processing' AND updated_at < now() - %s"
-            " RETURNING *", (older_than,))
+            "UPDATE spec_intakes SET updated_at = now(), attempts = attempts + 1"
+            " WHERE status = 'processing' AND updated_at < now() - %s RETURNING *", (older_than,))
         return sorted(rows, key=lambda r: r["created_at"])
 
     async def insert_case(self, **case: Any) -> bool:
@@ -687,7 +688,8 @@ class InMemoryReviewRepository:
         now = _now()
         self.intakes[intake["intake_id"]] = {
             **copy.deepcopy(intake), "status": "processing", "reason": None, "message": None, "details": [],
-            "result_commit_sha": None, "review_id": None, "baseline_used": None, "created_at": now, "updated_at": now,
+            "result_commit_sha": None, "review_id": None, "baseline_used": None, "attempts": 1, "created_at": now,
+            "updated_at": now,
         }
         return True
 
@@ -741,7 +743,7 @@ class InMemoryReviewRepository:
         now = _now()
         rows = [r for r in self.intakes.values() if r["status"] == "processing" and r["updated_at"] < now - older_than]
         for r in rows:
-            r["updated_at"] = now
+            r.update(updated_at=now, attempts=r["attempts"] + 1)
         return copy.deepcopy(sorted(rows, key=lambda r: r["created_at"]))
 
     async def insert_case(self, **case: Any) -> bool:

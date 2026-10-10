@@ -29,6 +29,7 @@ WEBHOOK_EVENTS = Counter("review_webhook_events", "웹훅 처리 결과", ["even
 SWEEP_RECOVERED = Counter("review_sweep_recovered", "review sweep 이 회수한 검토 (가져갈 때의 상태)", ["from_status"])
 SWEEP_FAILED = Counter("review_sweep_failed", "회수 3번을 넘어 failed 로 끝낸 검토")
 INTAKE_SWEEP_RECOVERED = Counter("review_intake_sweep_recovered", "intake sweep 이 다시 처리한 processing intake")
+INTAKE_SWEEP_FAILED = Counter("review_intake_sweep_failed", "처리 시도 3번을 넘어 failed(RETRY_EXHAUSTED)로 끝낸 intake")
 
 UNTRACKED_ROUTES = frozenset({"/metrics", "/healthz", "/readyz"})
 WEBHOOK_RESULTS = ("started", "intake", "skipped", "duplicate", "rejected", "error")
