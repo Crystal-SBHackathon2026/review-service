@@ -52,13 +52,20 @@ targets:
     # - 노출 경로: overlay 는 public 값과 무관하게 같은 Traefik Ingress 를 만든다(NET-003). 내부 전용은 터널 ingress·
     #   라우터 포트포워딩·NodePort 가 지킨다
     # - 백업: 관리형 DB·볼륨 스냅샷이 없다. 클러스터 안 DB 는 직접 밖으로 백업한다(DB-010)
-    verified: false
-    arch: [amd64]                  # busan-local 노드 아키텍처 확인 필요
+    # 2026-10-10 실측 (Slack, 이성진): k3d crystal-busan · k3s v1.35.5+k3s1 · 노드 2대(server+agent, WSL2 위 컨테이너)
+    # · 노드당 CPU 8·메모리 7.6Gi · Argo CD v3.5.4·Argo Rollouts v1.10.0 · Prometheus 없음(monitoring namespace 없음)
+    # → 카나리 분석은 api-ok 만, error-rate 는 aws 에서만 돈다.
+    verified: true
+    arch: [amd64]                  # 2026-10-10 실측 (containerd 2.2.3)
     database:
       in-cluster: {postgres: ["16"]}
       volume: {sqlite: []}
       external: {postgres: [], mysql: []}
-    volume_access_modes: [ReadWriteOnce]           # k3s local-path
+    # k3s 기본 클래스 local-path (WaitForFirstConsumer·RWO, 128Mi PVC Bound·쓰기 실측). storage_class 는 비워 기본 클래스를 쓴다.
+    # PV 가 노드 로컬 디스크라 처음 뜬 노드에 묶인다 — canary 의 새 Pod 도 같은 노드에만 뜬다(렌더러 같은 노드 affinity 와 같은 결과).
+    volume_access_modes: [ReadWriteOnce]
+    # reclaimPolicy Delete — PVC 를 지우면 데이터도 사라진다(aws 의 Retain 과 반대). 그래서 VOLUME_RETAINED 경고는 붙지 않는다.
+    volume_reclaim_policy: Delete
     secret_sources: [k8s-secret, generated]
     ingress:
       class: traefik               # k3s 기본
