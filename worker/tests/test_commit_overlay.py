@@ -76,6 +76,25 @@ async def test_수정_없이_통과하면_원본_그대로_커밋한다():
 
 
 @pytest.mark.asyncio
+async def test_gcp_public_service_is_preserved_and_removal_blocks():
+    git = FakeGit("01-pass-sample-app-aws.yaml")
+    spec = yaml.safe_load(git.raw)
+    spec["target"] = dict(env="gcp", region="asia-northeast1", namespace="sample-app")
+    spec["network"] = dict(service=dict(type="LoadBalancer", public=True))
+    git.raw = yaml.safe_dump(spec)
+    git.existing = ["kustomization.yaml", "service-public.yaml"]
+    assert await make_overlay_guard(git)(state("gcp")) is None
+    assert (await make_commit_overlay(git)(state("gcp")))["deploy_result"]["status"] == "committed"
+    assert "service-public.yaml" in git.commits[0][1]
+    git.commits.clear()
+    spec["network"] = {}
+    git.raw = yaml.safe_dump(spec)
+    assert await make_overlay_guard(git)(state("gcp")) == "OVERLAY_RESOURCE_REMOVED: service-public.yaml"
+    assert (await make_commit_overlay(git)(state("gcp")))["deploy_result"]["status"] == "blocked"
+    assert not git.commits
+
+
+@pytest.mark.asyncio
 async def test_overlay_에_이미지가_들어가지_않는다():
     """이미지 태그는 CI 가 base 의 newTag 로 정한다. overlay 가 덮으면 갱신이 무시된다."""
     git = FakeGit("01-pass-sample-app-aws.yaml")

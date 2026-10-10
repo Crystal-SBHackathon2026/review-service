@@ -269,6 +269,28 @@ async def test_protected_ingress_removal_blocks_before_merge():
 
 
 @pytest.mark.asyncio
+async def test_gcp_public_service_survives_multi_target_commit_and_cannot_disappear():
+    s = System(("gcp",))
+    spec = yaml.safe_load(s.gh.files[(HEAD, "deploy/gcp.yaml")])
+    spec["network"] = dict(service=dict(type="LoadBalancer", public=True))
+    spec["rollout"] = dict(strategy="bluegreen", auto_promotion=False)
+    s.gh.files[(HEAD, "deploy/gcp.yaml")] = yaml.safe_dump(spec)
+    rid = await s.start()
+    await s.work()
+    await s.coordinator.advance(rid)
+    snap = s.gh.snapshots[s.gh.gitops_head]
+    path = "apps/sample-app/overlays/gcp/service-public.yaml"
+    assert yaml.safe_load(snap[path])["spec"]["type"] == "LoadBalancer"
+    assert (await s.repo.get_request(rid))["state"] == "committed"
+    # Same deployed snapshot, subsequent PR accidentally omits the public-service contract.
+    spec["network"] = {}
+    from review_common.github import ProtectedFileRemoval
+    with pytest.raises(ProtectedFileRemoval):
+        await s.gitops.plan({"gcp": AppSpec.model_validate(spec)},
+            [dict(env="gcp", region="asia-northeast1", cluster="tokyo-gke")], MERGE)
+
+
+@pytest.mark.asyncio
 async def test_duplicate_requests_and_concurrent_advances_are_idempotent():
     s = System()
     ids = await asyncio.gather(s.start(), s.start())

@@ -76,6 +76,26 @@ async def deployment_summary(repo, row):
             "analysis_status": latest["analysis_status"] if latest else None}
 
 
+async def failure_case_history(repo, row):
+    """공개 진행 화면에는 저장 여부만 제공한다. 명세·진단·해결 내용은 운영자 API에서 읽는다."""
+    events = await repo.list_deployments(row["review_id"], limit=10)
+    result = []
+    repository = (row.get("spec_ref") or {}).get("repository")
+    for event in events:
+        if (event["kind"] not in {"degraded", "sync_failed"}
+                or event.get("review_id") != row["review_id"]
+                or (event.get("app"), event.get("repository"), event.get("target_env"))
+                   != (row["app"], repository, row["target_env"])):
+            continue
+        case = await repo.get_failure_case(event["event_id"])
+        saved = bool(case and (case.get("app"), case.get("repository"), case.get("target_env"))
+                     == (row["app"], repository, row["target_env"]))
+        result.append({"event_id": event["event_id"], "env": event["target_env"],
+                       "kind": event["kind"], "occurred_at": event.get("occurred_at"),
+                       "analysis_status": event.get("analysis_status"), "saved": saved})
+    return result
+
+
 def _envs(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
     if raw is None:
         return default
@@ -474,6 +494,7 @@ async def build_progress(repo: ReviewRepository, review_id: str, settings: Progr
         "chain": [{"review_id": r["review_id"], "status": r["status"], "verdict": r["verdict"],
                    "created_at": r["created_at"], "autofix": _is_autofix(r)} for r in chain],
         "history": review_history(chain, row),
+        "failure_cases": await failure_case_history(repo, row),
         "latest_review_id": latest_review_id,
         "intake": intake,
         "steps": build_steps(row, chain, intake, cards),
