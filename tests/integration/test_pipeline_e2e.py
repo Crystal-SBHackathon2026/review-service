@@ -562,8 +562,32 @@ async def test_cross_env_baseline_isolation_and_progress_on_postgres(pool):
     local["event_type"] = "deployed"; local["operation"]["phase"] = "Succeeded"
     await handle_deploy_event(repo, ArgoCdEvent.model_validate(local))
     progress = await build_progress(repo, "rv_scope", ProgressSettings())
-    assert next(s for s in progress["steps"] if s["key"] == "deploy")["state"] == "failed"
+    # 다른 환경 healthy 로 done 이 되지 않는다 — 대상 실패가 보이는 부분 완료
+    assert next(s for s in progress["steps"] if s["key"] == "deploy")["state"] == "partial"
     assert progress["review"]["deployment"]["status"] == "failed"
+
+
+async def test_failure_on_image_tag_revision_links_by_image_on_postgres(pool):
+    """rv_20261010_fb27c6bf — overlay 커밋 f316634 뒤 이미지 태그 커밋 f817924 의 Degraded 를 이미지 태그로 잇는다.
+    Rollout 중단 payload 는 진행 화면까지 간다 (deploy_events.payload)."""
+    from review_api.argocd import ArgoCdEvent, handle_deploy_event
+    from review_api.progress import build_progress, ProgressSettings
+    repo = PostgresReviewRepository(pool)
+    await seed_deployment_review(repo, "rv_stable", "a"*40)
+    await seed_deployment_review(repo, "rv_20261010_fb27c6bf", "b"*40)
+    await repo.update_review("rv_20261010_fb27c6bf", gitops_commit_sha="f316634" + "0"*33)
+    body = deployment_payload("health_degraded", revision="f817924" + "0"*33)
+    body.update(health="Degraded", revision="f817924" + "0"*33,
+                images=["ghcr.io/org/sample-app:" + "a"*7, "ghcr.io/org/sample-app:" + "b"*7],
+                resources=[{"kind": "Rollout", "name": "sample-app", "health": {
+                    "status": "Degraded", "message": "RolloutAborted: Rollout aborted update to revision 3"}}])
+    result = await handle_deploy_event(repo, ArgoCdEvent.model_validate(body))
+    assert result["review_id"] == "rv_20261010_fb27c6bf" and result["linked"]
+    assert await repo.is_deployment_failing("rv_20261010_fb27c6bf")
+    assert not await repo.is_deployment_failing("rv_stable")
+    progress = await build_progress(repo, "rv_20261010_fb27c6bf", ProgressSettings())
+    target = next(c for c in progress["envs"] if c["is_target"])
+    assert target["deploy"]["rollout_aborted"] and target["deploy"]["serving_tag"] == "a"*7
 
 
 async def test_last_deploy_state_decides_baseline_on_postgres(pool):

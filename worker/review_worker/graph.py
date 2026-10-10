@@ -444,6 +444,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             pull = await _open_pull(ref)  # 병합 직전에 PR 을 다시 읽는다
             if is_fork_pull(pull, ref["repository"]):
                 raise GitHubError(f"fork PR — PR #{pull['number']} 은 포크 브랜치라 병합하지 않는다")
+            if pull.get("draft"):  # GitHub 이 405 로 거절한다 — 부르지 않고 verify 성공도 쓰지 않는다
+                raise GitHubError(f"draft PR — PR #{pull['number']} 은 draft 라 병합하지 않는다")
             # 필수 체크라 success 가 없으면 GitHub 이 병합을 거절한다 — 병합 직전에 다시 쓴다
             if not await _verify_status(rid, ref, "success", "AI 검토 통과 — 병합", attempts=VERIFY_MAX_ATTEMPTS):
                 raise GitHubError(f"커밋 상태 {VERIFY_CONTEXT} 를 쓰지 못해 병합하지 않는다")

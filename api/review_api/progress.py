@@ -12,6 +12,9 @@ failed 는 어느 단계에서 났는지 저장하지 않아서 merge_sha·error
 
 환경 카드: DEPLOY_ENVS(실제, 기본 aws,local)와 PLANNED_ENVS(계획, 기본 gcp). 대상 환경은 렌더 결과(deploy_result)까지,
 다른 실제 환경은 배포 알림만 (review_api.argocd 의 cross_env 기록). 앱 주소는 APP_URLS (JSON {app: {env: url}}).
+
+Degraded 중 Argo Rollouts 자동 중단(카나리 분석 실패·progressDeadlineAbort)은 알림 payload 로 가른다 (rollout_abort).
+대상 환경만 실패하고 다른 환경은 Healthy 면 배포 단계는 partial (부분 완료).
 """
 
 from __future__ import annotations
@@ -221,6 +224,32 @@ def review_history(chain: list[dict[str, Any]], row: dict[str, Any]) -> list[dic
 
 # --- 환경 -----------------------------------------------------------------------------------------
 
+def _image_tag(image: Any) -> str | None:
+    last = str(image).split("@", 1)[0].rsplit("/", 1)[-1]
+    return last.rsplit(":", 1)[1] if ":" in last else None
+
+
+def rollout_abort(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Degraded 알림이 Argo Rollouts 자동 중단인지. 중단이면 {"serving_tag": 지금 서비스 중인 이전 버전 태그 | None}.
+
+    알림 payload 의 resources 는 Application status.resources 다. Argo CD(v3.5.4) Rollout 헬스 검사는 Rollout 의
+    status.phase·message 를 그대로 올린다 — 중단이면 health {status: Degraded, message: "RolloutAborted: Rollout aborted
+    update to revision N: …"}. Rollout 이 Degraded 여도 message 에 abort 가 없으면(형식 오류 등) 중단으로 보지 않는다.
+    이전 버전 태그는 images 중 이 검토의 태그(image_tag, 병합 SHA)가 아닌 것 — 중단 직후엔 새 태그도 같이 올 수 있다."""
+    payload = event.get("payload") or {}
+    if event.get("kind") != "degraded":
+        return None
+    messages = [str((r.get("health") or {}).get("message") or "") for r in payload.get("resources") or []
+                if isinstance(r, dict) and r.get("kind") == "Rollout"
+                and (r.get("health") or {}).get("status") == "Degraded"]
+    if not any("abort" in m.lower() for m in messages):
+        return None
+    mine = str(event.get("image_tag") or "").lower()
+    others = [t for t in map(_image_tag, payload.get("images") or [])
+              if t and not (mine and (mine.startswith(t.lower()) or t.lower().startswith(mine)))]
+    return {"serving_tag": others[0] if others else None}
+
+
 def env_cards(row: dict[str, Any], events: list[dict[str, Any]], settings: ProgressSettings) -> list[dict[str, Any]]:
     target = row["target_env"]
     latest: dict[str, dict[str, Any]] = {}
@@ -232,12 +261,12 @@ def env_cards(row: dict[str, Any], events: list[dict[str, Any]], settings: Progr
     cards: list[dict[str, Any]] = []
     for env in actual:
         event = latest.get(env)
-        card: dict[str, Any] = {
-            "env": env, "is_target": env == target,
-            "deploy": ({"kind": event["kind"], "image_tag": event["image_tag"], "received_at": event["received_at"]}
-                       if event else None),
-            "app_url": urls.get(env),
-        }
+        deploy = ({"kind": event["kind"], "image_tag": event["image_tag"], "received_at": event["received_at"]}
+                  if event else None)
+        abort = rollout_abort(event) if event else None
+        if deploy is not None and abort is not None:
+            deploy.update(rollout_aborted=True, serving_tag=abort["serving_tag"])
+        card: dict[str, Any] = {"env": env, "is_target": env == target, "deploy": deploy, "app_url": urls.get(env)}
         if env == target:
             result = row.get("deploy_result") or {}
             card["render"] = ({"status": result.get("status"), "reason": result.get("reason"),
@@ -287,7 +316,8 @@ def _human_detail(row: dict[str, Any]) -> str:
 
 
 def _deploy_state(cards: list[dict[str, Any]]) -> tuple[str, str, Any]:
-    """envs 중 하나라도 healthy 면 done, (healthy 없이) degraded 면 failed, 알림이 없으면 running."""
+    """대상 환경이 실패하면 failed — 다른 환경이 healthy 면 partial(부분 완료). 대상이 실패가 아니면
+    envs 중 하나라도 healthy 면 done, (healthy 없이) degraded 면 failed, 알림이 없으면 running."""
     real = [c for c in cards if not c.get("planned")]
     parts, healthy, degraded = [], [], []
     for card in real:
@@ -295,13 +325,16 @@ def _deploy_state(cards: list[dict[str, Any]]) -> tuple[str, str, Any]:
         if deploy is None:
             parts.append(f"{card['env']} 알림 대기")
             continue
-        parts.append(f"{card['env']} {HEALTH.get(deploy['kind'], deploy['kind'])}")
+        label = "자동 중단 → 이전 버전 유지" if deploy.get("rollout_aborted") else HEALTH.get(deploy["kind"], deploy["kind"])
+        parts.append(f"{card['env']} {label}")
         (healthy if deploy["kind"] == "healthy" else degraded).append(deploy["received_at"])
     detail = " · ".join(parts)
     target_failure = next((c["deploy"] for c in real if c.get("is_target") and c.get("deploy")
                            and c["deploy"]["kind"] in {"degraded", "sync_failed"}), None)
     if target_failure:
-        return "failed", detail, target_failure["received_at"]
+        others_healthy = any(not c.get("is_target") and c.get("deploy") and c["deploy"]["kind"] == "healthy"
+                             for c in real)
+        return "partial" if others_healthy else "failed", detail, target_failure["received_at"]
     if healthy:
         return "done", detail, min(healthy)
     if degraded:
