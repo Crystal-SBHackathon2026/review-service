@@ -35,6 +35,7 @@ from review_api.cases import record_degraded_case
 from review_common.repository import ReviewRepository
 
 KINDS = {"Healthy": "healthy", "Degraded": "degraded"}
+FAILURE_KINDS = frozenset({"health_degraded", "sync_failed"})
 
 
 async def latest_matching_review(repo: ReviewRepository, event: ArgoCdEvent, *,
@@ -119,11 +120,29 @@ async def match_versioned_event(repo, event):
     if row is None and is_verified_success(event):
         match = await latest_matching_review(repo, event, any_env=True)
         row = match[0] if match else None
+    if row is None and event.kind() in FAILURE_KINDS:
+        row = await failure_image_match(repo, event)
     if row and event.namespace:
         target = (row.get("final_spec") or {}).get("target") or {}
         if event.namespace != (target.get("namespace") or event.app):
             return None
     return row
+
+
+async def failure_image_match(repo, event):
+    """실패 알림(health_degraded·sync_failed)의 이미지 태그 → merge_sha 대체 매칭.
+
+    PR 하나에 gitops 리비전이 두 번 바뀐다 (overlay 커밋 → CI 이미지 태그 커밋). 두 번째 리비전의 실패는 revision 이
+    검토의 gitops_commit_sha 와 달라 revision 으로 못 찾는다 (rv_20261010_fb27c6bf: overlay f316634 → 이미지 f817924).
+    롤아웃 중 images 에는 옛 stable 태그도 같이 오므로, 고른 검토가 그 앱·환경에서 가장 최근에 병합한 검토일 때만 잇는다
+    — 새 태그가 없어 옛 검토만 맞으면 옛 stable 이 새 실패를 떠안는다."""
+    for any_env in (False, True):
+        match = await latest_matching_review(repo, event, any_env=any_env)
+        if match:
+            row = match[0]
+            newest = await repo.latest_merged_review(row["app"], row["target_env"])
+            return row if newest is not None and newest["review_id"] == row["review_id"] else None
+    return None
 
 
 async def store_observation(repo, event, row):
