@@ -10,7 +10,7 @@ targets:
   aws:
     # 2026-10-08 실측 (EKS 인계서 · Notion "배포 에이전트 설계" 6절): oneaction EKS 1.36,
     # t3.medium 2대(AL2023 x86_64), 애드온은 VPC CNI·kube-proxy·CoreDNS·Pod Identity Agent 4개뿐(Terraform 고정).
-    # 2026-10-10 갱신 (Slack, 이성진): EBS CSI 사용 가능 — StorageClass oneaction-monitoring-gp3(Retain)에
+    # 2026-10-10 갱신 (Slack, 박찬건): EBS CSI 사용 가능 — StorageClass oneaction-monitoring-gp3(Retain)에
     # Prometheus 10Gi·Grafana 2Gi PVC 가 Bound. 같은 클래스를 일반 앱 PVC 에도 쓴다.
     verified: true
     arch: [amd64]
