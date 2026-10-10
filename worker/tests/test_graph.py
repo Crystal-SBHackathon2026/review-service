@@ -458,6 +458,75 @@ async def test_invalid_unanswered_path_waits_and_next_answer_resumes(harness: Ha
     assert (fixed["database"]["engine"], fixed["database"]["version"]) == ("postgres", "16")
 
 
+# --- baselines 가 빈 환경(local·gcp — Argo 웹훅 없음): 마지막 committed 검토로 비교 ----------------------
+
+SAMPLE_02 = "02-pass-local-sqlite.yaml"
+
+
+def _without_sqlite_volume(spec: dict[str, Any]) -> dict[str, Any]:
+    out = {k: v for k, v in spec.items() if k not in ("database", "storage")}
+    return out | {"requirements": {"persistence": False}}
+
+
+async def _seed_committed(h: Harness, spec: dict[str, Any], review_id: str = "rv_20261008_prev",
+                          head: str = "c" * 40) -> None:
+    ref = {"repository": spec["metadata"]["repository"], "commit": head, "path": "deploy.yaml"}
+    await h.repo.insert_review(review_id=review_id, app=spec["metadata"]["name"], target_env=spec["target"]["env"],
+                               repo_id=ref["repository"], spec_ref=ref, pr_head_sha=head, requested_by="tester")
+    await h.repo.update_review(review_id, status="committed", final_spec=spec, merge_sha=head)
+
+
+async def test_local_volume_removal_without_baselines_row_needs_human(harness: Harness) -> None:
+    """local 은 Argo 웹훅이 닿지 않아 baselines 가 비어 있다 — 마지막 committed 검토의 명세로 STO-006 을 건다."""
+    sqlite = load_sample(SAMPLE_02)
+    await _seed_committed(harness, sqlite)
+    assert harness.repo.baselines == {}
+
+    await harness.request(_without_sqlite_volume(sqlite))
+
+    row = harness.row()
+    assert "STO-006" in {f["rule_id"] for f in row["findings"]}
+    assert row["status"] == "needs_human"
+    assert not harness.github.merged
+
+
+async def test_volume_removal_without_any_previous_deploy_is_not_flagged(harness: Harness) -> None:
+    await harness.request(_without_sqlite_volume(load_sample(SAMPLE_02)))
+
+    assert "STO-006" not in {f["rule_id"] for f in harness.row()["findings"] or []}
+
+
+async def test_committed_review_of_other_env_is_not_baseline(harness: Harness) -> None:
+    sqlite = load_sample(SAMPLE_02)
+    await _seed_committed(harness, sqlite | {"target": {"env": "gcp", "region": "asia-northeast3"}})
+
+    await harness.request(_without_sqlite_volume(sqlite))
+
+    assert "STO-006" not in {f["rule_id"] for f in harness.row()["findings"] or []}
+
+
+async def test_baselines_row_wins_over_committed_review(harness: Harness) -> None:
+    sqlite = load_sample(SAMPLE_02)
+    await _seed_committed(harness, sqlite)
+    no_volume = _without_sqlite_volume(sqlite)
+    await harness.repo.upsert_baseline(app="todo", target_env="local", spec=no_volume,
+                                       spec_ref={"repository": sqlite["metadata"]["repository"], "commit": "d" * 40},
+                                       merge_sha="d" * 40, observed_at=datetime.now(UTC))
+
+    row = await harness.repo.baseline_or_last_committed("todo", "local")
+    assert row is not None and row["spec"] == no_volume and row["merge_sha"] == "d" * 40
+
+
+async def test_committed_fallback_treats_database_as_having_data(harness: Harness) -> None:
+    sqlite = load_sample(SAMPLE_02)
+    await _seed_committed(harness, sqlite)
+
+    row = await harness.repo.baseline_or_last_committed("todo", "local")
+    assert row is not None
+    assert (row["spec"], row["database_has_data"], row["observed_at"]) == (sqlite, None, None)
+    assert await harness.repo.baseline_or_last_committed("todo", "aws") is None
+
+
 # --- 중복·오류 ------------------------------------------------------------------------------------
 
 async def test_duplicate_requested_is_skipped(harness: Harness) -> None:
