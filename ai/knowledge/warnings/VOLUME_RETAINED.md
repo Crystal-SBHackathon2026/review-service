@@ -16,7 +16,9 @@ title: 영속 볼륨이 Retain 클래스라 PVC 를 지워도 디스크와 과�
 
 ## 같이 볼 것
 - ReadWriteOnce 는 "한 노드" 단위다. canary·bluegreen 은 새 Pod 와 옛 Pod 가 잠시 같이 뜨는데, 둘이 다른 노드에 놓이면
-  새 Pod 가 볼륨을 붙이지 못해(Multi-Attach) Rollout 이 멈춘다. replicas 가 1 이어도 생긴다.
+  새 Pod 가 볼륨을 붙이지 못한다(Multi-Attach). 렌더러는 RWO PVC 가 있으면 Rollout Pod 에 같은 노드 podAffinity(required)를,
+  데이터 이전 Job 에 preferred 를 넣는다. 그 노드에 자리가 없으면 새 Pod 가 Pending → progressDeadlineAbort 로 중단되고
+  옛 버전이 계속 서비스한다 — 노드 자원(requests)을 줄이거나 노드를 늘린다.
 - 여러 replica 가 같은 볼륨을 쓰면 STO-002 가 막는다. 공유 저장소·여러 AZ 동시 마운트(ReadWriteMany)는 EBS 로 안 되며 EFS 등을 따로 검토한다.
 - 용량은 명세의 storage.volumes[].size 가 앱별로 정한다. 줄일 수 없다(STO-005).
 

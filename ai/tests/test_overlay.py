@@ -100,6 +100,25 @@ def test_sqlite_volume_renders_pvc_and_mount(tmp_path: Path) -> None:
     assert docs["PersistentVolumeClaim"]["spec"]["resources"]["requests"]["storage"] == "1Gi"
     assert docs["Service"]["spec"]["ports"][0]["targetPort"] == 3000
     assert docs["Ingress"]["spec"]["ingressClassName"] == "traefik"
+    # ReadWriteOnce 는 한 노드에만 붙는다 — canary 의 새 Pod 를 옛 Pod 와 같은 노드에 띄운다 (Multi-Attach 방지)
+    assert pod["affinity"] == {"podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [
+        {"labelSelector": {"matchLabels": {"app": "sample-app"}}, "topologyKey": "kubernetes.io/hostname"}]}}
+    # base Pod label 과 맞아야 첫 배포가 자기 자신으로 통과한다
+    assert docs["Rollout"]["spec"]["template"]["metadata"]["labels"]["app"] == "sample-app"
+
+
+@pytest.mark.parametrize(("volume", "expected"), [
+    ({"persistent": True}, True),
+    ({"persistent": True, "access_mode": "ReadWriteMany"}, False),  # 여러 노드에 붙는다
+    ({"persistent": False}, False),  # emptyDir 은 Pod 마다 따로
+])
+def test_same_node_affinity_only_for_read_write_once_pvc(volume: dict[str, Any], expected: bool) -> None:
+    raw = load_sample_dict("02-pass-local-sqlite.yaml")
+    raw["database"] = {"engine": "none"}
+    raw["storage"] = {"volumes": [{"name": "uploads", "mount_path": "/u", "size": "1Gi", **volume}]}
+    patch = yaml.safe_load(render_overlay(DeploySpec.model_validate(raw)).files["kustomization.yaml"])["patches"][0]
+    paths = {op["path"] for op in yaml.safe_load(patch["patch"])}
+    assert ("/spec/template/spec/affinity" in paths) is expected
 
 
 def test_secrets_render_as_secret_key_refs_without_values() -> None:
