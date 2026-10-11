@@ -140,9 +140,20 @@ def test_bluegreen_switches_strategy_and_adds_preview_service(tmp_path: Path) ->
     assert set(strategy) == {"blueGreen"}  # base 의 canary 설정이 남지 않는다
     assert strategy["blueGreen"]["activeService"] == "sample-app"
     assert strategy["blueGreen"]["previewService"] == "sample-app-preview"
+    assert strategy["blueGreen"]["autoPromotionEnabled"] is True
     preview = _one(docs, "Service", "sample-app-preview")
     assert preview["metadata"]["namespace"] == "sample-app"
     assert preview["spec"]["ports"][0]["targetPort"] == 8080
+
+
+@needs_kubectl
+def test_manual_bluegreen_survives_full_kustomize_build(tmp_path: Path) -> None:
+    raw = load_sample_dict("24-human-tokyo-manual-bluegreen.yaml")
+    docs = _build_all(write_rendered(tmp_path, DeploySpec.model_validate(raw)))
+    strategy = _one(docs, "Rollout", "sample-app")["spec"]["strategy"]
+    assert set(strategy) == {"blueGreen"}
+    assert strategy["blueGreen"]["autoPromotionEnabled"] is False
+    assert "autoPromotionSeconds" not in strategy["blueGreen"]
 
 
 @needs_kubectl

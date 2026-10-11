@@ -44,6 +44,7 @@ class ReviewRequested(BaseModel):
     deploy_spec: dict[str, Any] = Field(description="mask_spec() 을 거친 명세. baseline 없음")
     requested_by: str
     requested_at: datetime
+    deployment_request_id: str | None = Field(default=None, pattern=r"^dr_[0-9a-f]{32}$")
     autofix_commit: bool = Field(
         default=False,
         description="spec_ref.commit 이 워커가 applied_ops 를 커밋한 것(봇 커밋)이면 True — 또 fix 면 needs_human",
@@ -75,7 +76,8 @@ class ReviewRequested(BaseModel):
     def encode(self) -> bytes:
         """Kafka 값. 기본값인 선택 필드(generated_spec False·unverified_paths 빔)는 빼고 보낸다 —
         배포 중 남은 이전 워커(extra=forbid, 필드 모름)도 읽는다."""
-        exclude = {name for name, empty in (("generated_spec", not self.generated_spec),
+        exclude = {name for name, empty in (("deployment_request_id", self.deployment_request_id is None),
+                                            ("generated_spec", not self.generated_spec),
                                             ("unverified_paths", not self.unverified_paths)) if empty}
         return self.model_dump_json(exclude=exclude or None).encode()
 
@@ -92,6 +94,7 @@ def build_review_requested(
     spec_ref: dict[str, str],
     requested_by: str,
     requested_at: datetime,
+    deployment_request_id: str | None = None,
     autofix_commit: bool = False,
     generated_spec: bool = False,
     unverified_paths: Sequence[str] = (),
@@ -107,6 +110,7 @@ def build_review_requested(
         deploy_spec=body,
         requested_by=requested_by,
         requested_at=requested_at,
+        deployment_request_id=deployment_request_id,
         autofix_commit=autofix_commit,
         generated_spec=generated_spec,
         unverified_paths=tuple(unverified_paths),

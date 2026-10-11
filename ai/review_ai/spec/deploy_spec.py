@@ -191,8 +191,22 @@ class Ingress(_Frozen):
         return self
 
 
+class PublicService(_Frozen):
+    """GCP active Service를 공개한다. preview는 항상 클러스터 내부에 둔다."""
+
+    type: Literal["LoadBalancer"] = "LoadBalancer"
+    public: Literal[True]
+
+
 class Network(_Frozen):
-    ingress: Ingress | None = Field(default=None, description="None 이면 클러스터 밖으로 노출하지 않음")
+    ingress: Ingress | None = Field(default=None, description="Ingress로 공개할 때 설정. service와 함께 사용할 수 없음")
+    service: PublicService | None = None
+
+    @model_validator(mode="after")
+    def _one_entrypoint(self) -> Network:
+        if self.ingress is not None and self.service is not None:
+            raise ValueError("network.ingress와 network.service는 동시에 사용할 수 없다")
+        return self
 
 
 class Volume(_Frozen):
@@ -214,6 +228,14 @@ class Rollout(_Frozen):
     """canary: base Rollout 의 단계 배포를 그대로 쓴다. bluegreen: 새 버전을 미리보기 Service 로 띄워 확인한 뒤 한 번에 전환한다."""
 
     strategy: Strategy = "canary"
+    auto_promotion: bool = Field(default=True, description="bluegreen 새 버전 자동 승격. false 면 운영자가 수동 승격")
+    auto_promotion_seconds: int | None = Field(default=None, ge=0, le=3600)
+
+    @model_validator(mode="after")
+    def _promotion(self):
+        if self.strategy != "bluegreen" and self.auto_promotion_seconds is not None:
+            raise ValueError("auto_promotion_seconds is only valid for bluegreen")
+        return self
 
 
 class Smoke(_Frozen):
@@ -250,6 +272,12 @@ class AppSpec(_Frozen):
     storage: Storage = Storage()
     rollout: Rollout = Rollout()
     smoke: Smoke | None = Field(default=None, description="앱 레포에 테스트가 없으면 생성기가 확인 경로를 채운다")
+
+    @model_validator(mode="after")
+    def _public_service_target(self) -> AppSpec:
+        if self.network.service is not None and self.target.env != "gcp":
+            raise ValueError("network.service LoadBalancer는 현재 gcp에서만 지원한다")
+        return self
 
     @model_validator(mode="after")
     def _import_volume(self) -> AppSpec:

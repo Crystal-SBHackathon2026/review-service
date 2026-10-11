@@ -1,0 +1,39 @@
+# 로컬 검증 전용. 기존 개발 컨테이너와 다른 프로젝트·포트·볼륨을 쓴다.
+services:
+  postgres:
+    image: postgres:16
+    ports: ["127.0.0.1:15443:5432"]
+    environment:
+      POSTGRES_DB: oneaction_review
+      POSTGRES_USER: review
+      POSTGRES_PASSWORD: review
+    volumes: ["demo-postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U review -d oneaction_review"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  kafka:
+    image: apache/kafka:3.9.1
+    ports: ["127.0.0.1:19193:19193"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: HOST://:19193,DOCKER://:19092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:19193,DOCKER://kafka:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: HOST:PLAINTEXT,DOCKER:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19193 --list"]
+      interval: 3s
+      timeout: 10s
+      retries: 30
+volumes:
+  demo-postgres-data:

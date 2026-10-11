@@ -31,6 +31,7 @@ from review_ai.judge.prompt import RULE_PATCH_PATHS
 from review_ai.judge.schema import LlmPatch, LlmReview
 from review_ai.overlay import overlay_diff
 from review_ai.patching import PatchError, apply_ops, changed_paths, parse_pointer, path_under
+from review_ai.resource_limits import check_resource_limits
 from review_ai.secrets_pattern import MASK, looks_secret, redact
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.state import Doc, Finding, Patch, PatchOp
@@ -208,6 +209,25 @@ def _resolves_without_new(before_findings: Sequence[Finding], after: DeploySpec,
     return not ({f["finding_id"] for f in after_findings} & targets) and all(f["severity"] == "low" for f in new)
 
 
+def _fills_only_missing_resource_limits(before: DeploySpec, after: DeploySpec, target_rules: set[str]) -> bool:
+    """RUN-005 는 누락된 상한만 채운다. 요청값보다 작은 상한은 Kubernetes 에서 거절된다."""
+    if "RUN-005" not in target_rules:
+        return True
+    old, new = before.runtime.resources, after.runtime.resources
+    if (old.cpu_request, old.memory_request) != (new.cpu_request, new.memory_request):
+        return False
+    if any(getattr(old, field) is not None and getattr(old, field) != getattr(new, field)
+           for field in ("cpu_limit", "memory_limit")):
+        return False
+    if new.cpu_limit is None or new.memory_limit is None:
+        return False
+    try:
+        check_resource_limits(new)
+    except ValueError:
+        return False
+    return True
+
+
 def _parse_ops(llm_patch: LlmPatch) -> list[PatchOp] | None:
     try:
         return [op.to_patch_op() for op in llm_patch.ops]
@@ -241,6 +261,7 @@ def build_patch(llm_patch: LlmPatch, findings: Sequence[Finding], spec: dict[str
         _env_only_drops_shadowed(before, after, [by_id[fid] for fid in targets]),
         _secrets_only_drop_duplicates(before, after),
         _cidrs_only_drop_full_range(before, after),
+        _fills_only_missing_resource_limits(before, after, target_rules),
         _resolves_without_new(findings, after, targets),
     )
     if not all(guards):

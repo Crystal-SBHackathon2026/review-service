@@ -139,6 +139,9 @@ class GitHubClient:
         """GET /repos/{owner}/{repo}/commits/{sha}/pulls"""
         return await self._json("GET", f"/repos/{repository}/commits/{sha}/pulls", "커밋의 PR 조회")
 
+    async def get_pull(self, repository: str, number: int) -> dict[str, Any]:
+        return await self._json("GET", f"/repos/{repository}/pulls/{number}", "PR 조회")
+
     async def merge_pull(self, repository: str, number: int, *, head_sha: str) -> str:
         """PUT /repos/{owner}/{repo}/pulls/{n}/merge — sha 를 같이 보내 그사이 head 가 바뀌면 GitHub 이 거절한다. 병합 SHA 반환."""
         resp = await self._request("PUT", f"/repos/{repository}/pulls/{number}/merge",
@@ -226,12 +229,13 @@ class GitHubGitClient:
     """
 
     def __init__(self, github: GitHubClient, *, gitops_repo: str | None = None, branch: str = "main",
-                 max_attempts: int = 5, backoff_seconds: float = 0.5) -> None:
+                 max_attempts: int = 5, backoff_seconds: float = 0.5, preserve_overlay_images: bool = False) -> None:
         self._gh = github
         self.gitops_repo = gitops_repo or os.environ.get("GITOPS_REPO") or DEFAULT_GITOPS_REPO
         self.branch = branch
         self.max_attempts = max_attempts
         self.backoff_seconds = backoff_seconds
+        self.preserve_overlay_images = preserve_overlay_images
 
     async def read_file(self, repository: str, path: str, ref: str) -> str:
         try:
@@ -285,6 +289,15 @@ class GitHubGitClient:
         existing = {p: sha for p, sha in (await self._gh.tree_blobs(repo, base_tree)).items()
                     if p.startswith(directory + "/")}
         wanted = {f"{directory}/{name}": content for name, content in files.items()}
+        if self.preserve_overlay_images and "/overlays/" in directory:
+            import yaml
+            path = f"{directory}/kustomization.yaml"
+            if path in existing and path in wanted:
+                previous = yaml.safe_load(await self._gh.get_file(repo, path, head))
+                next_config = yaml.safe_load(wanted[path])
+                if previous.get("images") and not next_config.get("images"):
+                    next_config["images"] = previous["images"]
+                    wanted[path] = yaml.safe_dump(next_config, sort_keys=False)
         entries: list[dict[str, Any]] = [
             {"path": p, "mode": FILE_MODE, "type": "blob", "content": content}
             for p, content in sorted(wanted.items()) if existing.get(p) != git_blob_sha(content)

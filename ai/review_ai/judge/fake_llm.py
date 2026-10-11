@@ -55,7 +55,7 @@ def _db005_ops(spec: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _bluegreen_ops(spec: dict[str, Any]) -> list[dict[str, Any]]:
     if "rollout" in spec:
-        return [_op("replace", "/rollout/strategy", "bluegreen")]
+        return [_op("add", "/rollout/strategy", "bluegreen")]
     return [_op("add", "/rollout", {"strategy": "bluegreen"})]
 
 

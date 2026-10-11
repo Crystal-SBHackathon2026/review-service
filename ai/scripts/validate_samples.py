@@ -80,6 +80,9 @@ def check_rejects() -> int:
 
 
 def export_schema() -> Path:
+    from review_ai.spec.deployment_request import DeploymentRequest
+    request_out = ROOT / "schema/deployment_request.schema.json"
+    request_out.write_text(json.dumps(DeploymentRequest.model_json_schema(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     out = ROOT / "schema/deploy_spec.schema.json"
     out.write_text(json.dumps(DeploySpec.model_json_schema(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return out

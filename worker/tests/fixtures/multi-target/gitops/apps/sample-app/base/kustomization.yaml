@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - rollout.yaml
+  - service.yaml
+# 🔴 AnalysisTemplate 은 여기 없다. ../analysis/ 아래에 환경별로 있고
+# Argo CD Application 이 두 번째 소스로 가져간다 (argocd/sample-app-*.yaml).
+# Prometheus 가 있는 환경에서만 에러율 지표를 켜기 위해서다 — 이슈 #24.
+images:
+  - name: ghcr.io/crystal-sbhackathon2026/sample-app
+    # CI(update-gitops)가 커밋 SHA로 자동 갱신한다.
+    newTag: b3bdcd948b176d2a1306bd35a1f5e63211593245

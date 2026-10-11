@@ -56,6 +56,7 @@ from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.patching import apply_ops
 from review_ai.recommendations import resolve_human_decision
+from review_ai.resource_limits import check_resource_limits
 from review_ai.retrieval import Retriever, make_retrieve_evidence
 from review_ai.spec.deploy_spec import DeploySpec, user_fields
 from review_ai.state import DeployResult, ReviewState
@@ -187,6 +188,9 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     async def _verify_status(review_id: str, spec_ref: dict[str, str] | None, state: str, description: str, *,
                              attempts: int = 1) -> bool:
         """PR head 에 커밋 상태 review-service/verify. 실패해도 검토는 계속한다 (경고만). 썼으면 True."""
+        row = await repo.get_review(review_id)
+        if row and row.get("deployment_request_id"):
+            return True  # only the parent publishes the shared verify status
         if not spec_ref:
             return False
         url = f"{deps.public_url.rstrip('/')}/ui/reviews/{review_id}" if deps.public_url else None
@@ -258,6 +262,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         verdict = state["decision"]["verdict"]
         if verdict == "fix" and state.get("retry_count", 0) < MAX_PATCH_ROUNDS:
             return "apply_patch"
+        if verdict == "pass" and state.get("deployment_request_id"):
+            return "prepare_request"
         if verdict == "pass":
             return "commit_fix" if applied_ops(state) else "await_ci"
         return "await_human"  # needs_human. fix 인데 회차를 다 쓴 경우도 사람에게 (decide_verdict 가 막지만 안전장치)
@@ -288,6 +294,8 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
         await repo.update_review(rid, human_decision=decision, error=None, human_decided_at=datetime.now(UTC))
         if decision["edited_ops"]:
             goto = "apply_human_edits"
+        elif state.get("deployment_request_id"):
+            goto = "prepare_request"
         elif applied_ops(state):  # 사람 확인 전에 AI 가 고친 회차가 있다 — 앱 레포에도 커밋해야 gitops 와 어긋나지 않는다
             goto = "commit_fix"
         else:
@@ -303,6 +311,12 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
             await repo.update_review(state["review_id"], error=f"edited_ops 적용 실패: {exc}"[:2000])
             return Command(goto="await_human", update={"human_decision": None})
         return Command(goto="static_check", update=update)
+
+    async def prepare_request(state):
+        # No branch mutation, CI check, merge, or GitOps write by an individual child.
+        await repo.update_review(state["review_id"], status="waiting_ci", final_spec=app_spec(state["deploy_spec"]),
+                                 rounds=state.get("rounds") or [])
+        return {}
 
     # --- AI 수정 커밋 -----------------------------------------------------------------------------
 
@@ -324,7 +338,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
                 raise GitHubError(f"PR #{pull['number']} 은 포크 브랜치라 자동 커밋할 수 없다")
             raw = await _retry("deploy.yaml 읽기", lambda: github.get_file(repository, path, parent))
             fixed = apply_ops(yaml.safe_load(raw), ops)  # 원본(가리지 않은 값)에 적용. ops 는 env·시크릿을 건드리지 못한다
-            DeploySpec.model_validate(fixed)
+            check_resource_limits(DeploySpec.model_validate(fixed).runtime.resources)
             content = (f"# AI 검토 {rid} 가 고친 명세입니다. 무엇을 왜 고쳤는지는 검토 결과(rounds)에 있습니다.\n"
                        + yaml.safe_dump(fixed, sort_keys=False, allow_unicode=True))
             new_sha = await github.prepare_file_commit(repository, parent=parent, path=path, content=content,
@@ -490,8 +504,10 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     node("record_result", record_result)
     node("apply_patch", apply_patch)
     node("await_human", await_human)
-    node("wait_human", wait_human, destinations=("apply_human_edits", "await_human", "await_ci", "commit_fix", END))
+    node("wait_human", wait_human, destinations=("apply_human_edits", "await_human", "await_ci", "commit_fix", "prepare_request", END))
     node("apply_human_edits", apply_human_edits, destinations=("static_check", "await_human"))
+    node("prepare_request", prepare_request)
+    graph.add_edge("prepare_request", END)
     node("commit_fix", commit_fix, destinations=(END,))
     node("await_ci", await_ci)
     node("check_ci", check_ci, destinations=("wait_ci", "confirm_ci", END))
@@ -507,7 +523,7 @@ def build_graph(deps: Deps, checkpointer: Any) -> Any:
     graph.add_edge("judge", "inspect_failure_cases")
     graph.add_edge("inspect_failure_cases", "record_result")
     graph.add_conditional_edges("record_result", route_after_result,
-                                ["apply_patch", "await_human", "await_ci", "commit_fix"])
+                                ["apply_patch", "await_human", "await_ci", "commit_fix", "prepare_request"])
     graph.add_edge("apply_patch", "static_check")
     graph.add_edge("await_human", "wait_human")
     graph.add_edge("await_ci", "check_ci")

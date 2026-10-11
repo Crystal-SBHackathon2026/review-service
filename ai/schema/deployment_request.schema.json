@@ -1,0 +1,75 @@
+{
+  "$defs": {
+    "SelectedTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "env": {
+          "enum": [
+            "aws",
+            "gcp",
+            "local"
+          ],
+          "title": "Env",
+          "type": "string"
+        },
+        "region": {
+          "maxLength": 80,
+          "minLength": 1,
+          "pattern": "^[a-z0-9-]+$",
+          "title": "Region",
+          "type": "string"
+        },
+        "cluster": {
+          "maxLength": 100,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9._-]+$",
+          "title": "Cluster",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 200,
+          "pattern": "^(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\\.ya?ml$",
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "env",
+        "region",
+        "cluster",
+        "path"
+      ],
+      "title": "SelectedTarget",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "const": "oneaction/v1",
+      "title": "Apiversion",
+      "type": "string"
+    },
+    "kind": {
+      "const": "DeploymentRequest",
+      "title": "Kind",
+      "type": "string"
+    },
+    "targets": {
+      "items": {
+        "$ref": "#/$defs/SelectedTarget"
+      },
+      "maxItems": 3,
+      "minItems": 1,
+      "title": "Targets",
+      "type": "array"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "targets"
+  ],
+  "title": "DeploymentRequest",
+  "type": "object"
+}
