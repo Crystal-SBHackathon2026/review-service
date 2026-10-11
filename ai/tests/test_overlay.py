@@ -29,6 +29,45 @@ def codes(rendered: RenderedOverlay) -> set[str]:
     return {w.code for w in rendered.warnings}
 
 
+@needs_kubectl
+def test_gcp_public_service_survives_render_and_preview_stays_internal(tmp_path: Path) -> None:
+    raw = load_sample_dict("01-pass-sample-app-aws.yaml")
+    raw.update(target={"env": "gcp", "region": "asia-northeast1"},
+               network={"service": {"type": "LoadBalancer", "public": True}},
+               rollout={"strategy": "bluegreen", "auto_promotion": False})
+    spec = DeploySpec.model_validate(raw)
+    path = write_rendered(tmp_path, spec)
+    output = subprocess.run(["kubectl", "kustomize", str(path)], check=True, capture_output=True, text=True).stdout
+    docs = list(yaml.safe_load_all(output))
+    services = {d["metadata"]["name"]: d for d in docs if d["kind"] == "Service"}
+    assert set(services) == {"sample-app", "sample-app-preview"}
+    assert services["sample-app"]["spec"]["type"] == "LoadBalancer"
+    assert services["sample-app-preview"]["spec"].get("type", "ClusterIP") == "ClusterIP"
+    assert services["sample-app"]["spec"]["selector"] == {"app": "sample-app"}
+    rollout = next(d for d in docs if d["kind"] == "Rollout")
+    assert rollout["spec"]["strategy"]["blueGreen"]["autoPromotionEnabled"] is False
+    assert rollout["spec"]["strategy"]["blueGreen"]["activeService"] == "sample-app"
+    assert not any(d["kind"] == "Ingress" for d in docs)
+    from review_ai.static_check import run_static_check
+    assert any(f["rule_id"] == "NET-001" for f in run_static_check(spec))
+
+
+@pytest.mark.parametrize("changes", [
+    {"target": {"env": "aws", "region": "ap-northeast-2"}},
+    {"target": {"env": "local", "region": "busan-local"}},
+    {"network": {"service": {"public": False}}},
+    {"network": {"service": {"public": True, "type": "NodePort"}}},
+    {"network": {"service": {"public": True}, "ingress": {"public": True}}},
+])
+def test_public_service_rejects_unimplemented_exposure(changes) -> None:
+    from pydantic import ValidationError
+    raw = load_sample_dict("01-pass-sample-app-aws.yaml")
+    raw.update(target={"env": "gcp", "region": "asia-northeast1"}, network={"service": {"public": True}})
+    raw.update(changes)
+    with pytest.raises(ValidationError):
+        DeploySpec.model_validate(raw)
+
+
 def build(overlay_dir: Path) -> dict[str, dict[str, Any]]:
     out = subprocess.run(["kubectl", "kustomize", str(overlay_dir)], check=True, capture_output=True, text=True).stdout
     return {doc["kind"]: doc for doc in yaml.safe_load_all(out)}

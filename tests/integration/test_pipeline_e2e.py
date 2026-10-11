@@ -114,7 +114,7 @@ async def test_migrate_is_idempotent(conninfo: str) -> None:
                                        "0006_generated_spec_unverified.sql", "0007_review_recovery.sql",
                                        "0008_review_head_unique.sql", "0009_review_stage_times.sql",
                                        "0010_intake_attempts.sql", "0011_deployment_analysis.sql",
-                                       "0012_intake_unverified_paths.sql"]
+                                       "0012_intake_unverified_paths.sql", "0013_deployment_requests.sql"]
     assert await migrate(conninfo) == []
 
 
@@ -437,7 +437,9 @@ async def test_demo_api_kafka_postgres_fix_and_approval(
             self.head_statuses = []
 
         async def get_file(self, repository, path, ref):
-            assert repository == REPO and path == "deploy.yaml"
+            if path != "deploy.yaml":
+                raise SpecNotFound("missing", 404)
+            assert repository == REPO
             return self.files[ref]
 
         async def pulls_for_commit(self, repository, sha):

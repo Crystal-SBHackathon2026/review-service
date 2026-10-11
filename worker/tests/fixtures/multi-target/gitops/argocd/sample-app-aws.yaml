@@ -1,0 +1,36 @@
+# Argo CD Application: GitOps 레포의 aws overlay를 해당 클러스터에 동기화한다.
+# Argo CD를 oneaction EKS 안에 설치하므로(in-cluster) 목적지는 kubernetes.default.svc를 사용한다.
+# Argo CD를 클러스터 밖에 두는 경우에만 EKS API 주소와 CA로 클러스터를 등록하고 이 값을 바꾼다.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sample-app-aws
+  namespace: argocd
+  annotations:
+    # 배포 성공·실패를 검토 서비스로 보낸다 (argocd/notifications/).
+    # app 은 deploy.yaml 의 metadata.name, env 는 target.env 와 같아야 한다.
+    # 검토 서비스가 이 값으로 업무 DB 의 baseline 을 찾는다.
+    oneaction.crystal/app: sample-app
+    oneaction.crystal/env: aws
+    notifications.argoproj.io/subscribe.on-deployed.review-api: ""
+    notifications.argoproj.io/subscribe.on-health-degraded.review-api: ""
+spec:
+  project: default
+  # 소스가 둘이다. overlay 는 렌더러가 만드는 생성물이고, 분석은 손으로 관리한다.
+  # 🔴 분석 경로가 환경마다 다르다 — Prometheus 가 있는 곳만 에러율 지표를 켠다 (#24).
+  sources:
+    - repoURL: https://github.com/Crystal-SBHackathon2026/gitops.git
+      targetRevision: main
+      path: apps/sample-app/overlays/aws
+    - repoURL: https://github.com/Crystal-SBHackathon2026/gitops.git
+      targetRevision: main
+      path: apps/sample-app/analysis/prometheus
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sample-app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

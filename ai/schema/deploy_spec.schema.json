@@ -58,7 +58,8 @@
         "network": {
           "$ref": "#/$defs/Network",
           "default": {
-            "ingress": null
+            "ingress": null,
+            "service": null
           }
         },
         "storage": {
@@ -72,7 +73,8 @@
           "$ref": "#/$defs/Rollout",
           "default": {
             "strategy": "canary",
-            "auto_promotion": true
+            "auto_promotion": true,
+            "auto_promotion_seconds": null
           }
         },
         "smoke": {
@@ -537,7 +539,18 @@
             }
           ],
           "default": null,
-          "description": "None 이면 클러스터 밖으로 노출하지 않음"
+          "description": "Ingress로 공개할 때 설정. service와 함께 사용할 수 없음"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicService"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "title": "Network",
@@ -578,6 +591,28 @@
         "schema_change"
       ],
       "title": "Observed",
+      "type": "object"
+    },
+    "PublicService": {
+      "additionalProperties": false,
+      "description": "GCP active Service를 공개한다. preview는 항상 클러스터 내부에 둔다.",
+      "properties": {
+        "type": {
+          "const": "LoadBalancer",
+          "default": "LoadBalancer",
+          "title": "Type",
+          "type": "string"
+        },
+        "public": {
+          "const": true,
+          "title": "Public",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "public"
+      ],
+      "title": "PublicService",
       "type": "object"
     },
     "Requirements": {
@@ -656,6 +691,20 @@
           "description": "bluegreen 새 버전 자동 승격. false 면 운영자가 수동 승격",
           "title": "Auto Promotion",
           "type": "boolean"
+        },
+        "auto_promotion_seconds": {
+          "anyOf": [
+            {
+              "maximum": 3600,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Auto Promotion Seconds"
         }
       },
       "title": "Rollout",
@@ -936,7 +985,8 @@
     "network": {
       "$ref": "#/$defs/Network",
       "default": {
-        "ingress": null
+        "ingress": null,
+        "service": null
       }
     },
     "storage": {
@@ -950,7 +1000,8 @@
       "$ref": "#/$defs/Rollout",
       "default": {
         "strategy": "canary",
-        "auto_promotion": true
+        "auto_promotion": true,
+        "auto_promotion_seconds": null
       }
     },
     "smoke": {

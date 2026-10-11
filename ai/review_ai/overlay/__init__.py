@@ -115,6 +115,14 @@ def render_overlay(spec: AppSpec, *, apps_root: str = "apps") -> RenderedOverlay
             {"target": {"kind": "Service", "name": name}, "patch": dump(service_ops(spec)).rstrip("\n")},
         ],
     }
+    if spec.network.service is not None:
+        # active Service의 이름·selector·clusterIP를 유지한다. 별도 Service를
+        # 만들지 않으므로 Rollouts가 승격할 때 같은 공개 주소의 대상만 바뀐다.
+        files["service-public.yaml"] = dump_with_header({
+            "apiVersion": "v1", "kind": "Service", "metadata": {"name": name},
+            "spec": {"type": "LoadBalancer"},
+        }, HEADER)
+        kustomization["patches"].append({"path": "service-public.yaml"})
     replacements = image_replacements(spec)
     if replacements:
         kustomization["replacements"] = replacements

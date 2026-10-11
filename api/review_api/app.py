@@ -30,6 +30,8 @@ import hmac
 import json
 import logging
 import time
+
+import yaml
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -47,6 +49,10 @@ from review_ai.judge.llm import CachedLLM, ClaudeLLM, LlmClient, LlmUnavailable
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.messages import build_review_requested
 from review_ai.recommendations import resolve_human_decision
+from review_ai.spec.deployment_request import SPEC_PATH, registered_targets
+from review_common.deployment_requests import RequestBusy, activate_multitarget
+from review_ai.spec.deploy_spec import Provider
+from review_common.request_dispatch import DEPLOYMENT_BRANCH, MANIFEST_PATH, dispatch_request, supersede_request
 from review_ai.spec.deploy_spec import REPOSITORY
 from review_ai.transform import TRANSFORM_MAX_TOKENS
 from review_ai.transform.prompt import TransformOutput
@@ -112,6 +118,8 @@ class ApiDeps:
     lockfile: Callable[[str, str], Awaitable[str]] = regenerate_lockfile  # 코드 패치가 바꾼 의존성의 잠금 파일
     # /readyz 가 볼 의존성 — 이름 → 실패하면 예외를 내는 확인. 비어 있으면 늘 준비됨
     readiness: dict[str, Callable[[], Awaitable[Any]]] = field(default_factory=dict)
+    multi_target_enabled: bool = False
+    deployment_targets: frozenset[tuple[str, str, str]] = frozenset()
     progress: ProgressSettings = field(default_factory=ProgressSettings)  # DEPLOY_ENVS·PLANNED_ENVS·APP_URLS
 
 
@@ -158,6 +166,19 @@ class ReviewIn(BaseModel):
     requested_by: str = Field(min_length=1)
 
 
+class DeploymentRequestIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    spec_ref: SpecRefIn
+    pr_number: int = Field(gt=0)
+    requested_by: str = Field(min_length=1, max_length=100)
+
+
+class RetryDeploymentIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    env: Provider
+    idempotency_key: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+
+
 def require_bearer(authorization: str, token: str | None, name: str) -> None:
     """Authorization: Bearer <token> 확인. 토큰이 설정되지 않았으면 503 — 비어 있다고 검사를 건너뛰지 않는다(fail-closed).
 
@@ -177,6 +198,10 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
 
     def d(request: Request) -> ApiDeps:
         return request.app.state.deps
+
+    @app.exception_handler(RequestBusy)
+    async def request_busy(request, exc):
+        return JSONResponse({"detail": "PR coordination is in progress; retry later"}, status_code=409)
 
     @app.middleware("http")
     async def http_metrics(request: Request, call_next: Callable[[Request], Awaitable[Any]]) -> Any:
@@ -214,6 +239,53 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         except SpecNotFound as exc:
             raise HTTPException(404, str(exc)) from exc
         return {"review_id": review_id}
+
+    @app.post("/deployment-requests", status_code=202)
+    async def create_deployment_request(body: DeploymentRequestIn, request: Request,
+                                        authorization: str = Header(default="")):
+        deps_ = d(request)
+        require_bearer(authorization, deps_.api_token, "REVIEW_API_TOKEN")
+        return await start_deployment_request(deps_, body.spec_ref.model_dump(), body.pr_number, body.requested_by)
+
+    @app.get("/deployment-requests/{request_id}")
+    async def get_deployment_request(request_id: str, request: Request,
+                                     authorization: str = Header(default="")):
+        require_bearer(authorization, d(request).api_token, "REVIEW_API_TOKEN")
+        row = await d(request).repo.get_request(request_id)
+        if row is None:
+            raise HTTPException(404, "deployment request not found")
+        children = await d(request).repo.request_children(request_id)
+        envs = []
+        for child in children:
+            last = await d(request).repo.last_deploy_event(review_id=child["review_id"], target_env=child["target_env"])
+            envs.append(dict(env=child["target_env"], review_id=child["review_id"], review_status=child["status"],
+                             verdict=child["verdict"], deployment=last["kind"] if last else "unconfirmed"))
+        outcomes = [e["deployment"] for e in envs]
+        deployment = "succeeded" if outcomes and len(envs) == len(row["targets"]) and all(v == "healthy" for v in outcomes) else (
+            "partial_failure" if "healthy" in outcomes and any(v in {"degraded", "sync_failed"} for v in outcomes)
+            else "failed" if any(v in {"degraded", "sync_failed"} for v in outcomes) else "unconfirmed")
+        return {**row, "environments": envs, "deployment": deployment}
+
+    @app.post("/deployment-requests/{request_id}/retry", status_code=202)
+    async def retry_deployment(request_id: str, body: RetryDeploymentIn, request: Request,
+                               authorization: str = Header(default="")):
+        deps_ = d(request)
+        require_bearer(authorization, deps_.api_token, "REVIEW_API_TOKEN")
+        if not deps_.multi_target_enabled:
+            raise HTTPException(409, "multi-target deployment is disabled")
+        parent = await deps_.repo.get_request(request_id)
+        if parent is None:
+            raise HTTPException(404, "deployment request not found")
+        if parent["state"] != "committed":
+            raise HTTPException(409, "deployment must be committed before retry")
+        child = next((c for c in await deps_.repo.request_children(request_id) if c["target_env"] == body.env), None)
+        if child is None:
+            raise HTTPException(422, "environment was not selected")
+        last = await deps_.repo.last_deploy_event(review_id=child["review_id"], target_env=body.env)
+        if not last or last["kind"] not in {"degraded", "sync_failed"}:
+            raise HTTPException(409, "retry requires a confirmed environment failure")
+        retry_id = "retry_" + hashlib.sha256(f"{request_id}:{body.env}:{body.idempotency_key}".encode()).hexdigest()[:32]
+        return await deps_.repo.insert_request_retry(retry_id, request_id, body.env)
 
     @app.get("/reviews")
     async def list_reviews(request: Request, status: list[str] = Query(default=[]),
@@ -258,6 +330,10 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
             status = "intake_failed" if intake["status"] in INTAKE_FAILED else f"intake_{intake['status']}"
             return {"sha": sha, "intake_id": intake["intake_id"], "passed": False, "status": status,
                     "verdict": None, "reasons": [intake["reason"]] if intake["reason"] else []}
+        if row.get("deployment_request_id"):
+            parent = await d(request).repo.get_request(row["deployment_request_id"])
+            return {"sha": sha, "request_id": parent["request_id"], "passed": parent["state"] in
+                    {"merging", "waiting_image", "committed"}, "status": parent["state"]}
         return {"sha": sha, "review_id": row["review_id"], "passed": row["status"] in PASSED_STATUSES,
                 "status": row["status"], "verdict": row["verdict"], "reasons": row["reasons"] or []}
 
@@ -344,6 +420,8 @@ def create_app(deps: ApiDeps | None = None) -> FastAPI:
         ci = CiResult(head_sha=suite["head_sha"], conclusion=suite.get("conclusion") or "unknown")
         resumed = []
         for row in await deps_.repo.waiting_ci_by_head_sha(ci.head_sha):
+            if row.get("deployment_request_id"):
+                continue
             msg = CiCompletedResumed(review_id=row["review_id"], ci=ci, resumed_at=datetime.now(UTC))
             await publish(deps_, RESUMED_TOPIC, row["review_id"], msg.model_dump_json().encode())
             resumed.append(row["review_id"])
@@ -438,6 +516,12 @@ async def fetch_spec(deps: ApiDeps, spec_ref: dict[str, str]) -> dict[str, Any]:
 async def start_review(deps: ApiDeps, spec_ref: dict[str, str], requested_by: str) -> str:
     """POST /reviews — 파일이 없으면 SpecNotFound(404), 비었거나 깨졌으면 422."""
     try:
+        await deps.specs.get_file(spec_ref["repository"], MANIFEST_PATH, spec_ref["commit"])
+    except SpecNotFound:
+        pass
+    else:
+        raise HTTPException(409, "a selected-environment manifest exists; use /deployment-requests")
+    try:
         loaded = await fetch_spec(deps, spec_ref)
     except SpecProblem as exc:
         raise HTTPException(422, {"message": exc.message, "errors": exc.errors}) from exc
@@ -495,6 +579,47 @@ def is_fork(pull_request: dict[str, Any]) -> bool:
     return head_repo is None or head_repo.get("full_name") != base_repo.get("full_name")
 
 
+async def start_deployment_request(deps, ref, number, requested_by):
+    if not deps.multi_target_enabled:
+        raise HTTPException(409, "multi-target deployment is disabled")
+    if deps.github is None or not deps.deployment_targets:
+        raise HTTPException(503, "registered deployment destinations are required")
+    # Validate the path before passing it to a provider API.
+    import re
+    if ref["path"] != MANIFEST_PATH or not re.fullmatch(SPEC_PATH, ref["path"]):
+        raise HTTPException(422, "invalid deployment request path")
+    async with deps.repo.request_lock(ref["repository"], number):
+        pull = await deps.github.get_pull(ref["repository"], number)
+        if (is_fork(pull) or pull.get("state") != "open" or pull["head"]["sha"] != ref["commit"]
+                or (pull.get("base") or {}).get("ref") != DEPLOYMENT_BRANCH):
+            raise HTTPException(409, "request must refer to the current head of an open same-repository PR targeting main")
+        try:
+            rid = await dispatch_request(deps.repo, deps.specs, deps.publisher, ref["repository"], number,
+                                         ref["commit"], ref["path"], requested_by, deps.deployment_targets)
+        except SpecNotFound:
+            raise HTTPException(422, "selected deployment spec is missing") from None
+        except (ValueError, yaml.YAMLError):
+            raise HTTPException(422, "deployment request/spec/registered target do not match") from None
+        # Also retire pre-existing legacy AWS reviews of the same PR.
+        children = {r["review_id"] for r in await deps.repo.request_children(rid)}
+        current = await deps.repo.get_request(rid)
+        for previous in await deps.repo.requests_for_pr(ref["repository"], number):
+            if previous["head_sha"] == current.get("pending_sha"):
+                continue  # Prepared successor while the fix ref update is still pending.
+            if previous["request_id"] != rid and previous["state"] not in {"committed", "superseded"}:
+                await supersede_request(deps.repo, previous["request_id"])
+        for old in await deps.repo.list_reviews([], 200):
+            full = await deps.repo.get_review(old["review_id"])
+            if full.get("deployment_request_id"):
+                continue  # Parent transitions own all batch children, including a prepared successor.
+            if old.get("pr_number") == number and old["spec_ref"]["repository"] == ref["repository"] and old["review_id"] not in children:
+                if old["status"] in {"received", "reviewing", "needs_human", "waiting_ci"}:
+                    await deps.repo.update_review(old["review_id"], status="superseded")
+        # Parent remains pending until every child, final CI, and preflight pass.
+        await post_verify_status(deps, ref, rid, "pending", "Reviewing selected environments")
+        return {"request_id": rid}
+
+
 PR_ACTIONS = frozenset({"opened", "synchronize", "reopened"})
 
 
@@ -526,6 +651,17 @@ async def on_pull_request(deps: ApiDeps, payload: dict[str, Any]) -> dict[str, A
     if is_fork(pr):  # 포크 브랜치는 쓸 수도(수정 커밋) 믿을 수도 없다 — 검토도 intake 도 하지 않는다
         return {"skipped": "fork"}
     repository, head_sha, number = repo["full_name"], pr["head"]["sha"], pr["number"]
+    try:
+        await deps.specs.get_file(repository, MANIFEST_PATH, head_sha)
+    except SpecNotFound:
+        pass  # Existing deploy.yaml remains the single-environment contract.
+    else:
+        if not deps.multi_target_enabled:
+            await post_verify_status(deps, {"repository": repository, "commit": head_sha, "path": MANIFEST_PATH},
+                                     "multi-target-disabled", "failure", "Multi-target feature is disabled")
+            return {"ignored": "multi-target disabled"}
+        return await start_deployment_request(deps, dict(repository=repository, commit=head_sha, path=MANIFEST_PATH),
+                                              number, payload["sender"]["login"])
     existing = await deps.repo.find_by_head(repository, head_sha)
     if existing is not None and not (action == "reopened" and existing["status"] == "superseded"):
         return {"skipped": "already reviewed", "review_id": existing["review_id"]}
@@ -566,6 +702,10 @@ async def on_pull_request_closed(deps: ApiDeps, payload: dict[str, Any]) -> dict
     pr = payload["pull_request"]
     if pr.get("merged"):
         return {"ignored": "merged"}
+    async with deps.repo.request_lock(payload["repository"]["full_name"], pr["number"]):
+        for parent in await deps.repo.requests_for_pr(payload["repository"]["full_name"], pr["number"]):
+            if parent["state"] not in {"committed", "superseded"}:
+                await supersede_request(deps.repo, parent["request_id"], "PR closed")
     superseded = await deps.repo.supersede_open(repository=payload["repository"]["full_name"],
                                                 pr_number=pr["number"], superseded_by=None, error=PR_CLOSED)
     return {"closed": pr["number"], "superseded": superseded}
@@ -610,10 +750,16 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
     from review_common.repository import PostgresReviewRepository, make_pool
     from review_common.settings import db_conninfo, kafka_bootstrap
 
+    multi_target_enabled = os.environ.get("MULTI_TARGET_ENABLED", "false").lower() == "true"
+    registry = registered_targets(os.environ.get("DEPLOYMENT_TARGETS_JSON"))
+    if multi_target_enabled and not registry:
+        raise ValueError("multi-target mode requires registered destinations")
     conninfo = db_conninfo()
     await migrate(conninfo)
     pool = make_pool(conninfo)
     await pool.open(wait=True)
+    if multi_target_enabled:
+        await activate_multitarget(pool)
     producer = AIOKafkaProducer(bootstrap_servers=kafka_bootstrap(), acks="all", enable_idempotence=True)
     await producer.start()
     github = GitHubClient()
@@ -635,6 +781,8 @@ async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
         transform_llm=make_transform_llm(),
         readiness=make_readiness(pool, producer),
         progress=ProgressSettings.from_env(os.environ),
+        multi_target_enabled=multi_target_enabled,
+        deployment_targets=registry,
     )
     sweeps = [asyncio.create_task(sweep_stale_intakes(app.state.deps)),
               asyncio.create_task(sweep_stale_reviews(app.state.deps)),

@@ -29,6 +29,8 @@ pip install "./ai[qdrant]"        # 이미지 빌드 — catalog/·knowledge/ �
 |---|---|---|
 | Review API | `messages.build_review_requested(spec, review_id=, spec_ref=, requested_by=, requested_at=, autofix_commit=False)` | baseline 을 떼고 `mask_spec()` 한 뒤 `spec_sha256` 계산. `ReviewRequested` 모델이 평문 비밀·baseline·해시 불일치를 거절한다. **검토할 커밋이 워커가 `applied_ops` 를 커밋한 것(봇 커밋)이면 `autofix_commit=True`** — 워커는 `initial_state(..., autofix_commit=message.autofix_commit)` 로 넘긴다. intake 가 후보값으로 채운 생성 명세 PR 이면 `generated_spec=True, unverified_paths=[...]`(spec_intakes.unverified_paths) — 워커는 `initial_state(..., generated_spec=, unverified_paths=)` 로 그대로 넘긴다 |
 | Review API | `spec.deploy_spec.DeploySpec` / `schema/deploy_spec.schema.json` | 형식 오류 → 422 |
+| GCP 배포 담당 | `network.service: {type: LoadBalancer, public: true}` | 기존 active Service를 공개 HTTP Service로 patch한다. Ingress와 동시 지정·다른 환경은 거절한다. preview는 내부, NET-001 low 경고 유지. `service-public.yaml` 제거는 단일·다중 환경 보호 검사에서 차단한다. [추가 연결·리허설 조건](../../docs/slack-demo-followups.md) |
+| 진행 화면 | `GET /reviews/{id}/progress`의 `failure_cases` | 같은 앱·저장소·대상 환경의 실패 관찰에 대해 실제 사례 저장 여부·분석 상태만 공개한다. 진단·명세 원문·해결 내용은 운영자 상세 API의 인증을 유지한다 |
 | 워커 그래프 | `static_check.make_static_check()` | `findings` 만 반환 |
 | 워커 그래프 | `retrieval.make_retrieve_evidence(retriever)` | `FileRetriever()`(벡터 DB 없음) 또는 `QdrantRetriever(client, FastEmbedder())`. 워커는 `CompositeRetriever(FileRetriever(), CaseRetriever(repo))` — 규칙 문서 뒤에 업무 DB 판단 사례(아래 [판단 사례](#판단-사례-review_cases)) |
 | 워커 종료 지점·Argo CD Degraded | `cases.case_from_state(state, human=)` · `cases.case_from_review(row, "deploy_degraded")` → `repo.insert_case(**case)` | 판단이 필요했던 finding(low 제외)이 없으면 `None`. 기록 실패는 경고 로그만 — 검토 결과를 바꾸지 않는다 |
@@ -224,3 +226,17 @@ cd ai && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 
 .venv/bin/pytest -q --cov=review_ai
 .venv/bin/python scripts/validate_samples.py
 ```
+
+## 다중 환경 요청 연결 (기본 비활성)
+
+`ReviewRequested`와 `ReviewState`의 선택 필드 `deployment_request_id`가 부모 요청을 가리킨다.
+필드를 생략하면 기존 단일 환경 경로를 유지한다. 자식 검토는 승인·수정 후 `prepare_request`에서 끝나며,
+공유 verify 상태·원본 수정 커밋·CI·PR 병합·GitOps 쓰기는 부모 `RequestCoordinator`만 수행한다.
+수정 커밋으로 SHA가 바뀌면 선택한 모든 환경을 다시 검토하고 이전 SHA의 승인은 재사용하지 않는다.
+`GET /deployment-requests/{id}`의 인증된 부모·환경별 결과 API는 구현했으며,
+기존 개발자 HTML 화면에 부모 집계를 표시하는 작업은 별도로 남아 있다.
+
+`rollout.auto_promotion`은 수동 승격 여부, `rollout.auto_promotion_seconds`는 자동 승격 지연을 나타낸다.
+Argo Rollouts에서 자동 승격이 false면 지연은 무시된다. 현재 외부 DB 명세는
+`DB_PROVISIONING_REQUIRED` 보호가 남아 있으므로, DB가 준비되었다는 주장만으로 배포 통과로 표시하지 않는다.
+활성화·DB 인덱스·이미지 pin·복구 계약은 [다중 환경 안내](../../docs/multi-target.md)를 따른다.
