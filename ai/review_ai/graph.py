@@ -27,6 +27,7 @@ from review_ai.judge.node import make_judge
 from review_ai.judge.validate import overlay_files
 from review_ai.patching import PatchError, apply_ops, parse_pointer
 from review_ai.recommendations import resolve_human_decision
+from review_ai.resource_limits import check_resource_limits
 from review_ai.retrieval import Retriever, make_retrieve_evidence
 from review_ai.spec.deploy_spec import PIPELINE_FIELDS, DeploySpec
 from review_ai.state import Patch, ReviewState
@@ -90,7 +91,7 @@ def check_edited_ops(deploy_spec: dict[str, Any], ops: list[Any]) -> dict[str, A
             raise PatchError(f"{parse_pointer(op['path'])[0]} 은 사람이 고칠 수 없다 — 파이프라인이 채우는 관측 사실이다: "
                              f"{op['path']}")
     edited = apply_ops(deploy_spec, ops)
-    DeploySpec.model_validate(edited)
+    check_resource_limits(DeploySpec.model_validate(edited).runtime.resources)
     return edited
 
 
@@ -113,11 +114,12 @@ def route_after_judge(state: dict[str, Any]) -> str:
     return END
 
 
-def build_graph(llm: LlmClient | None, retriever: Retriever) -> Any:
+def build_graph(llm: LlmClient | None, retriever: Retriever, *, deterministic_fixes: bool = False,
+                strict_citations: bool = False) -> Any:
     graph = StateGraph(ReviewState)
     graph.add_node("static_check", make_static_check())
     graph.add_node("retrieve_evidence", make_retrieve_evidence(retriever))
-    graph.add_node("judge", make_judge(llm))
+    graph.add_node("judge", make_judge(llm, deterministic_fixes=deterministic_fixes, strict_citations=strict_citations))
     graph.add_node("apply_patch", apply_patch)
     graph.add_node("apply_human_edits", apply_human_edits)
     graph.add_conditional_edges(START, route_start, ["apply_human_edits", "static_check"])
@@ -149,11 +151,14 @@ def initial_state(deploy_spec: dict[str, Any], *, review_id: str, spec_ref: dict
     )
 
 
-async def run_graph(state: ReviewState, *, llm: LlmClient | None, retriever: Retriever) -> dict[str, Any]:
+async def run_graph(state: ReviewState, *, llm: LlmClient | None, retriever: Retriever,
+                    deterministic_fixes: bool = False, strict_citations: bool = False) -> dict[str, Any]:
     """최종 State + status(verdict) + applied_ops(원본에 적용할 ops) + patched(ops 가 하나라도 있는지).
 
     고쳐서 통과 = status == "pass" and patched. 수정 없이 통과면 applied_ops == [] 이다.
     """
-    final = await build_graph(llm, retriever).ainvoke(state, {"recursion_limit": RECURSION_LIMIT})
+    final = await build_graph(llm, retriever, deterministic_fixes=deterministic_fixes,
+                             strict_citations=strict_citations).ainvoke(
+        state, {"recursion_limit": RECURSION_LIMIT})
     ops = applied_ops(final)
     return {**final, "applied_ops": ops, "patched": bool(ops)}  # status 는 judge 가 verdict 로 채운다

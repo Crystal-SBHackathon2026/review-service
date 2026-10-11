@@ -35,8 +35,10 @@ EXCLUDE_LOW_FROM_HUMAN = True
 
 class Validation(TypedDict, total=False):
     llm_available: bool
+    deterministic_available: bool
     schema_ok: bool
     citations_ok: bool
+    chunk_citations_ok: bool
     patch_scope_ok: bool
 
 
@@ -47,10 +49,10 @@ def _counted(findings: Sequence[Finding]) -> list[Finding]:
 
 
 def _low_score(findings: Sequence[Finding], docs: Sequence[Doc]) -> bool:
-    # 지난 검토 사례(doc_type case)는 규칙 문서를 대신하지 않는다 — 문서 없는 규칙이 사례만으로 근거를 갖추면 안 된다
-    exact = {d["rule_id"] for d in docs if d["match"] == "exact_rule" and d["doc_type"] != "case"}
-    best_semantic = max((d["score"] for d in docs if d["match"] == "semantic"), default=0.0)
-    return any(f["rule_id"] not in exact for f in findings) and best_semantic < LOW_SCORE_THRESHOLD
+    # 근거는 finding마다 확인한다. 사례·사고·다른 규칙의 높은 검색 점수가 규칙 문서를 대신하지 않는다.
+    supported = {d["rule_id"] for d in docs if d["doc_type"] == "rule"
+                 and (d["match"] == "exact_rule" or d["score"] >= LOW_SCORE_THRESHOLD)}
+    return any(f["rule_id"] not in supported for f in findings)
 
 
 def _loop_exhausted(findings: Sequence[Finding], rounds: Sequence[dict[str, Any]]) -> bool:
@@ -76,7 +78,7 @@ def _human_reasons(
     rounds: Sequence[dict[str, Any]],
 ) -> set[str]:
     counted = _counted(findings)
-    available = validation.get("llm_available", False)
+    available = validation.get("llm_available", False) or validation.get("deterministic_available", False)
     reasons: set[str] = set()
     if available and not (validation.get("schema_ok") and validation.get("citations_ok")):
         reasons.add("CITATION_INVALID")
@@ -147,6 +149,10 @@ def round_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     }
     if decision.get("recommendations"):
         snapshot["recommendations"] = copy.deepcopy(decision["recommendations"])
+    if decision.get("patch_source"):
+        snapshot["patch_source"] = decision["patch_source"]
+    if decision.get("validation"):
+        snapshot["validation"] = copy.deepcopy(decision["validation"])
     return snapshot
 
 

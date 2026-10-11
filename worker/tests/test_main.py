@@ -16,6 +16,18 @@ from review_worker.main import AliveFile, consume, keep_alive_while, make_llm
 WORST_CASE_SECONDS = 10 * 60  # SDK 기본값(600초·재시도 2번)이면 한 검토가 judge 에서 최대 12×600초 멈췄다
 
 
+def test_review_features_default_off_and_reject_invalid_values(monkeypatch):
+    monkeypatch.delenv("REVIEW_STRICT_CITATIONS", raising=False)
+    monkeypatch.delenv("REVIEW_DETERMINISTIC_FIXES", raising=False)
+    assert main_module.review_feature_flags() == {"strict_citations": False, "deterministic_fixes": False}
+    monkeypatch.setenv("REVIEW_STRICT_CITATIONS", "true")
+    monkeypatch.setenv("REVIEW_DETERMINISTIC_FIXES", "1")
+    assert all(main_module.review_feature_flags().values())
+    monkeypatch.setenv("REVIEW_STRICT_CITATIONS", "tru")
+    with pytest.raises(ValueError, match="REVIEW_STRICT_CITATIONS"):
+        main_module.review_feature_flags()
+
+
 def test_judge_llm_is_bounded_and_retried_only_by_graph(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     client = make_llm()._inner._client  # type: ignore[union-attr]

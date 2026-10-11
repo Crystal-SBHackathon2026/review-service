@@ -71,6 +71,8 @@ class CaseResult:
     reasons: list[str]
     llm_calls: int
     citations_ok: bool | None
+    chunk_citations_ok: bool | None = None
+    expected_verdict: str = ""
     usage: dict[str, int] = field(default_factory=dict)
     seconds: float = 0.0
 
@@ -191,7 +193,7 @@ class _Run:
 
 
 async def resume(final: dict[str, Any], answer: dict[str, Any], llm: LlmClient,
-                 retriever: Retriever) -> tuple[dict[str, Any], str | None, bool]:
+                 retriever: Retriever, *, strict_citations: bool = False) -> tuple[dict[str, Any], str | None, bool]:
     """승인 API 와 같은 검사(resolve_human_decision → check_edited_ops)를 거쳐 재개.
 
     거절되면 (원래 상태, 사유, 상태가 그대로인가) — 승인 API 는 이때 422 를 돌려주고 검토를 재개하지 않는다.
@@ -204,7 +206,8 @@ async def resume(final: dict[str, Any], answer: dict[str, Any], llm: LlmClient,
         check_edited_ops(final["deploy_spec"], resolved["edited_ops"])
     except ValueError as exc:  # PatchError·ValidationError — 승인 API 는 422
         return final, str(exc), final == before
-    resumed = await run_graph({**final, "human_decision": human}, llm=llm, retriever=retriever)
+    resumed = await run_graph({**final, "human_decision": human}, llm=llm, retriever=retriever,
+                              strict_citations=strict_citations)
     return resumed, None, True
 
 
@@ -315,7 +318,7 @@ def _repair_factory(case: dict[str, Any], repairer: Repairer | None) -> Callable
 
 
 async def _execute(case: dict[str, Any], llm: RecordingLLM, make_repair: Callable[[], RecordingLLM],
-                   retriever: Retriever) -> _Run:
+                   retriever: Retriever, *, strict_citations: bool = False) -> _Run:
     outcome, kind, repair_llm = None, None, None
     if "intake" in case:
         kind, outcome, repair_llm = await run_intake(case, make_repair)
@@ -325,23 +328,30 @@ async def _execute(case: dict[str, Any], llm: RecordingLLM, make_repair: Callabl
         spec = yaml.safe_load(outcome.content)
     else:
         spec = build_spec(case)
-    final = await run_graph(initial_state(spec, review_id=f"eval-{case['id']}"), llm=llm, retriever=retriever)
+    unverified = outcome.unverified_paths if outcome else ()
+    final = await run_graph(initial_state(spec, review_id=f"eval-{case['id']}",
+                                         generated_spec=bool(unverified), unverified_paths=unverified),
+                            llm=llm, retriever=retriever, strict_citations=strict_citations)
     run = _Run(spec=spec, final=final, outcome=outcome, kind=kind, repair_llm=repair_llm)
     if "resume" in case:
         run.paused = final["decision"]["verdict"]
-        run.final, run.resume_error, run.unchanged = await resume(final, case["resume"], llm, retriever)
+        run.final, run.resume_error, run.unchanged = await resume(final, case["resume"], llm, retriever,
+                                                                strict_citations=strict_citations)
     return run
 
 
 async def run_case(case: dict[str, Any], reviewer: Callable[[], LlmClient], retriever: Retriever,
-                   repairer: Repairer | None = None) -> CaseResult:
+                   repairer: Repairer | None = None, *, strict_citations: bool = False) -> CaseResult:
     """reviewer 는 judge 자리, repairer 는 형식 오류 복구 자리(intake 케이스). 없으면 가짜 oracle 복구."""
     role, repair_role = case["llm"], _repair_role(case)
     llm = RecordingLLM(reviewer() if role == REVIEWER else FAKES[role]())
     started = time.perf_counter()
-    run = await _execute(case, llm, _repair_factory(case, repairer), retriever)
-    validation = run.final["decision"]["validation"] if run.final else {}
-    citations = validation.get("citations_ok") if validation.get("llm_available") else None
+    run = await _execute(case, llm, _repair_factory(case, repairer), retriever, strict_citations=strict_citations)
+    validations = ([r.get("validation") or {} for r in run.final["rounds"]]
+                   + [run.final["decision"]["validation"]]) if run.final else []
+    llm_validations = [v for v in validations if v.get("llm_available")]
+    citations = all(v.get("citations_ok", False) for v in llm_validations) if llm_validations else None
+    chunk_citations = all(v.get("chunk_citations_ok", False) for v in llm_validations) if llm_validations else None
     recorders = (llm, run.repair_llm) if run.repair_llm else (llm,)
     failures = _check(case, run, recorders)
     # 일부러 틀린 복구 가짜를 쓰는 케이스는 게이트 평가다 — reviewer 지표에 섞지 않는다
@@ -350,14 +360,18 @@ async def run_case(case: dict[str, Any], reviewer: Callable[[], LlmClient], retr
         case_id=case["id"], llm_role=label, ok=not failures, failures=failures,
         verdict=run.verdict, reasons=run.reasons, llm_calls=sum(len(r.requests) for r in recorders),
         citations_ok=citations, usage=_usage(*recorders), seconds=time.perf_counter() - started,
+        expected_verdict=case["expect"]["verdict"],
+        chunk_citations_ok=chunk_citations,
     )
 
 
 def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
     reviewer = [r for r in results if r.llm_role == REVIEWER]
     cited = [r.citations_ok for r in reviewer if r.citations_ok is not None]
-    pass_expected = {c["id"] for c in load_eval_cases() if c["expect"]["verdict"] == "pass"}
-    false_positive = [r for r in results if r.case_id in pass_expected and r.verdict != "pass"]
+    chunks = [r.chunk_citations_ok for r in reviewer if r.chunk_citations_ok is not None]
+    false_positive = [r for r in results if r.expected_verdict == "pass" and r.verdict != "pass"]
+    blocked = [r for r in results if r.expected_verdict in ("needs_human", INTAKE_REJECTED, "fix")]
+    unsafe = [r for r in blocked if r.verdict == "pass" or (r.expected_verdict != "fix" and r.verdict == "fix")]
     tokens: dict[str, int] = {}
     for r in results:
         for k, v in r.usage.items():
@@ -369,7 +383,10 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
         "gate_match_rate": (sum(r.ok for r in results if r.llm_role != REVIEWER)
                             / max(1, sum(1 for r in results if r.llm_role != REVIEWER))),
         "citation_valid_rate": sum(cited) / len(cited) if cited else None,
+        "chunk_citation_valid_rate": sum(chunks) / len(chunks) if chunks else None,
         "false_positive_on_pass": len(false_positive),
+        "unsafe_false_pass": len(unsafe),
+        "unsafe_false_pass_rate": len(unsafe) / len(blocked) if blocked else None,
         "llm_calls": sum(r.llm_calls for r in results),
         "tokens": tokens,
         "seconds": round(sum(r.seconds for r in results), 2),

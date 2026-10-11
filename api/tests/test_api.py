@@ -369,6 +369,44 @@ async def test_decision_edited_ops_checked_against_paused_spec(env: Env, ops: li
     assert rejected.status_code == 202  # 거절이면 ops 를 보지 않는다
 
 
+@pytest.mark.parametrize("mode", ["default", "stored", "explicit", "invalid_waiver"])
+async def test_resource_approval_rejects_unsafe_values_before_kafka_publish(env: Env, mode: str) -> None:
+    spec = yaml.safe_load(sample_text("23-fix-busan-resource-limits.yaml"))
+    spec["runtime"]["resources"]["memory_request"] = "256Mi"
+    env.put_spec(yaml.safe_dump(spec))
+    rid = env.request_review().json()["review_id"]
+    unsafe = {"op": "add", "path": "/runtime/resources/memory_limit", "value": "128Mi"}
+    decision = {"recommendations": [{"ops": [unsafe]}]} if mode == "stored" else {"recommendations": []}
+    body = {"decision": "approved", "approver": "tester"}
+    if mode == "explicit":
+        body["edited_ops"] = [unsafe]
+    if mode == "invalid_waiver":
+        spec["runtime"]["resources"]["memory_limit"] = "128Mi"
+        body["use_recommendations"] = False
+    await env.set_status(rid, status="needs_human", final_spec=spec, decision=decision)
+    sent = len(env.publisher.sent)
+    resp = env.client.post(f"/reviews/{rid}/decision", json=body)
+    assert resp.status_code == 422 and "memory_limit" in resp.json()["detail"]["errors"]
+    assert len(env.publisher.sent) == sent
+
+
+@pytest.mark.parametrize("waive_missing", [False, True])
+async def test_resource_approval_accepts_safe_limit_or_explicit_missing_limit_waiver(env: Env, waive_missing: bool) -> None:
+    spec = yaml.safe_load(sample_text("23-fix-busan-resource-limits.yaml"))
+    spec["runtime"]["resources"]["memory_request"] = "256Mi"
+    env.put_spec(yaml.safe_dump(spec))
+    rid = env.request_review().json()["review_id"]
+    await env.set_status(rid, status="needs_human", final_spec=spec, decision={"recommendations": []})
+    body = {"decision": "approved", "approver": "tester"}
+    if waive_missing:
+        body["use_recommendations"] = False
+    else:
+        body["edited_ops"] = [{"op": "add", "path": "/runtime/resources/memory_limit", "value": "256Mi"}]
+    sent = len(env.publisher.sent)
+    assert env.client.post(f"/reviews/{rid}/decision", json=body).status_code == 202
+    assert len(env.publisher.sent) == sent + 1
+
+
 # --- POST /webhooks/github -------------------------------------------------------------------------
 
 

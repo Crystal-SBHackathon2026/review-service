@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -25,10 +26,12 @@ from typing import Any
 from pydantic import ValidationError
 
 from review_ai.catalog import load_targets
+from review_ai.failure_evidence import safe_text
 from review_ai.judge.prompt import RULE_PATCH_PATHS
 from review_ai.judge.schema import LlmPatch, LlmReview
 from review_ai.overlay import overlay_diff
 from review_ai.patching import PatchError, apply_ops, changed_paths, parse_pointer, path_under
+from review_ai.resource_limits import check_resource_limits
 from review_ai.secrets_pattern import MASK, looks_secret, redact
 from review_ai.spec.deploy_spec import DeploySpec
 from review_ai.state import Doc, Finding, Patch, PatchOp
@@ -55,13 +58,41 @@ def parse_review(text: str, findings: Sequence[Finding]) -> LlmReview | None:
     return _sanitized(review)
 
 
-def citations_ok(review: LlmReview, findings: Sequence[Finding], docs: Sequence[Doc]) -> bool:
-    available = {d["rule_id"] for d in docs if d["rule_id"]}
+def citations_ok(review: LlmReview, findings: Sequence[Finding], docs: Sequence[Doc], *, strict: bool = True) -> bool:
+    available = {d["chunk_id"]: d for d in docs}
+    available_rules = {d["rule_id"] for d in docs if d["rule_id"]}
     rule_of = {f["finding_id"]: f["rule_id"] for f in findings}
-    return all(
-        set(item.cited_rule_ids) <= available and rule_of[item.finding_id] in item.cited_rule_ids
-        for item in review.items
-    )
+    for item in review.items:
+        own_rule = rule_of[item.finding_id]
+        if not set(item.cited_rule_ids) <= available_rules or own_rule not in item.cited_rule_ids:
+            return False
+        ids = item.cited_chunk_ids
+        if len(ids) != len(set(ids)) or not set(ids) <= available.keys():
+            return False
+        cited = [available[cid] for cid in ids]
+        if strict and not any(
+            d["doc_type"] == "rule" and d["rule_id"] == own_rule for d in cited
+        ):
+            return False
+    return True
+
+
+def citation_evidence(review: LlmReview, docs: Sequence[Doc]) -> dict[str, list[dict[str, Any]]]:
+    """유효한 인용의 당시 내용을 저장한다. 비밀 제거·크기 제한 뒤의 본문 해시로 변경 여부를 비교할 수 있다."""
+    by_id = {d["chunk_id"]: d for d in docs}
+    result = {}
+    for item in review.items:
+        evidence = []
+        for cid in item.cited_chunk_ids:
+            if cid not in by_id:
+                continue
+            d = by_id[cid]
+            text = safe_text(d["text"])
+            evidence.append(dict(chunk_id=cid, rule_id=d["rule_id"], doc_type=d["doc_type"],
+                                 source_uri=safe_text(d["source_uri"])[:512], excerpt=text[:800],
+                                 content_hash=hashlib.sha256(text.encode()).hexdigest(), truncated=len(text) > 800))
+        result[item.finding_id] = evidence
+    return result
 
 
 def _overlaps(path: str, pattern: str) -> bool:
@@ -178,6 +209,25 @@ def _resolves_without_new(before_findings: Sequence[Finding], after: DeploySpec,
     return not ({f["finding_id"] for f in after_findings} & targets) and all(f["severity"] == "low" for f in new)
 
 
+def _fills_only_missing_resource_limits(before: DeploySpec, after: DeploySpec, target_rules: set[str]) -> bool:
+    """RUN-005 는 누락된 상한만 채운다. 요청값보다 작은 상한은 Kubernetes 에서 거절된다."""
+    if "RUN-005" not in target_rules:
+        return True
+    old, new = before.runtime.resources, after.runtime.resources
+    if (old.cpu_request, old.memory_request) != (new.cpu_request, new.memory_request):
+        return False
+    if any(getattr(old, field) is not None and getattr(old, field) != getattr(new, field)
+           for field in ("cpu_limit", "memory_limit")):
+        return False
+    if new.cpu_limit is None or new.memory_limit is None:
+        return False
+    try:
+        check_resource_limits(new)
+    except ValueError:
+        return False
+    return True
+
+
 def _parse_ops(llm_patch: LlmPatch) -> list[PatchOp] | None:
     try:
         return [op.to_patch_op() for op in llm_patch.ops]
@@ -211,6 +261,7 @@ def build_patch(llm_patch: LlmPatch, findings: Sequence[Finding], spec: dict[str
         _env_only_drops_shadowed(before, after, [by_id[fid] for fid in targets]),
         _secrets_only_drop_duplicates(before, after),
         _cidrs_only_drop_full_range(before, after),
+        _fills_only_missing_resource_limits(before, after, target_rules),
         _resolves_without_new(findings, after, targets),
     )
     if not all(guards):
@@ -228,7 +279,7 @@ def overlay_files(before: DeploySpec, after: DeploySpec) -> list[dict[str, str]]
 
 
 def validate_output(
-    text: str, findings: Sequence[Finding], docs: Sequence[Doc], spec: dict[str, Any]
+    text: str, findings: Sequence[Finding], docs: Sequence[Doc], spec: dict[str, Any], *, strict_citations: bool = True
 ) -> tuple[LlmReview | None, Validation, Patch | None]:
     review = parse_review(text, findings)
     if review is None:
@@ -237,7 +288,8 @@ def validate_output(
     validation = Validation(
         llm_available=True,
         schema_ok=True,
-        citations_ok=citations_ok(review, findings, docs),
+        citations_ok=citations_ok(review, findings, docs, strict=strict_citations),
+        chunk_citations_ok=citations_ok(review, findings, docs, strict=True),
         patch_scope_ok=review.patch is None or patch is not None,
     )
     return review, validation, patch

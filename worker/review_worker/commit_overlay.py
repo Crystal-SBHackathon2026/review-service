@@ -32,7 +32,7 @@ __all__ = ["GitClient", "make_commit_overlay", "make_overlay_guard", "commit_mes
 # 10/09 sample-app#11: network: {} 명세 → ingress.yaml 삭제 → ALB 삭제(10분 장애, 주소 변경).
 # pvc-*.yaml: 명세에서 persistent 볼륨을 빼거나 이름을 바꾸면 PVC 가 지워진다. local-path(local)·GKE 기본
 # StorageClass 는 reclaim Delete 라 데이터(SQLite 파일)도 같이 사라진다. 일부러 지우려면 사람이 gitops 에서 지운다.
-PROTECTED_OVERLAY_FILES: tuple[str, ...] = ("ingress.yaml", "pvc-*.yaml")
+PROTECTED_OVERLAY_FILES: tuple[str, ...] = ("ingress.yaml", "pvc-*.yaml", "service-public.yaml")
 OVERLAY_RESOURCE_REMOVED = "OVERLAY_RESOURCE_REMOVED"
 
 

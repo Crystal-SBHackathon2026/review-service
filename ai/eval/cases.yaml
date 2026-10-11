@@ -221,6 +221,16 @@ cases:
     expect: {verdict: pass, findings: [NET-001, STO-004], rounds: 1, values: {/storage/buckets/0/encryption: true}}
 
   # ── 배포 계획: 스키마·DB 변경이면 전략을 bluegreen 으로, 호환 안 되는 스키마 변경은 사람에게 ──────────
+  - id: demo-busan-resource-fix
+    sample: 23-fix-busan-resource-limits.yaml
+    llm: reviewer
+    expect: {verdict: pass, findings: [NET-001, RUN-005], rounds: 1, llm_calls: 1,
+             values: {/runtime/resources/cpu_limit: 250m, /runtime/resources/memory_limit: 128Mi}}
+  - id: demo-tokyo-human-manual-bluegreen
+    sample: 24-human-tokyo-manual-bluegreen.yaml
+    llm: reviewer
+    expect: {verdict: needs_human, reasons_include: [AUTOFIX_FORBIDDEN], findings: [NET-001, RUN-006], rounds: 0,
+             values: {/rollout/strategy: bluegreen, /rollout/auto_promotion: false}}
   - id: plan-db-switch-without-data-goes-bluegreen
     sample: 04-human-engine-change-with-data.yaml
     mutate:
@@ -274,6 +284,11 @@ cases:
     intake: {repo: sample-app, file: missing}
     llm: reviewer
     expect: {intake_kind: missing, intake: generated, verdict: pass, findings: [], llm_calls: 0}
+  - id: e01b-missing-unverified
+    intake: {repo: sample-app-unverified, file: missing}
+    llm: reviewer
+    expect: {intake_kind: missing, intake: generated, verdict: needs_human,
+             reasons_include: [GENERATED_SPEC_UNVERIFIED], llm_calls: 0}
   - id: e02-empty                # 배포된 앱의 명세를 비운 PR — baseline 의 ingress·replicas·env 를 그대로 둔다 (sample-app #11)
     intake: {repo: sample-app, raw: "# 나중에 채운다\n", baseline: 01-pass-sample-app-aws.yaml}
     llm: reviewer

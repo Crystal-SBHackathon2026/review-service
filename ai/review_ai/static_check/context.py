@@ -54,7 +54,7 @@ def make_finding(rule: Rule, hit: Hit, ctx: CheckContext) -> Finding:
         finding_id=finding_id(rule.id, hit.spec_path),
         rule_id=rule.id,
         category=rule.category,  # type: ignore[typeddict-item]
-        severity=rule.severity,
+        severity=rule.severity_for(ctx.spec.target.env),
         autofix=autofix,  # type: ignore[typeddict-item]
         irreversible=rule.irreversible,
         title=rule.title,

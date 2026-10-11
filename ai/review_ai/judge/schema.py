@@ -26,6 +26,8 @@ class _Strict(BaseModel):
 class LlmItem(_Strict):
     finding_id: str
     cited_rule_ids: list[str] = Field(description="근거로 쓴 규칙 ID. 제공된 문서에 있는 것만")
+    cited_chunk_ids: list[str] = Field(default_factory=list, max_length=6,
+                                      description="실제로 인용한 evidence chunk_id. 자기 규칙 문서 조각을 반드시 포함")
     why: str = Field(max_length=MAX_WHY_CHARS, description="위험 설명 (한국어, 비밀 값 금지)")
     fix_kind: Literal["config", "env", "code", "none"]
 

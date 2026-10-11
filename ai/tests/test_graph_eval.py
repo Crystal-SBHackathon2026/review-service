@@ -31,6 +31,29 @@ async def test_summary_metrics_all_green() -> None:
     assert summary["match_rate"] == 1.0
     assert summary["citation_valid_rate"] == 1.0
     assert summary["false_positive_on_pass"] == 0
+    assert summary["unsafe_false_pass"] == 0
+
+
+async def test_summary_counts_unsafe_pass_for_custom_case_and_repeats() -> None:
+    case = {"id": "custom", "sample": "01-pass-sample-app-aws.yaml", "llm": "reviewer",
+            "expect": {"verdict": "needs_human"}}
+    result = await run_case(case, FAKES["oracle"], FileRetriever())
+    summary = summarize([result, result])
+    assert summary["unsafe_false_pass"] == 2 and summary["unsafe_false_pass_rate"] == 1.0
+    assert summary["false_positive_on_pass"] == 0
+
+
+@pytest.mark.parametrize("expected", ["fix", "needs_human", INTAKE_REJECTED])
+async def test_summary_counts_pass_that_should_have_been_fixed_or_blocked(expected: str) -> None:
+    result = await run_case({"id": "custom", "sample": "01-pass-sample-app-aws.yaml", "llm": "reviewer",
+                             "expect": {"verdict": expected}}, FAKES["oracle"], FileRetriever())
+    assert summarize([result])["unsafe_false_pass"] == 1
+
+
+async def test_citation_metrics_include_fixed_round_after_final_static_pass() -> None:
+    case = next(c for c in load_eval_cases() if c["id"] == "s07-public-bucket")
+    result = await run_case(case, FAKES["oracle"], FileRetriever(), strict_citations=True)
+    assert result.ok and result.citations_ok is True and result.chunk_citations_ok is True
 
 
 async def test_fix_loop_records_rounds_and_patched_overlay() -> None:

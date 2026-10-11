@@ -25,10 +25,14 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from prometheus_client import start_http_server
 
+from review_ai.spec.deployment_request import registered_targets
+from review_worker.request_coordinator import RequestCoordinator
+from review_worker.request_gitops import RequestGitOps
 from review_ai.judge.llm import CachedLLM, ClaudeLLM, LlmUnavailable
 from review_ai.messages import TOPIC as REQUESTED_TOPIC
 from review_ai.retrieval.case_retriever import CaseRetriever
 from review_ai.retrieval.runtime import make_retriever, qdrant_from_url
+from review_common.deployment_requests import activate_multitarget
 from review_common.github import GitHubClient, GitHubGitClient
 from review_common.kafka import KafkaPublisher
 from review_common.migrate import migrate
@@ -50,6 +54,18 @@ GROUP_ID = "review-worker"
 JUDGE_CLIENT_OPTIONS: dict[str, Any] = {"timeout": 120.0, "max_retries": 0}
 ALIVE_FILE = "/tmp/worker-alive"
 ALIVE_TOUCH_SECONDS = 30.0  # 처리 중 갱신 주기 — probe 기준(2분)보다 넉넉히 짧게
+
+
+def review_feature_flags() -> dict[str, bool]:
+    """검증 뒤 명시적으로 활성화한다. 설정 오타로 정책이 바뀌면 시작을 거부한다."""
+    flags = {}
+    for name, field in (("REVIEW_STRICT_CITATIONS", "strict_citations"),
+                        ("REVIEW_DETERMINISTIC_FIXES", "deterministic_fixes")):
+        value = os.environ.get(name, "false").strip().lower()
+        if value not in {"true", "false", "1", "0"}:
+            raise ValueError(f"{name} must be true/false or 1/0")
+        flags[field] = value in {"true", "1"}
+    return flags
 
 
 def make_llm() -> CachedLLM | None:
@@ -124,11 +140,18 @@ def make_analysis_llm():
 
 
 async def run() -> None:
+    features = review_feature_flags()
     start_http_server(int(os.environ.get("METRICS_PORT") or DEFAULT_METRICS_PORT))
+    multi_target_enabled = os.environ.get("MULTI_TARGET_ENABLED", "false").lower() == "true"
+    registry = registered_targets(os.environ.get("DEPLOYMENT_TARGETS_JSON"))
+    if multi_target_enabled and not registry:
+        raise ValueError("multi-target mode requires registered destinations")
     conninfo = db_conninfo()
     await migrate(conninfo)
     pool = make_pool(conninfo)
     await pool.open(wait=True)
+    if multi_target_enabled:
+        await activate_multitarget(pool)
     github = GitHubClient()
     max_poll_interval_ms = int(os.environ.get("KAFKA_MAX_POLL_INTERVAL_MS", "900000"))  # judge 재시도까지 기다린다
     consumer = AIOKafkaConsumer(
@@ -147,6 +170,7 @@ async def run() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     outbox = None
+    request_sweep = None
     try:
         checkpointer = AsyncPostgresSaver(pool)
         await checkpointer.setup()
@@ -154,12 +178,16 @@ async def run() -> None:
         await producer.start()
         # 규칙 문서(파일) → Qdrant 의미 검색(QDRANT_URL 이 있을 때, 실패하면 건너뜀) → 판단 사례
         retriever = make_retriever(CaseRetriever(repo), qdrant=qdrant_from_url(os.environ.get("QDRANT_URL")))
-        gitops = GitHubGitClient(github)  # gitops 레포: GITOPS_REPO
+        gitops = GitHubGitClient(github, preserve_overlay_images=multi_target_enabled)  # gitops 레포: GITOPS_REPO
         deps = Deps(repo=repo, github=github, publisher=KafkaPublisher(producer), llm=make_llm(),
                     retriever=retriever, commit_overlay=make_commit_overlay(gitops),
                     overlay_guard=make_overlay_guard(gitops),
                     ci_app_slug=os.environ.get("GITHUB_CI_APP_SLUG", "github-actions") or None,
-                    public_url=os.environ.get("REVIEW_API_PUBLIC_URL") or None)
+                    public_url=os.environ.get("REVIEW_API_PUBLIC_URL") or None, **features)
+        if multi_target_enabled:
+            coordinator = RequestCoordinator(repo, github, deps.publisher, RequestGitOps(gitops), registry,
+                                             ci_app_slug=deps.ci_app_slug)
+            request_sweep = asyncio.create_task(coordinator.sweep())
         graph = build_graph(deps, checkpointer)
         handler = ReviewHandler(repo, graph, files=github)
         analysis_handler = DeploymentAnalysisHandler(repo, make_analysis_llm(), retriever)
@@ -173,6 +201,9 @@ async def run() -> None:
         finally:
             lag.cancel()
     finally:
+        if request_sweep is not None:
+            request_sweep.cancel()
+            await asyncio.gather(request_sweep, return_exceptions=True)
         if outbox is not None:
             outbox.cancel()
             await asyncio.gather(outbox, return_exceptions=True)

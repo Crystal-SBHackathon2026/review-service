@@ -1,0 +1,42 @@
+# Argo CD Application: GitOps 레포의 local overlay 를 부산 로컬 k3s 클러스터에 배포한다.
+#
+# 🔴 이 파일은 로컬 클러스터의 Argo CD 에만 적용한다. EKS 에 적용하지 않는다.
+#
+# 운영 모델은 "로컬 자체 Argo CD(pull)" 다 (2026-10-09 합의). 로컬 클러스터 안에 Argo CD 를
+# 두고 그 Argo CD 가 이 레포를 직접 읽는다. 중앙 EKS 에서 로컬 API 로 들어오는 경로(Tailscale
+# 등)를 데모 중에 유지하지 않아도 되는 쪽을 택했다.
+#
+# destination 을 server 가 아니라 name 으로 쓰는 이유:
+#   server: kubernetes.default.svc  → "Argo CD 가 있는 클러스터". EKS 에 적용하면 EKS 자신이
+#                                     되어 local overlay 가 aws overlay 를 밀어낸다
+#                                     (네임스페이스가 둘 다 sample-app 이다). 10/9 에 실제로
+#                                     이 상태였고 gitops#25 로 막았다
+#   name: crystal-busan             → 로컬 Argo CD 에만 등록된 이름이라 EKS 에 적용하면
+#                                     "cluster not found" 로 **명확히 실패**한다
+#
+# 등록 방법은 argocd/install/README.md 의 "로컬(부산) 클러스터" 절에 있다.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sample-app-local
+  namespace: argocd
+spec:
+  project: default
+  # 소스가 둘이다. overlay 는 렌더러가 만드는 생성물이고, 분석은 손으로 관리한다.
+  # 🔴 분석 경로가 환경마다 다르다 — Prometheus 가 있는 곳만 에러율 지표를 켠다 (#24).
+  sources:
+    - repoURL: https://github.com/Crystal-SBHackathon2026/gitops.git
+      targetRevision: main
+      path: apps/sample-app/overlays/local
+    - repoURL: https://github.com/Crystal-SBHackathon2026/gitops.git
+      targetRevision: main
+      path: apps/sample-app/analysis/default
+  destination:
+    name: crystal-busan
+    namespace: sample-app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -44,6 +44,21 @@ async def test_prompt_masks_secrets_and_is_hash_stable() -> None:
     assert a.input_hash == b.input_hash
 
 
+async def test_rollout_patch_needs_real_parent_and_prompt_explains_it() -> None:
+    state = await prepared("04-human-engine-change-with-data.yaml")
+    state["deploy_spec"]["baseline"]["facts"]["database_has_data"] = False
+    state["findings"] = run_static_check(DeploySpec.model_validate(state["deploy_spec"]))
+    state["retrieved_docs"] = await FileRetriever().search(state["findings"], state["target_env"])
+    request = build_request(state["deploy_spec"], state["findings"], state["retrieved_docs"], state["target_env"])
+    assert "rollout 키가 없으면 /rollout/strategy에 add하지 말고" in request.system
+    out = oracle_review(request)
+    _, validation, patch = validate_output(json.dumps(out), state["findings"], state["retrieved_docs"], state["deploy_spec"])
+    assert validation["patch_scope_ok"] and patch is not None
+    out["patch"]["ops"] = [{"op": "add", "path": "/rollout/strategy", "value_json": '"bluegreen"'}]
+    _, validation, patch = validate_output(json.dumps(out), state["findings"], state["retrieved_docs"], state["deploy_spec"])
+    assert not validation["patch_scope_ok"] and patch is None
+
+
 # ── 출력 검증 ────────────────────────────────────────────────────
 
 
@@ -71,6 +86,64 @@ async def test_item_must_cite_its_own_rule() -> None:
     out["items"][0]["cited_rule_ids"] = ["STO-003"]
     _, validation, _ = validate_output(json.dumps(out), state["findings"], state["retrieved_docs"], state["deploy_spec"])
     assert validation["citations_ok"] is False
+
+
+@pytest.mark.parametrize("ids", [[], ["invented-chunk"], ["DUPLICATE", "DUPLICATE"]])
+async def test_strict_chunk_citations_reject_missing_unknown_and_duplicate(ids) -> None:
+    state = await prepared("07-fix-public-bucket.yaml")
+    out = oracle_text(state)
+    valid_id = out["items"][0]["cited_chunk_ids"][0]
+    out["items"][0]["cited_chunk_ids"] = [valid_id if cid == "DUPLICATE" else cid for cid in ids]
+    _, validation, _ = validate_output(json.dumps(out), state["findings"], state["retrieved_docs"], state["deploy_spec"])
+    assert not validation["citations_ok"]
+
+
+async def test_shared_guide_representative_rule_does_not_require_equal_id_sets() -> None:
+    state = await prepared("10-human-mixed-aws.yaml")
+    out = oracle_text(state)
+    state["retrieved_docs"].append(dict(chunk_id="shared-guide", rule_id="RUN-001", doc_type="guide",
+                                      match="exact_rule", score=1.0, provider="any", source_uri="guide.md", text="shared"))
+    bucket = next(i for i in out["items"] if i["cited_rule_ids"] == ["STO-003"])
+    bucket["cited_chunk_ids"].append("shared-guide")
+    _, validation, _ = validate_output(json.dumps(out), state["findings"], state["retrieved_docs"], state["deploy_spec"])
+    assert validation["citations_ok"] and validation["chunk_citations_ok"]
+
+
+async def test_compatible_mode_records_missing_chunks_without_disabling_autofix() -> None:
+    def legacy(request):
+        out = oracle_review(request)
+        for item in out["items"]:
+            item.pop("cited_chunk_ids")
+        return out
+    state = await prepared("07-fix-public-bucket.yaml")
+    compatible = await make_judge(ScriptedLLM(legacy))(state)
+    strict = await make_judge(ScriptedLLM(legacy), strict_citations=True)(state)
+    assert compatible["decision"]["verdict"] == "fix"
+    assert not compatible["decision"]["validation"]["chunk_citations_ok"]
+    assert compatible["decision"]["items"][0]["citation_status"] == "rule_only"
+    assert strict["decision"]["reasons"] == ["CITATION_INVALID"]
+
+
+async def test_cited_case_cannot_replace_own_rule_chunk_in_strict_mode() -> None:
+    state = await prepared("07-fix-public-bucket.yaml")
+    out = oracle_text(state)
+    state["retrieved_docs"].append(dict(chunk_id="old-case", rule_id="STO-003", doc_type="case",
+                                      match="exact_rule", score=1.0, provider="any", source_uri="review://old", text="case"))
+    out["items"][0]["cited_chunk_ids"] = ["old-case"]
+    _, validation, _ = validate_output(json.dumps(out), state["findings"], state["retrieved_docs"], state["deploy_spec"])
+    assert not validation["citations_ok"]
+
+
+async def test_citation_evidence_is_redacted_bounded_and_saved_in_decision() -> None:
+    state = await prepared("07-fix-public-bucket.yaml")
+    cid = oracle_text(state)["items"][0]["cited_chunk_ids"][0]
+    doc = next(d for d in state["retrieved_docs"] if d["chunk_id"] == cid)
+    doc["text"] = "password=never-display " + "x" * 1000
+    out = await make_judge(FAKES["oracle"](), strict_citations=True)(state)
+    evidence = out["decision"]["items"][0]["evidence"][0]
+    assert "never-display" not in evidence["excerpt"]
+    assert len(evidence["excerpt"]) == 800 and evidence["truncated"]
+    assert len(evidence["content_hash"]) == 64
 
 
 FIX_BUCKET = {"op": "replace", "path": "/storage/buckets/0/public", "value_json": "false"}
@@ -332,7 +405,7 @@ async def test_node_low_only_skips_llm() -> None:
 async def test_node_returns_patch_only_for_fix() -> None:
     out = await make_judge(FAKES["oracle"]())(await prepared("07-fix-public-bucket.yaml"))
     assert out["decision"]["verdict"] == "fix" and out["patch"] is not None
-    assert out["decision"]["llm"]["prompt_version"] == "judge-v3"
+    assert out["decision"]["llm"]["prompt_version"] == "judge-v4"
     human = await make_judge(FAKES["oracle"]())(await prepared("10-human-mixed-aws.yaml"))
     assert human["decision"]["verdict"] == "needs_human" and human["patch"] is None
 

@@ -73,6 +73,8 @@ class Decision(TypedDict):
     extra_opinions: list[str]  # findings 밖 LLM 의견. verdict 에 영향 없음
     validation: dict[str, bool]  # {schema_ok, citations_ok, patch_scope_ok}
     llm: dict[str, Any] | None  # {model, prompt_version, usage, input_hash}
+    patch_source: NotRequired[Literal["llm", "deterministic"]]
+    failure_case_observation: NotRequired[dict[str, Any]]  # 관찰 메타데이터. 판정·배포 차단에 쓰지 않는다
     recommendations: NotRequired[list[dict[str, Any]]]  # {finding_ids, source, why, ops}; 미입력 보충용
 
 
@@ -111,6 +113,7 @@ class HumanDecision(TypedDict):
 
 class ReviewState(TypedDict, total=False):
     review_id: str
+    deployment_request_id: str | None
     target_env: TargetEnv
     spec_ref: dict[str, str]  # {repository, commit, path}
     deploy_spec: dict[str, Any]  # 워커가 baseline 까지 채운 명세 (dict)
