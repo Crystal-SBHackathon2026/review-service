@@ -58,7 +58,9 @@ class DeploymentAnalysisHandler:
         except (TransientError, TimeoutError):
             status = "pending" if job["attempts"] < MAX_ATTEMPTS else "failed"
             result, code = fallback, "ANALYSIS_TRANSIENT" if status == "pending" else "RETRIES_EXHAUSTED"
-        except Exception:
+        except Exception as e:  # 원인을 남기지 않으면 fallback 결과만 보고 왜 무효였는지 알 수 없다
+            log.warning("배포 분석 결과 무효 event_id=%s error=%s: %s",
+                        msg.event_id, type(e).__name__, str(e).replace("\n", " ")[:500])
             status, result, code = "failed", fallback, "ANALYSIS_INVALID"
         # Immutable event input plus lease guard prevents a reclaimed worker from overwriting the new result.
         case = None

@@ -12,8 +12,10 @@ failed 는 어느 단계에서 났는지 저장하지 않아서 merge_sha·error
 
 환경 카드: DEPLOY_ENVS(실제, 기본 aws,local)와 PLANNED_ENVS(계획, 기본 gcp). 대상 환경은 렌더 결과(deploy_result)까지,
 다른 실제 환경은 배포 알림만 (review_api.argocd 의 cross_env 기록). 앱 주소는 APP_URLS (JSON {app: {env: url}}).
+모니터링 링크는 GRAFANA_URL 의 앱 대시보드(uid apps-{app})에 var-env={env}. GRAFANA_URL 이 비면 null.
 
-Degraded 중 Argo Rollouts 자동 중단(카나리 분석 실패·progressDeadlineAbort)은 알림 payload 로 가른다 (rollout_abort).
+Degraded 중 Argo Rollouts 자동 중단(카나리 분석 실패·progressDeadlineAbort)은 알림 payload 로 가른다 (rollout_abort) —
+Rollout 헬스 message 가 있으면 그것으로, 없으면(Argo CD v3) images 에 이 검토의 태그와 이전 태그가 같이 있는지로.
 대상 환경만 실패하고 다른 환경은 Healthy 면 배포 단계는 partial (부분 완료).
 """
 
@@ -22,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from urllib.parse import quote
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -129,19 +132,40 @@ def parse_app_urls(raw: str | None) -> dict[str, dict[str, str]]:
     return urls
 
 
+def parse_grafana_url(raw: str | None) -> str | None:
+    """GRAFANA_URL — http(s) 주소만. 끝의 / 는 뗀다. 아니면 경고하고 None (화면은 모니터링 버튼을 숨긴다)."""
+    url = (raw or "").strip().rstrip("/")
+    if not url:
+        return None
+    if not re.match(r"^https?://[^\s\"'<>?#]+$", url):
+        log.warning("GRAFANA_URL 이 http(s) 주소가 아니다 — 모니터링 링크 없이 시작")
+        return None
+    return url
+
+
+def monitoring_url(grafana_url: str | None, app: str, env: str) -> str | None:
+    """앱 대시보드(uid apps-{app}, gitops monitoring/dashboards/{app}.json)의 그 환경. env 변수 값은 aws·gcp·local
+    (sample-app overlay 의 DEPLOY_ENV → 메트릭 env 라벨)."""
+    if not grafana_url:
+        return None
+    return f"{grafana_url}/d/apps-{quote(app, safe='')}?var-env={quote(env, safe='')}"
+
+
 @dataclass(frozen=True)
 class ProgressSettings:
     deploy_envs: tuple[str, ...] = ("aws", "local")  # DEPLOY_ENVS — 배포 알림이 오는 실제 환경
     planned_envs: tuple[str, ...] = ("gcp",)          # PLANNED_ENVS — 화면에 "계획"으로만 보이는 환경
     app_urls: Mapping[str, Mapping[str, str]] = field(default_factory=dict)  # APP_URLS
     gitops_repo: str = DEFAULT_GITOPS_REPO            # GITOPS_REPO — overlay 커밋 링크
+    grafana_url: str | None = None                    # GRAFANA_URL — 환경 카드의 모니터링 링크. 없으면 버튼 숨김
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> ProgressSettings:
         return cls(deploy_envs=_envs(environ.get("DEPLOY_ENVS"), cls.deploy_envs),
                    planned_envs=_envs(environ.get("PLANNED_ENVS"), cls.planned_envs),
                    app_urls=parse_app_urls(environ.get("APP_URLS")),
-                   gitops_repo=environ.get("GITOPS_REPO") or DEFAULT_GITOPS_REPO)
+                   gitops_repo=environ.get("GITOPS_REPO") or DEFAULT_GITOPS_REPO,
+                   grafana_url=parse_grafana_url(environ.get("GRAFANA_URL")))
 
 
 # --- 이력 -----------------------------------------------------------------------------------------
@@ -249,24 +273,35 @@ def _image_tag(image: Any) -> str | None:
     return last.rsplit(":", 1)[1] if ":" in last else None
 
 
-def rollout_abort(event: dict[str, Any]) -> dict[str, Any] | None:
+def _same_tag(a: str, b: str) -> bool:
+    return bool(a) and bool(b) and (a.startswith(b) or b.startswith(a))  # 짧은 SHA·전체 SHA 어느 쪽이든
+
+
+def rollout_abort(event: dict[str, Any], merge_sha: str | None = None) -> dict[str, Any] | None:
     """Degraded 알림이 Argo Rollouts 자동 중단인지. 중단이면 {"serving_tag": 지금 서비스 중인 이전 버전 태그 | None}.
 
-    알림 payload 의 resources 는 Application status.resources 다. Argo CD(v3.5.4) Rollout 헬스 검사는 Rollout 의
-    status.phase·message 를 그대로 올린다 — 중단이면 health {status: Degraded, message: "RolloutAborted: Rollout aborted
-    update to revision N: …"}. Rollout 이 Degraded 여도 message 에 abort 가 없으면(형식 오류 등) 중단으로 보지 않는다.
-    이전 버전 태그는 images 중 이 검토의 태그(image_tag, 병합 SHA)가 아닌 것 — 중단 직후엔 새 태그도 같이 올 수 있다."""
+    알림 payload 의 resources 는 Application status.resources 다. Rollout 헬스가 거기 실려 오면 그 message 로 가른다 —
+    중단이면 health {status: Degraded, message: "RolloutAborted: Rollout aborted update to revision N: …"}. Rollout 이
+    Degraded 여도 message 에 abort 가 없으면(형식 오류 등) 중단으로 보지 않는다.
+
+    Argo CD v3 는 리소스 헬스를 status.resources 에 저장하지 않는다(health 가 null). 그때는 images 로 가른다:
+    payload.images 는 Application status.summary.images — 그 순간 클러스터에 떠 있는 파드들의 이미지다. 이 검토의
+    태그(병합 SHA)와 다른 태그가 같이 있으면 새 버전은 막혔고 이전 버전이 아직 서비스 중이다(카나리 분석 실패·
+    progressDeadlineAbort). 이 검토의 태그만 있으면 새 버전이 다 올라간 뒤 깨진 것이라 중단이 아니다."""
     payload = event.get("payload") or {}
     if event.get("kind") != "degraded":
         return None
-    messages = [str((r.get("health") or {}).get("message") or "") for r in payload.get("resources") or []
-                if isinstance(r, dict) and r.get("kind") == "Rollout"
-                and (r.get("health") or {}).get("status") == "Degraded"]
-    if not any("abort" in m.lower() for m in messages):
+    mine = str(merge_sha or event.get("image_tag") or "").lower()
+    tags = [t for t in map(_image_tag, payload.get("images") or []) if t]
+    others = [t for t in tags if not _same_tag(mine, t.lower())]
+    healths = [r.get("health") for r in payload.get("resources") or []
+               if isinstance(r, dict) and r.get("kind") == "Rollout" and isinstance(r.get("health"), dict)]
+    if healths:
+        messages = [str(h.get("message") or "") for h in healths if h.get("status") == "Degraded"]
+        if not any("abort" in m.lower() for m in messages):
+            return None
+    elif not (others and any(_same_tag(mine, t.lower()) for t in tags)):
         return None
-    mine = str(event.get("image_tag") or "").lower()
-    others = [t for t in map(_image_tag, payload.get("images") or [])
-              if t and not (mine and (mine.startswith(t.lower()) or t.lower().startswith(mine)))]
     return {"serving_tag": others[0] if others else None}
 
 
@@ -283,10 +318,11 @@ def env_cards(row: dict[str, Any], events: list[dict[str, Any]], settings: Progr
         event = latest.get(env)
         deploy = ({"kind": event["kind"], "image_tag": event["image_tag"], "received_at": event["received_at"]}
                   if event else None)
-        abort = rollout_abort(event) if event else None
+        abort = rollout_abort(event, row.get("merge_sha")) if event else None
         if deploy is not None and abort is not None:
             deploy.update(rollout_aborted=True, serving_tag=abort["serving_tag"])
-        card: dict[str, Any] = {"env": env, "is_target": env == target, "deploy": deploy, "app_url": urls.get(env)}
+        card: dict[str, Any] = {"env": env, "is_target": env == target, "deploy": deploy, "app_url": urls.get(env),
+                                "monitoring_url": monitoring_url(settings.grafana_url, row["app"], env)}
         if env == target:
             result = row.get("deploy_result") or {}
             card["render"] = ({"status": result.get("status"), "reason": result.get("reason"),

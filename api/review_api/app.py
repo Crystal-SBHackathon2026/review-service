@@ -120,7 +120,7 @@ class ApiDeps:
     readiness: dict[str, Callable[[], Awaitable[Any]]] = field(default_factory=dict)
     multi_target_enabled: bool = False
     deployment_targets: frozenset[tuple[str, str, str]] = frozenset()
-    progress: ProgressSettings = field(default_factory=ProgressSettings)  # DEPLOY_ENVS·PLANNED_ENVS·APP_URLS
+    progress: ProgressSettings = field(default_factory=ProgressSettings)  # DEPLOY_ENVS·PLANNED_ENVS·APP_URLS·GRAFANA_URL
 
 
 READY_TIMEOUT_SECONDS = 2.0  # 확인 하나의 상한. readinessProbe timeoutSeconds 는 이보다 길게 (gitops, 기본 1초)
@@ -741,6 +741,10 @@ def make_repair_llm() -> LlmClient | None:
 @asynccontextmanager
 async def _real_lifespan(app: FastAPI) -> AsyncIterator[None]:
     import os
+
+    # uvicorn 은 자기 로거만 설정한다 — 루트가 없으면 review_api 의 INFO(웹훅 linked 등)가 안 나온다. 워커와 같은 형식
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
     from aiokafka import AIOKafkaProducer
 

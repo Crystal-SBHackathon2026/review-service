@@ -55,6 +55,77 @@ async def test_diagnosis_validates_evidence_and_paths():
         await diagnose(event(), Llm(answer, "max_tokens"))
 
 
+FAIL_SPEC = {"metadata": {"name": "sample-app"}, "target": {"env": "aws"},
+             "runtime": {"health": {"readiness": "/healthz"},
+                         "env": {"DEPLOY_ENV": "aws", "FAIL_RATE": "0.3", "DB_PASSWORD": "hunter2"}}}
+
+
+def fail_event():
+    """sample-app#46 — FAIL_RATE 0.3 으로 카나리 중단. LLM 이 /runtime/env/FAIL_RATE 를 인용해 진단 전체가 무효였다."""
+    return dict(kind="health_degraded", spec_snapshot=copy.deepcopy(FAIL_SPEC),
+                payload={"operation": {"resources": [{"message": "rollout.argoproj.io/sample-app configured"}]}})
+
+
+def hypothesis(*paths, reason="FAIL_RATE 환경 변수가 요청 일부를 실패시킨다", action="FAIL_RATE 를 제거한다"):
+    return dict(reason=reason, evidence_ids=["e1"], spec_paths=list(paths), actions=[action])
+
+
+def answer(*hyps, summary="카나리 에러율 초과"):
+    return dict(summary=summary, hypotheses=list(hyps), additional_information=[], cited_case_ids=[])
+
+
+@pytest.mark.asyncio
+async def test_env_key_name_citation_is_allowed_without_value():
+    """이번 케이스: /runtime/env/FAIL_RATE 인용은 키 이름까지 허용 — 값(0.3)은 결과 어디에도 없다."""
+    llm = Llm(answer(hypothesis("/runtime/env/FAIL_RATE",
+                                reason="FAIL_RATE 가 0.3 으로 설정돼 30% 가 500 이다",
+                                action="FAIL_RATE 0.3 을 제거한다"),
+                     summary="FAIL_RATE=0.3 때문에 에러율이 기준을 넘었다"))
+    status, result = await diagnose(fail_event(), llm)
+    assert status == "completed"
+    assert result["spec_paths"] == ["/runtime/env/FAIL_RATE"]
+    assert result["hypotheses"][0]["reason"] == "FAIL_RATE 가 (값 생략) 으로 설정돼 30% 가 500 이다"
+    assert result["summary"] == "FAIL_RATE=(값 생략) 때문에 에러율이 기준을 넘었다"
+    dumped = json.dumps(result, ensure_ascii=False)
+    assert "0.3" not in dumped and "hunter2" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_env_value_mask_keeps_similar_numbers():
+    llm = Llm(answer(hypothesis("/runtime/env/FAIL_RATE", reason="FAIL_RATE 0.3 · 응답 10.3초 · 비율 0.35")))
+    _, result = await diagnose(fail_event(), llm)
+    assert result["hypotheses"][0]["reason"] == "FAIL_RATE (값 생략) · 응답 10.3초 · 비율 0.35"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/runtime/env/DB_PASSWORD", "/runtime/env/NOT_THERE", "/runtime/env",
+                                  "/runtime/env/FAIL_RATE/x", "/metadata/name"])
+async def test_unsupported_paths_only_drop_their_hypothesis(path):
+    """비밀 이름·없는 키·env 전체·잘못된 경로를 든 가설만 버리고 나머지 진단은 살린다."""
+    good = hypothesis("/runtime/health/readiness", reason="readiness 경로 확인", action="경로 확인")
+    status, result = await diagnose(fail_event(), Llm(answer(hypothesis(path), good)))
+    assert status == "completed"
+    assert [h["reason"] for h in result["hypotheses"]] == ["readiness 경로 확인"]
+    assert result["spec_paths"] == ["/runtime/health/readiness"]
+    assert "hunter2" not in json.dumps(result, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_all_hypotheses_dropped_falls_back():
+    """다 버려지면 지금처럼 무효 — 워커가 기본 결과(ANALYSIS_INVALID)를 쓴다."""
+    with pytest.raises(ValueError):
+        await diagnose(fail_event(), Llm(answer(hypothesis("/runtime/env/DB_PASSWORD"))))
+
+
+def test_env_key_paths_never_read_values_in_case_advice():
+    """사례 비교는 env 값을 읽지 않는다 — 진단에 env 키 경로가 남아도 related 에 값이 없다."""
+    past = dict(case_id="c1", failed_spec=copy.deepcopy(FAIL_SPEC), resolution=None,
+                diagnosis={"summary": "FAIL_RATE", "spec_paths": ["/runtime/env/FAIL_RATE"],
+                           "hypotheses": [{"actions": ["FAIL_RATE 제거"]}]})
+    advice = compare_case(past, copy.deepcopy(FAIL_SPEC))
+    assert advice["related"] == [] and "0.3" not in json.dumps(advice, ensure_ascii=False)
+
+
 @pytest.mark.asyncio
 async def test_insufficient_evidence_or_no_llm_preserves_failure():
     assert (await diagnose({"kind": "sync_failed", "payload": {}}, None))[0] == "insufficient"

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from review_api.app import ApiDeps, create_app
 from review_api.argocd import ArgoCdEvent, handle_deploy_event
-from review_api.progress import ProgressSettings, parse_app_urls
+from review_api.progress import ProgressSettings, parse_app_urls, parse_grafana_url
 from review_common.repository import InMemoryReviewRepository
 from review_ai.secrets_pattern import MASK
 
@@ -91,10 +91,11 @@ async def test_pass_auto_merged_and_deployed(env: Env) -> None:
     assert step(body, "deploy")["at"] is not None
     assert step(body, "deploy")["detail"] == "aws Healthy · local 알림 대기"
     assert card(body, "aws") == {
-        "env": "aws", "is_target": True, "app_url": AWS_URL,
+        "env": "aws", "is_target": True, "app_url": AWS_URL, "monitoring_url": None,
         "deploy": {"kind": "healthy", "image_tag": MERGE[:7], "received_at": card(body, "aws")["deploy"]["received_at"]},
         "render": {"status": "committed", "reason": None, "gitops_commit_sha": GITOPS}}
-    assert card(body, "local") == {"env": "local", "is_target": False, "deploy": None, "app_url": LOCAL_URL}
+    assert card(body, "local") == {"env": "local", "is_target": False, "deploy": None, "app_url": LOCAL_URL,
+                                   "monitoring_url": None}  # GRAFANA_URL 없음 → 화면은 모니터링 버튼을 숨긴다
     assert card(body, "gcp") == {"env": "gcp", "planned": True}
     assert body["links"] == {"pr": f"https://github.com/{REPO}/pull/12",
                              "merge_commit": f"https://github.com/{REPO}/commit/{MERGE}",
@@ -438,6 +439,52 @@ async def test_target_aborted_without_other_healthy_fails(env: Env) -> None:
     assert step(body, "deploy")["state"] == "failed"
 
 
+def argocd_v3_payload(*tags: str) -> dict[str, Any]:
+    """Argo CD v3 실제 알림(sample-app#44) — status.resources 에 헬스가 없고(null), images 는 summary.images."""
+    return {"health": "Degraded", "health_message": None, "images": [f"{IMAGE}:{t}" for t in tags],
+            "resources": [{"kind": "Service", "name": "sample-app", "health": None, "status": "Synced"},
+                          {"kind": "Rollout", "name": "sample-app", "health": None, "status": "Synced"}]}
+
+
+async def test_argocd_v3_abort_from_images() -> None:
+    """헬스 message 가 없으면 images 로 — 이 검토의 태그와 이전 태그가 같이 떠 있으면 새 버전이 막힌 것."""
+    env = Env(deploy_envs=("aws", "gcp", "local"))
+    rid = await scene_14(env, argocd_v3_payload(STABLE, MERGE))
+
+    body = env.progress(rid)
+
+    assert card(body, "aws")["deploy"]["rollout_aborted"] is True
+    assert card(body, "aws")["deploy"]["serving_tag"] == STABLE
+    assert step(body, "deploy")["detail"] == "aws 자동 중단 → 이전 버전 유지 · gcp Healthy · local Healthy"
+
+
+async def test_argocd_v3_only_new_tag_is_plain_degraded(env: Env) -> None:
+    """이 검토의 태그만 떠 있으면 새 버전이 다 올라간 뒤 깨진 것 — 중단이 아니다."""
+    rid = await env.review("rv_n", head="a" * 40, **COMMITTED)
+    await env.repo.add_deploy_event(review_id=rid, app="sample-app", target_env="aws", kind="degraded",
+                                    image_tag=MERGE, payload=argocd_v3_payload(MERGE))
+
+    assert "rollout_aborted" not in card(env.progress(rid), "aws")["deploy"]
+
+
+async def test_argocd_v3_new_tag_missing_is_plain_degraded(env: Env) -> None:
+    """이 검토의 태그가 없으면 새 버전이 떴는지 모른다 — 이전 버전 문제일 수 있어 중단으로 보지 않는다."""
+    rid = await env.review("rv_o", head="a" * 40, **COMMITTED)
+    await env.repo.add_deploy_event(review_id=rid, app="sample-app", target_env="aws", kind="degraded",
+                                    image_tag=MERGE, payload=argocd_v3_payload(STABLE))
+
+    assert "rollout_aborted" not in card(env.progress(rid), "aws")["deploy"]
+
+
+async def test_argocd_v3_uses_merge_sha_when_event_tag_missing(env: Env) -> None:
+    """알림의 image_tag 가 비어도 검토의 merge_sha 로 이 검토의 태그를 안다."""
+    rid = await env.review("rv_m", head="a" * 40, **COMMITTED)
+    await env.repo.add_deploy_event(review_id=rid, app="sample-app", target_env="aws", kind="degraded",
+                                    image_tag=None, payload=argocd_v3_payload(STABLE, MERGE))
+
+    assert card(env.progress(rid), "aws")["deploy"]["rollout_aborted"] is True
+
+
 async def test_done_steps_use_stage_time_columns(env: Env) -> None:
     """7차 0009 열(judged_at·human_decided_at·merged_at·gitops_committed_at)이 있으면 끝난 단계 시각으로 쓴다."""
     rid = await env.review("rv_t", head="a" * 40, **COMMITTED,
@@ -453,6 +500,32 @@ async def test_done_steps_use_stage_time_columns(env: Env) -> None:
         "review": "2026-10-09T10:00:00Z", "human": "2026-10-09T10:05:00Z", "merge": "2026-10-09T10:07:00Z",
         "gitops": "2026-10-09T10:08:00Z"}
     assert at["ci"] is None
+
+
+async def test_monitoring_url_per_env() -> None:
+    env = Env(deploy_envs=("aws", "gcp", "local"), grafana_url="http://localhost:3000")
+    rid = await env.review("rv_m", head="a" * 40, **COMMITTED)
+
+    body = env.progress(rid)
+
+    assert {c["env"]: c["monitoring_url"] for c in body["envs"]} == {
+        "aws": "http://localhost:3000/d/apps-sample-app?var-env=aws",
+        "gcp": "http://localhost:3000/d/apps-sample-app?var-env=gcp",
+        "local": "http://localhost:3000/d/apps-sample-app?var-env=local"}
+
+
+async def test_planned_env_has_no_monitoring_url() -> None:
+    env = Env(grafana_url="http://localhost:3000")
+    rid = await env.review("rv_p", head="a" * 40, **COMMITTED)
+
+    assert card(env.progress(rid), "gcp") == {"env": "gcp", "planned": True}
+
+
+def test_grafana_url_only_http() -> None:
+    assert parse_grafana_url("http://localhost:3000/") == "http://localhost:3000"
+    assert parse_grafana_url(" https://grafana.example/sub ") == "https://grafana.example/sub"
+    for bad in (None, "", "javascript:alert(1)", "localhost:3000", "http://g.example/?x=1"):
+        assert parse_grafana_url(bad) is None
 
 
 def test_progress_404(env: Env) -> None:
@@ -492,6 +565,8 @@ def test_settings_from_env() -> None:
     assert settings.deploy_envs == ("aws", "local")
     assert settings.planned_envs == ()
     assert ProgressSettings.from_env({}).planned_envs == ("gcp",)
+    assert ProgressSettings.from_env({}).grafana_url is None
+    assert ProgressSettings.from_env({"GRAFANA_URL": "http://localhost:3000"}).grafana_url == "http://localhost:3000"
 
 
 async def test_history_preserves_chunk_evidence_and_legacy_items(env: Env) -> None:
